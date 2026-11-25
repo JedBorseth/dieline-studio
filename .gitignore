@@ -1,0 +1,7 @@
+.local/
+
+# Generated output belongs outside the repo
+/out/
+*.cf2.tmp
+__pycache__/
+.venv/
