@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window: core APIs (events) only. Engine access goes through the engine_request command.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

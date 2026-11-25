@@ -5,3 +5,14 @@
 *.cf2.tmp
 __pycache__/
 .venv/
+
+# App build output and dependencies
+node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/gen/
+app/src-tauri/binaries/
+
+# Engine sidecar packaging (PyInstaller)
+engine/build/
+engine/dist/

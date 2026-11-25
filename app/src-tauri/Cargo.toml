@@ -1,0 +1,25 @@
+[package]
+name = "dieline-studio"
+version = "0.1.0"
+description = "Dieline Studio desktop shell"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "dieline_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
