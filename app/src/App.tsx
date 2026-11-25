@@ -5,6 +5,7 @@ import { PreviewPane } from "./components/PreviewPane";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
 import { Splitter } from "./components/Splitter";
+import { TooltipProvider } from "./components/ui/tooltip";
 import { EngineError, request, subscribe } from "./lib/engine";
 import type { EngineInfo } from "./lib/protocol";
 import { initialState, reducer } from "./lib/store";
@@ -63,40 +64,42 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app">
-      <Sidebar
-        sessions={state.sessions}
-        activeId={state.activeId}
-        onNew={() => dispatch({ type: "new_session" })}
-        onSelect={(id) => dispatch({ type: "select_session", id })}
-        onSettings={() => setSettingsOpen(true)}
-        engineReady={state.engineReady}
-        engineVersion={info?.version}
-      />
-      <main className="main" ref={mainRef}>
-        <ChatPanel
-          session={active}
-          settings={info?.settings ?? null}
-          engineError={engineError}
-          onSend={(text) => void send(active.id, text)}
-          onStop={() => void request("chat.cancel", { session_id: active.id }).catch(() => undefined)}
-          onOpenSettings={() => setSettingsOpen(true)}
+    <TooltipProvider delay={400}>
+      <div className="flex h-full">
+        <Sidebar
+          sessions={state.sessions}
+          activeId={state.activeId}
+          onNew={() => dispatch({ type: "new_session" })}
+          onSelect={(id) => dispatch({ type: "select_session", id })}
+          onSettings={() => setSettingsOpen(true)}
+          engineReady={state.engineReady}
+          engineVersion={info?.version}
         />
-        <Splitter onDrag={resizePreview} />
-        <PreviewPane
-          width={previewWidth}
-          source={state.preview}
-          info={info}
-          onPreview={(source) => dispatch({ type: "preview", source })}
-        />
-      </main>
-      {settingsOpen && info && (
-        <SettingsDialog
-          settings={info.settings}
-          onClose={() => setSettingsOpen(false)}
-          onSaved={(settings) => setInfo({ ...info, settings })}
-        />
-      )}
-    </div>
+        <main className="flex min-w-0 flex-1" ref={mainRef}>
+          <ChatPanel
+            session={active}
+            settings={info?.settings ?? null}
+            engineError={engineError}
+            onSend={(text) => void send(active.id, text)}
+            onStop={() => void request("chat.cancel", { session_id: active.id }).catch(() => undefined)}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+          <Splitter onDrag={resizePreview} />
+          <PreviewPane
+            width={previewWidth}
+            source={state.preview}
+            info={info}
+            onPreview={(source) => dispatch({ type: "preview", source })}
+          />
+        </main>
+        {settingsOpen && info && (
+          <SettingsDialog
+            settings={info.settings}
+            onClose={() => setSettingsOpen(false)}
+            onSaved={(settings) => setInfo({ ...info, settings })}
+          />
+        )}
+      </div>
+    </TooltipProvider>
   );
 }

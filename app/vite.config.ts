@@ -1,7 +1,8 @@
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-import { engineBridge } from "./vite-engine-bridge";
+import { engineBridge } from "./vite-engine-bridge.ts";
 
 // Tauri expects a fixed port and launches the dev server itself (tauri.conf.json).
 // The engine bridge is only for running the UI in a plain browser; inside
@@ -9,7 +10,7 @@ import { engineBridge } from "./vite-engine-bridge";
 const insideTauri = !!process.env.TAURI_ENV_PLATFORM;
 
 export default defineConfig({
-  plugins: [react(), ...(insideTauri ? [] : [engineBridge()])],
+  plugins: [react(), tailwindcss(), ...(insideTauri ? [] : [engineBridge()])],
   clearScreen: false,
   server: {
     port: 1420,
@@ -20,5 +21,7 @@ export default defineConfig({
   build: {
     target: "es2022",
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    // A desktop app loads its bundle from disk, so one ~600 kB chunk is fine.
+    chunkSizeWarningLimit: 1000,
   },
 });

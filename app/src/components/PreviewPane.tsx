@@ -1,10 +1,36 @@
+import {
+  ChevronRightIcon,
+  CircleAlertIcon,
+  CircleCheckIcon,
+  CircleXIcon,
+  CrosshairIcon,
+  DownloadIcon,
+  FolderOpenIcon,
+  RulerIcon,
+  ScanIcon,
+  SlidersHorizontalIcon,
+  SquareDashedIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, parseCf2 } from "../lib/cf2";
 import { EngineError, request } from "../lib/engine";
-import type { BoxParams, EngineInfo } from "../lib/protocol";
+import type { BoxParams, CheckStatus, EngineInfo } from "../lib/protocol";
 import type { PreviewSource } from "../lib/store";
+import { cn } from "../lib/utils";
+import { STATUS_BADGE } from "./ChatPanel";
 import { DielineCanvas, KIND_LABELS } from "./DielineCanvas";
+import { Tip } from "./Tip";
+import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
+import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { Checkbox } from "./ui/checkbox";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "./ui/collapsible";
+import { Input } from "./ui/input";
+import { Label } from "./ui/label";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "./ui/select";
+import { Spinner } from "./ui/spinner";
 
 interface Props {
   width: number;
@@ -61,26 +87,31 @@ export function PreviewPane({ width, source, info, onPreview }: Props) {
   };
 
   return (
-    <section className="preview" style={{ width }}>
-      <header className="pane-header">
-        <h2 className="pane-title" title={title}>
+    <section className="@container flex min-w-0 shrink-0 flex-col bg-card" style={{ width }}>
+      <header className="flex h-12 shrink-0 items-center gap-1 border-b pr-2 pl-4">
+        <h2 className="min-w-0 truncate font-medium text-sm" title={title}>
           {title}
         </h2>
         {source && (
-          <span className="badge subtle">
+          <Badge variant="outline" className="ml-1.5 font-normal text-muted-foreground">
             {source.kind === "file" ? "file" : source.origin === "agent" ? "from chat" : "from form"}
-          </span>
+          </Badge>
         )}
-        <div className="spacer" />
-        <button className="btn btn-ghost" onClick={() => setFormOpen((o) => !o)} aria-expanded={formOpen}>
-          Parameters
-        </button>
-        <button className="btn btn-ghost" onClick={() => fileRef.current?.click()}>
-          Open CF2…
-        </button>
-        <button className="btn btn-ghost" onClick={() => void exportCf2()} disabled={!design}>
-          Export CF2
-        </button>
+        <div className="min-w-2 flex-1" />
+        <ToolbarButton
+          label="Parameters"
+          icon={<SlidersHorizontalIcon />}
+          onClick={() => setFormOpen((o) => !o)}
+          aria-expanded={formOpen}
+          data-pressed={formOpen ? "" : undefined}
+        />
+        <ToolbarButton wide label="Open CF2…" icon={<FolderOpenIcon />} onClick={() => fileRef.current?.click()} />
+        <ToolbarButton
+          label="Export CF2"
+          icon={<DownloadIcon />}
+          onClick={() => void exportCf2()}
+          disabled={!design}
+        />
         <input
           ref={fileRef}
           type="file"
@@ -103,86 +134,159 @@ export function PreviewPane({ width, source, info, onPreview }: Props) {
         />
       )}
 
-      <div className="canvas-wrap">
+      <div className="relative min-h-0 flex-1 bg-canvas">
         {doc ? (
           <DielineCanvas doc={doc} visible={visible} fitToken={fitToken} onCursor={setCursor} onZoom={setZoom} />
         ) : (
-          <div className="canvas-empty">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
             {parsed.error ? (
-              <span className="error-text">Couldn't read this CF2: {parsed.error}</span>
+              <Alert variant="error" className="max-w-sm text-left" controlAlignment="first-line">
+                <CircleAlertIcon />
+                <AlertTitle>Couldn't read this CF2</AlertTitle>
+                <AlertDescription className="wrap-anywhere">{parsed.error}</AlertDescription>
+              </Alert>
             ) : (
               <>
-                <p>No dieline yet.</p>
-                <p className="muted">Ask in the chat, use Parameters, or open a CF2 file.</p>
+                <span className="flex size-11 items-center justify-center rounded-xl border border-dashed text-muted-foreground">
+                  <SquareDashedIcon className="size-5" />
+                </span>
+                <div className="flex flex-col gap-1">
+                  <p className="font-medium text-sm">No dieline yet</p>
+                  <p className="text-muted-foreground text-sm">Ask in the chat, use Parameters, or open a CF2 file.</p>
+                </div>
               </>
             )}
           </div>
         )}
         {doc && (
-          <div className="legend">
+          <div className="absolute bottom-3 left-3 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-popover/90 py-1 pr-1 pl-2.5 text-xs shadow-sm backdrop-blur-sm">
             {KINDS.filter((k) => present.has(k)).map((k) => (
-              <label key={k} className="legend-item">
-                <input
-                  type="checkbox"
+              <Label key={k} className="h-6 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
+                <Checkbox
+                  className="sm:size-3.5"
                   checked={visible[k]}
-                  onChange={(e) => setVisible({ ...visible, [k]: e.target.checked })}
+                  onCheckedChange={(checked) => setVisible({ ...visible, [k]: checked })}
                 />
                 <span className={`swatch ln-${k}`} />
                 {KIND_LABELS[k]}
-              </label>
+              </Label>
             ))}
-            <button className="btn btn-ghost small" onClick={() => setFitToken((n) => n + 1)}>
-              Fit
-            </button>
+            <Tip label="Fit to view (or double-click)">
+              <Button variant="ghost" size="icon-xs" onClick={() => setFitToken((n) => n + 1)} aria-label="Fit">
+                <ScanIcon />
+              </Button>
+            </Tip>
           </div>
         )}
       </div>
 
-      {design && <Checks design={design} />}
+      {design && <Checks key={design.id} design={design} />}
 
-      <footer className="statusbar">
+      <footer className="flex h-7 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t px-3 text-[11px] text-muted-foreground tabular-nums">
         {doc && (
           <>
-            <span>
+            <span className="flex items-center gap-1.5">
+              <RulerIcon className="size-3" />
               Blank {(doc.bounds.xmax - doc.bounds.xmin).toFixed(1)} × {(doc.bounds.ymax - doc.bounds.ymin).toFixed(1)} mm
             </span>
             <span>{doc.primitives.length} segments</span>
             <span>{Math.round(zoom * 100) / 100} px/mm</span>
             {cursor && (
-              <span>
-                x {cursor.x.toFixed(1)} · y {cursor.y.toFixed(1)}
+              <span className="flex items-center gap-1.5">
+                <CrosshairIcon className="size-3" />x {cursor.x.toFixed(1)} · y {cursor.y.toFixed(1)}
               </span>
             )}
-            {doc.warnings.length > 0 && <span className="warn-text">{doc.warnings.length} parse warnings</span>}
+            {doc.warnings.length > 0 && (
+              <span className="text-warning-foreground">{doc.warnings.length} parse warnings</span>
+            )}
             {present.has("other") && (
-              <span className="warn-text" title={JSON.stringify(doc.codes)}>
+              <span className="text-warning-foreground" title={JSON.stringify(doc.codes)}>
                 unmapped line codes present
               </span>
             )}
           </>
         )}
-        {status && <span className={status.tone === "error" ? "error-text" : "muted"}>{status.text}</span>}
+        {status && (
+          <span className={cn("min-w-0 truncate", status.tone === "error" && "text-destructive-foreground")}>
+            {status.text}
+          </span>
+        )}
       </footer>
     </section>
   );
 }
 
+/** Icon + label; collapses to icon-only (label in a tooltip) when the pane is narrow. `wide` collapses sooner. */
+function ToolbarButton({
+  label,
+  icon,
+  wide = false,
+  ...props
+}: { label: string; icon: React.ReactNode; wide?: boolean } & React.ComponentProps<typeof Button>) {
+  return (
+    <Tip label={label}>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-label={label}
+        className={cn("px-2", wide ? "@[48rem]:px-2.5" : "@[34rem]:px-2.5")}
+        {...props}
+      >
+        {icon}
+        <span className={cn("hidden", wide ? "@[48rem]:inline" : "@[34rem]:inline")}>{label}</span>
+      </Button>
+    </Tip>
+  );
+}
+
+const CHECK_ICON: Record<CheckStatus, React.ReactNode> = {
+  pass: <CircleCheckIcon className="size-3.5 shrink-0 text-success" />,
+  warn: <TriangleAlertIcon className="size-3.5 shrink-0 text-warning" />,
+  fail: <CircleXIcon className="size-3.5 shrink-0 text-destructive" />,
+};
+
 function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind: "design" }>["design"]> }) {
   const failing = design.checks.filter((c) => c.status !== "pass");
   return (
-    <details className="checks" open={design.overall === "fail"}>
-      <summary>
-        <span className={`badge ${design.overall}`}>{design.overall}</span>
-        Checks · {design.checks.length - failing.length}/{design.checks.length} pass
-      </summary>
-      <ul>
-        {design.checks.map((c) => (
-          <li key={c.id} className={c.status}>
-            <span className={`badge ${c.status}`}>{c.status}</span> {c.message}
-          </li>
-        ))}
-      </ul>
-    </details>
+    <Collapsible className="shrink-0 border-t" defaultOpen={design.overall === "fail"}>
+      <CollapsibleTrigger className="group flex h-9 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+        <Badge variant={STATUS_BADGE[design.overall]} className="uppercase tracking-wide">
+          {design.overall}
+        </Badge>
+        <span className="font-medium">Checks</span>
+        <span className="text-muted-foreground">
+          {design.checks.length - failing.length}/{design.checks.length} pass
+        </span>
+        <span className="flex-1" />
+        <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsiblePanel>
+        <ul className="scroll-thin flex max-h-56 flex-col gap-1.5 overflow-y-auto px-3 pt-0.5 pb-3">
+          {design.checks.map((c) => (
+            <li key={c.id} className="flex items-start gap-2 text-xs leading-snug">
+              <span className="flex h-[1lh] items-center">{CHECK_ICON[c.status]}</span>
+              <span
+                className={cn(
+                  "min-w-0 wrap-anywhere",
+                  c.status === "pass" ? "text-muted-foreground" : "text-foreground",
+                )}
+              >
+                {c.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </CollapsiblePanel>
+    </Collapsible>
+  );
+}
+
+function Field({ label, className, children }: { label: string; className?: string; children: React.ReactNode }) {
+  return (
+    <div className={cn("flex min-w-0 flex-col gap-1.5", className)}>
+      <Label className="font-normal text-muted-foreground text-xs sm:text-xs">{label}</Label>
+      {children}
+    </div>
   );
 }
 
@@ -207,9 +311,16 @@ function QuickBox(props: {
   const num = (k: "length" | "width" | "depth") => (e: React.ChangeEvent<HTMLInputElement>) =>
     setP({ ...p, [k]: Number(e.target.value) });
 
+  const styleItems = info.styles.map((s) => ({ value: s.id, label: s.name }));
+  const boardItems = info.boards.map((b) => ({ value: b.id, label: `${b.name} (${b.caliper_mm} mm)` }));
+  const unitItems = [
+    { value: "mm", label: "mm" },
+    { value: "in", label: "in" },
+  ];
+
   return (
     <form
-      className="quickbox"
+      className="grid shrink-0 grid-cols-12 gap-x-2 gap-y-3 border-b bg-background/50 p-3"
       onSubmit={(e) => {
         e.preventDefault();
         setBusy(true);
@@ -219,48 +330,67 @@ function QuickBox(props: {
           .finally(() => setBusy(false));
       }}
     >
-      <label>
-        Style
-        <select value={p.style} onChange={(e) => setP({ ...p, style: e.target.value })}>
-          {info.styles.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        L
-        <input type="number" min={1} step="any" value={p.length} onChange={num("length")} />
-      </label>
-      <label>
-        W
-        <input type="number" min={1} step="any" value={p.width} onChange={num("width")} />
-      </label>
-      <label>
-        D
-        <input type="number" min={1} step="any" value={p.depth} onChange={num("depth")} />
-      </label>
-      <label>
-        Units
-        <select value={p.units} onChange={(e) => setP({ ...p, units: e.target.value as "mm" | "in" })}>
-          <option value="mm">mm</option>
-          <option value="in">in</option>
-        </select>
-      </label>
-      <label>
-        Board
-        <select value={p.board} onChange={(e) => setP({ ...p, board: e.target.value })}>
-          {info.boards.map((b) => (
-            <option key={b.id} value={b.id}>
-              {b.name} ({b.caliper_mm} mm)
-            </option>
-          ))}
-        </select>
-      </label>
-      <button className="btn btn-primary" type="submit" disabled={busy}>
-        Generate
-      </button>
+      <Field label="Style" className="col-span-12 @[30rem]:col-span-6">
+        <Select items={styleItems} value={p.style} onValueChange={(v) => v !== null && setP({ ...p, style: v })}>
+          <SelectTrigger size="sm" className="min-w-0" aria-label="Style">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectPopup>
+            {styleItems.map((s) => (
+              <SelectItem key={s.value} value={s.value}>
+                {s.label}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      </Field>
+      <Field label="Board" className="col-span-12 @[30rem]:col-span-6">
+        <Select items={boardItems} value={p.board} onValueChange={(v) => v !== null && setP({ ...p, board: v })}>
+          <SelectTrigger size="sm" className="min-w-0" aria-label="Board">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectPopup>
+            {boardItems.map((b) => (
+              <SelectItem key={b.value} value={b.value}>
+                {b.label}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      </Field>
+      <Field label="Length" className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" type="number" min={1} step="any" value={p.length} onChange={num("length")} aria-label="Length" />
+      </Field>
+      <Field label="Width" className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" type="number" min={1} step="any" value={p.width} onChange={num("width")} aria-label="Width" />
+      </Field>
+      <Field label="Depth" className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" type="number" min={1} step="any" value={p.depth} onChange={num("depth")} aria-label="Depth" />
+      </Field>
+      <Field label="Units" className="col-span-3 @[30rem]:col-span-2">
+        <Select
+          items={unitItems}
+          value={p.units}
+          onValueChange={(v) => v !== null && setP({ ...p, units: v as "mm" | "in" })}
+        >
+          <SelectTrigger size="sm" className="min-w-0" aria-label="Units">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectPopup>
+            {unitItems.map((u) => (
+              <SelectItem key={u.value} value={u.value}>
+                {u.label}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      </Field>
+      <div className="col-span-12 flex items-end justify-end @[30rem]:col-span-4">
+        <Button type="submit" size="sm" disabled={busy} className="w-full @[30rem]:w-auto">
+          {busy && <Spinner />}
+          Generate
+        </Button>
+      </div>
     </form>
   );
 }
