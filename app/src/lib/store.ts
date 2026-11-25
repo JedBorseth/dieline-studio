@@ -69,6 +69,14 @@ function appendAssistant(s: Session, field: "text" | "thinking", chunk: string):
   return { ...s, items: [...s.items, item] };
 }
 
+/** Tool calls still "running" when a turn ends never got a result. */
+function markUnfinishedTools(s: Session): Session {
+  return {
+    ...s,
+    items: s.items.map((it) => (it.kind === "tool" && it.status === "running" ? { ...it, status: "error" } : it)),
+  };
+}
+
 function notice(s: Session, tone: "error" | "info", text: string): Session {
   return { ...s, items: [...s.items, { kind: "notice", id: uid(), tone, text }] };
 }
@@ -115,7 +123,7 @@ function applyEvent(state: State, e: EngineEvent): State {
         ...state,
         engineReady: false,
         sessions: state.sessions.map((s) =>
-          s.busy ? { ...notice(s, "error", "The engine stopped during this turn."), busy: false } : s,
+          s.busy ? { ...notice(markUnfinishedTools(s), "error", "The engine stopped during this turn."), busy: false } : s,
         ),
       };
     case "chat.text":
@@ -140,15 +148,10 @@ function applyEvent(state: State, e: EngineEvent): State {
       return updateSession(state, e.session_id, (s) => notice(s, "error", e.message));
     case "chat.turn_end":
       return updateSession(state, e.session_id, (s) => {
-        // Tool calls still "running" when a turn ends never got a result.
-        const items = s.items.map((it) =>
-          it.kind === "tool" && it.status === "running" ? { ...it, status: "error" as const } : it,
-        );
-        const ended = { ...s, items, busy: false };
+        const ended = { ...markUnfinishedTools(s), busy: false };
         if (e.stop_reason === "cancelled")
           return notice(ended, "info", "Stopped. This turn was not kept in the conversation.");
         if (e.stop_reason === "error") return notice(ended, "info", "This turn was not kept in the conversation.");
-        if (e.stop_reason === "max_steps") return notice(ended, "info", "Stopped after too many tool steps.");
         return ended;
       });
     case "design": {

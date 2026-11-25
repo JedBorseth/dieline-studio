@@ -83,87 +83,107 @@ function isConformal(t: Affine): boolean {
   return Math.abs(n1 - n2) <= 1e-9 * Math.max(n1, n2, 1) && Math.abs(dot) <= 1e-9 * Math.max(n1 * n2, 1);
 }
 
+/**
+ * Units (UM/UI) are honoured wherever they appear, including the header.
+ * A block's SCALE,sx,sy record scales that block's own coordinates.
+ */
 export function parseCf2(text: string, maxDepth = 16): Cf2Doc {
   const blocks = new Map<string, string[][]>();
+  const blockScale = new Map<string, [number, number]>();
   let main: string | null = null;
-  let current: string[][] | null = null;
-  let units: "mm" | "in" = "mm";
+  let current: string | null = null;
+  let units: "mm" | "in" | null = null;
   const warnings: string[] = [];
+
+  const num = (s: string | undefined) => {
+    const v = s === undefined || s.trim() === "" ? NaN : Number(s);
+    if (!Number.isFinite(v)) throw new Error(`bad number ${s}`);
+    return v;
+  };
 
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line) continue;
     const f = line.split(",").map((s) => s.trim());
     const key = f[0].toUpperCase();
-    if ((key === "MAIN" || key === "SUB") && f.length > 1) {
-      current = blocks.get(f[1]) ?? [];
-      blocks.set(f[1], current);
-      if (key === "MAIN") main = f[1];
+    if (key === "UM" || key === "UI") {
+      const u = key === "UI" ? "in" : "mm";
+      if (units !== null && units !== u) warnings.push(`conflicting units ${units} and ${u}; using ${units}`);
+      units ??= u;
+    } else if ((key === "MAIN" || key === "SUB") && f.length > 1) {
+      current = f[1];
+      if (!blocks.has(current)) blocks.set(current, []);
+      if (key === "MAIN") main = current;
     } else if (key === "END") {
       current = null;
-    } else if (current) {
-      if (key === "UM") units = "mm";
-      else if (key === "UI") units = "in";
-      else current.push(f);
+    } else if (current !== null) {
+      if (key === "SCALE" && f.length >= 3) {
+        try {
+          blockScale.set(current, [num(f[1]), num(f[2])]);
+        } catch {
+          warnings.push(`skipped unparseable record: ${line}`);
+        }
+      } else {
+        blocks.get(current)!.push(f);
+      }
     }
   }
   if (main === null) throw new Error("Not a CF2 file: no MAIN block");
 
-  const scale = units === "in" ? 25.4 : 1;
+  const finalUnits = units ?? "mm";
+  const unit = finalUnits === "in" ? 25.4 : 1;
   const primitives: Primitive[] = [];
   const codes: Record<number, number> = {};
   const kindOf = (s: string): [number, LineKind] => {
-    const code = Math.trunc(Number(s));
+    const code = Math.trunc(num(s));
     codes[code] = (codes[code] ?? 0) + 1;
     return [code, CODE_KINDS[code] ?? "other"];
   };
-  const num = (s: string) => {
-    const v = Number(s);
-    if (!Number.isFinite(v)) throw new Error(`bad number ${s}`);
-    return v;
-  };
 
-  const emit = (name: string, t: Affine, depth: number) => {
+  /** `xf` maps this block's file coordinates to world millimetres. */
+  const emit = (name: string, xf: Affine, depth: number) => {
     if (depth > maxDepth) {
       warnings.push(`subroutine nesting deeper than ${maxDepth} at "${name}"`);
       return;
     }
+    const [bsx, bsy] = blockScale.get(name) ?? [1, 1];
+    const t = compose({ a: bsx, b: 0, c: 0, d: bsy, e: 0, f: 0 }, xf); // block SCALE, then placement
     const mirrored = t.a * t.d - t.b * t.c < 0;
     const conformal = isConformal(t);
     for (const f of blocks.get(name) ?? []) {
       const key = f[0].toUpperCase();
       try {
         if (key === "L" && f.length >= 8) {
+          const [x1, y1] = apply(t, num(f[4]), num(f[5]));
+          const [x2, y2] = apply(t, num(f[6]), num(f[7]));
           const [code, type] = kindOf(f[2]);
-          const [x1, y1] = apply(t, num(f[4]) * scale, num(f[5]) * scale);
-          const [x2, y2] = apply(t, num(f[6]) * scale, num(f[7]) * scale);
           primitives.push({ kind: "line", code, type, x1, y1, x2, y2 });
         } else if (key === "A" && f.length >= 11) {
-          const [code, type] = kindOf(f[2]);
-          const [sx, sy] = apply(t, num(f[4]) * scale, num(f[5]) * scale);
-          const [ex, ey] = apply(t, num(f[6]) * scale, num(f[7]) * scale);
-          const [cx, cy] = apply(t, num(f[8]) * scale, num(f[9]) * scale);
+          const [sx, sy] = apply(t, num(f[4]), num(f[5]));
+          const [ex, ey] = apply(t, num(f[6]), num(f[7]));
+          const [cx, cy] = apply(t, num(f[8]), num(f[9]));
           let cw = Math.trunc(num(f[10])) === -1;
           if (mirrored) cw = !cw;
           if (!conformal) warnings.push(`arc in "${name}" is scaled non-uniformly; drawn as a circular arc`);
+          const [code, type] = kindOf(f[2]);
           primitives.push({ kind: "arc", code, type, sx, sy, ex, ey, cx, cy, cw });
         } else if (key === "C" && f.length >= 3) {
           if (!blocks.has(f[1])) {
             warnings.push(`call to undefined subroutine "${f[1]}"`);
             continue;
           }
-          const n = [...f.slice(2, 7).map(num), ...[0, 0, 0, 1, 1].slice(f.slice(2, 7).length)];
-          const inner = callTransform(n[0] * scale, n[1] * scale, n[2], n[3], n[4]);
-          emit(f[1], compose(inner, t), depth + 1);
+          const defaults = [0, 0, 0, 1, 1];
+          const n = defaults.map((d, i) => (f[2 + i] ? num(f[2 + i]) : d));
+          emit(f[1], compose(callTransform(n[0], n[1], n[2], n[3], n[4]), t), depth + 1);
         }
       } catch {
         warnings.push(`skipped unparseable record: ${f.join(",")}`);
       }
     }
   };
-  emit(main, IDENTITY, 0);
+  emit(main, { ...IDENTITY, a: unit, d: unit }, 0);
 
-  return { name: main, units, primitives, bounds: boundsOf(primitives), codes, warnings };
+  return { name: main, units: finalUnits, primitives, bounds: boundsOf(primitives), codes, warnings };
 }
 
 function boundsOf(prims: Primitive[]): Bounds {

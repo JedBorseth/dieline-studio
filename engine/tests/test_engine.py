@@ -181,3 +181,131 @@ def test_api_key_must_be_an_api_key(tmp_path):
     store = SettingsStore(tmp_path / "settings.json")
     with pytest.raises(ValueError):
         store.update({"api_key": "sk-ant-oat01-subscription-token"})
+
+
+# --- agent loop against a fake Anthropic client --------------------------------
+
+from types import SimpleNamespace as NS  # noqa: E402
+
+from dieline_engine import agent as agent_mod  # noqa: E402
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self.response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(())
+
+    def get_final_message(self):
+        return self.response
+
+    def close(self):
+        pass
+
+
+def _fake_client(responses, calls):
+    class Client:
+        def __init__(self, api_key):
+            self.beta = NS(messages=NS(stream=self.stream))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def stream(self, **kw):
+            calls.append([dict(m) if isinstance(m, dict) else m for m in kw["messages"]])
+            return _FakeStream(responses.pop(0))
+
+    return Client
+
+
+def _tool_use(id_, name, input_):
+    return NS(type="tool_use", id=id_, name=name, input=input_)
+
+
+def _text(t):
+    return NS(type="text", text=t)
+
+
+BOX = {"style": "fefco-0201", "length": 300, "width": 200, "depth": 150, "units": "mm", "board": "C-32ECT"}
+
+
+def _run(monkeypatch, tmp_path, responses):
+    calls, events = [], []
+    monkeypatch.setattr(agent_mod.anthropic, "Anthropic", _fake_client(responses, calls))
+    store = SettingsStore(tmp_path / "settings.json")
+    monkeypatch.setattr(store, "api_key", lambda: "sk-ant-api-test")
+    ag = agent_mod.Agent(store, events.append)
+    s = agent_mod.Session("s1")
+    ag.sessions["s1"] = s
+    s.busy = True
+    ag._run_turn(s, "make a box", "sk-ant-api-test")
+    return ag, s, events, calls
+
+
+def test_agent_tool_round_trip(monkeypatch, tmp_path):
+    responses = [
+        NS(stop_reason="tool_use", content=[_tool_use("t1", "create_box", BOX)]),
+        NS(stop_reason="end_turn", content=[_text("Done.")]),
+    ]
+    _, s, events, calls = _run(monkeypatch, tmp_path, responses)
+    types = [e["type"] for e in events]
+    assert "design" in types and types[-1] == "chat.turn_end"
+    assert events[-1]["stop_reason"] == "end_turn" and not s.busy
+    # history: user, assistant(tool_use), user(tool_result), assistant(text)
+    assert [m["role"] for m in s.messages] == ["user", "assistant", "user", "assistant"]
+    assert s.messages[2]["content"][0]["tool_use_id"] == "t1"
+    assert s.current is not None
+
+
+def test_agent_refusal_discards_turn_and_restores_design(monkeypatch, tmp_path):
+    responses = [
+        NS(stop_reason="tool_use", content=[_tool_use("t1", "create_box", BOX)]),
+        NS(stop_reason="refusal", content=[], stop_details=NS(category=None)),
+    ]
+    _, s, events, _ = _run(monkeypatch, tmp_path, responses)
+    assert s.messages == [] and s.current is None
+    assert any(e["type"] == "chat.error" and "declined" in e["message"] for e in events)
+    assert events[-1] == {"type": "chat.turn_end", "session_id": "s1", "stop_reason": "error"}
+
+
+def test_agent_max_steps_discards_turn(monkeypatch, tmp_path):
+    responses = [
+        NS(stop_reason="tool_use", content=[_tool_use(f"t{i}", "list_options", {})])
+        for i in range(agent_mod.MAX_STEPS)
+    ]
+    _, s, events, _ = _run(monkeypatch, tmp_path, responses)
+    assert s.messages == []
+    assert events[-1]["stop_reason"] == "error"
+
+
+def test_inner_flap_collision_fails_when_width_exceeds_length():
+    results = {r.id: r for r in run_checks(rsc(200, 300, 150))}
+    assert results["inner_flaps"].status == "fail"
+    assert {r.id: r for r in run_checks(rsc())}["inner_flaps"].status == "pass"
+
+
+def test_settings_update_is_all_or_nothing(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    with pytest.raises(ValueError):
+        store.update({"model": "claude-haiku-5-5", "effort": "bogus"})
+    assert store.settings.model == "claude-opus-5-5"
+    with pytest.raises(ValueError):
+        store.update({"output_dir": "relative/dir"})
+
+
+def test_cf2_header_units_and_block_scale():
+    text = "$BOF\nV2\nORDER\nUI\nEND\nMAIN,t\nSCALE,2,2\nL,2,1,0,0,0,1,0,0,0\nEND\n$EOF"
+    line = read_cf2(text).dieline.segments[0]
+    assert line.end == pytest.approx((50.8, 0.0))
+    bad = read_cf2("MAIN,t\nL,2,,0,0,0,1,0,0,0\nEND")
+    assert bad.dieline.segments == [] and bad.raw_codes == {} and len(bad.warnings) == 1

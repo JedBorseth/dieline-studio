@@ -83,7 +83,7 @@ class Server:
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         req_id = msg.get("id")
-        params = msg.get("params") or {}
+        params = {} if msg.get("params") is None else msg["params"]
         try:
             fn = self.methods.get(msg["method"])
             if fn is None:
@@ -149,6 +149,9 @@ def _validation_message(exc: ValidationError) -> str:
 
 
 def main() -> None:
+    # Logs may contain non-ASCII paths; the Windows console code page can't encode them.
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
     # Binary-safe UTF-8 on Windows pipes regardless of the console code page.
     stdin = open(sys.stdin.fileno(), "r", encoding="utf-8", newline="\n", closefd=False)

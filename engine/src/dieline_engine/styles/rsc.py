@@ -100,6 +100,7 @@ def build(length: float, width: float, depth: float, board: Board) -> Dieline:
         "inside_dims_mm": {"length": length, "width": width, "depth": depth},
         "board": board.id,
         "caliper_mm": board.caliper_mm,
+        "corrugated": board.corrugated,
         "allowances_mm": {**asdict(a), "glue_taper": tg},
         "calibrated": False,
         "panels_mm": {

@@ -66,3 +66,13 @@ test("subroutine transforms compose as affine maps (mirror after rotation)", () 
   const single = parseCf2("MAIN,m\nC,s,0,0,90,1,-1\nEND\nSUB,s\nL,2,1,0,0,0,1,0,0,0\nEND").primitives[0];
   assert.ok(single.kind === "line" && Math.abs(single.x2) < 1e-9 && Math.abs(single.y2 + 1) < 1e-9);
 });
+
+test("units in the header and block SCALE records are honoured", () => {
+  const doc = parseCf2("$BOF\nV2\nORDER\nUI\nEND\nMAIN,t\nSCALE,2,2\nL,2,1,0,0,0,1,0,0,0\nEND\n$EOF");
+  const p = doc.primitives[0];
+  assert.ok(p.kind === "line" && Math.abs(p.x2 - 50.8) < 1e-9);
+  const bad = parseCf2("MAIN,t\nL,2,,0,0,0,1,0,0,0\nEND");
+  assert.equal(bad.primitives.length, 0);
+  assert.deepEqual(bad.codes, {});
+  assert.equal(bad.warnings.length, 1);
+});

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import anthropic
@@ -19,7 +19,7 @@ from pydantic import ValidationError
 
 from . import designs
 from .designs import BoxParams
-from .settings import SettingsStore
+from .settings import Settings, SettingsStore
 
 log = logging.getLogger(__name__)
 
@@ -98,6 +98,10 @@ class TurnCancelled(Exception):
     pass
 
 
+class TurnDiscarded(Exception):
+    """The turn can't be kept in the history; the message is shown to the user."""
+
+
 @dataclass
 class Session:
     id: str
@@ -154,16 +158,19 @@ class Agent:
 
     def _run_turn(self, s: Session, text: str, api_key: str) -> None:
         checkpoint = len(s.messages)
+        current_before = s.current  # restored if the turn is discarded
         s.messages.append({"role": "user", "content": text})
         events: list[dict[str, Any]] = []
         try:
             stop_reason = self._loop(s, api_key)
         except TurnCancelled:
             del s.messages[checkpoint:]  # drop the whole turn; history stays append-only
+            s.current = current_before
             stop_reason = "cancelled"
         except Exception as exc:  # surface every failure to the UI, keep the engine alive
             log.warning("turn failed: %s", exc)
             del s.messages[checkpoint:]
+            s.current = current_before
             events.append({"type": "chat.error", "session_id": s.id, "message": _describe_error(exc)})
             stop_reason = "error"
         with self._lock:  # release before announcing, so an immediate follow-up is accepted
@@ -178,79 +185,86 @@ class Agent:
             raise TurnCancelled()
 
     def _loop(self, s: Session, api_key: str) -> str:
-        cfg = self.settings.settings
-        client = anthropic.Anthropic(api_key=api_key)
+        cfg = replace(self.settings.settings)  # snapshot: settings changes apply from the next turn
         sid = s.id
-        json_retries = 0
-        for _ in range(MAX_STEPS):
-            self._check_cancel(s)
-            try:
-                with client.beta.messages.stream(
-                    model=cfg.model,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    messages=s.messages,
-                    thinking={"type": "adaptive", "display": "summarized"},
-                    output_config={"effort": cfg.effort},
-                    cache_control={"type": "ephemeral"},
-                    betas=[FALLBACK_BETA],
-                    fallbacks="default",
-                ) as stream:
-                    s.stream = stream
-                    for event in stream:
-                        self._check_cancel(s)
-                        self._forward(sid, event)
-                    self._check_cancel(s)
-                    response = stream.get_final_message()
-                json_retries = 0
-            except TurnCancelled:
-                raise
-            except ValueError:
-                # Tool input JSON the SDK could not parse at all; re-issue the step.
-                json_retries += 1
-                if json_retries > 2:
-                    raise
-                continue
-            except Exception:
-                if s.cancel.is_set():  # the stream was closed under us by cancel()
-                    raise TurnCancelled() from None
-                raise
-            finally:
-                s.stream = None
-
-            stop = response.stop_reason
-            if stop == "pause_turn":
-                s.messages.append({"role": "assistant", "content": response.content})
-                continue
-
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if stop != "tool_use" and tool_uses:
-                # A refusal or truncation cut a tool call off. A tool_use without a
-                # tool_result would break the next request, so drop the whole turn.
-                raise RuntimeError(f"Claude's reply ended mid tool call ({stop}); this turn was discarded.")
-            s.messages.append({"role": "assistant", "content": response.content})
-            if stop == "refusal":
-                details = getattr(response, "stop_details", None)
-                category = getattr(details, "category", None) if details else None
-                self.emit({"type": "chat.error", "session_id": sid,
-                           "message": f"Claude declined this request{f' ({category})' if category else ''}."})
-                return "refusal"
-            if stop in ("max_tokens", "model_context_window_exceeded"):
-                # Never run tools from a truncated turn: their input may be cut off.
-                what = "the reply length limit" if stop == "max_tokens" else "the context window"
-                self.emit({"type": "chat.error", "session_id": sid,
-                           "message": f"The reply was cut off at {what}. Start a new design to continue."})
-                return stop
-            if stop != "tool_use":
-                return stop or "end_turn"
-
-            results = []
-            for block in tool_uses:
+        with anthropic.Anthropic(api_key=api_key) as client:
+            for _ in range(MAX_STEPS):
                 self._check_cancel(s)
-                results.append(self._run_tool(s, block))
-            s.messages.append({"role": "user", "content": results})
-        return "max_steps"
+                response = self._step(client, cfg, s)
+                done = self._after_step(s, response)
+                if done is not None:
+                    return done
+        # Every step ended in tool calls. The last tool results have no reply, so
+        # discard the turn rather than leave an unanswered exchange in the history.
+        raise TurnDiscarded(f"Stopped after {MAX_STEPS} tool steps without an answer.")
+
+    def _step(self, client: anthropic.Anthropic, cfg: Settings, s: Session) -> Any:
+        """One streamed model call. A ValueError from the SDK (tool input it
+        couldn't parse) propagates and discards the turn: retrying would leave
+        partly streamed text and tool cards in the UI."""
+        try:
+            with client.beta.messages.stream(
+                model=cfg.model,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=s.messages,
+                thinking={"type": "adaptive", "display": "summarized"},
+                output_config={"effort": cfg.effort},
+                cache_control={"type": "ephemeral"},
+                betas=[FALLBACK_BETA],
+                fallbacks="default",
+            ) as stream:
+                s.stream = stream
+                for event in stream:
+                    self._check_cancel(s)
+                    self._forward(s.id, event)
+                self._check_cancel(s)
+                return stream.get_final_message()
+        except TurnCancelled:
+            raise
+        except Exception:
+            if s.cancel.is_set():  # the stream was closed under us by cancel()
+                raise TurnCancelled() from None
+            raise
+        finally:
+            s.stream = None
+
+    def _after_step(self, s: Session, response: Any) -> str | None:
+        """Record a model step and run its tools. Returns a stop reason when the turn is over."""
+        sid = s.id
+        stop = response.stop_reason
+        if stop == "pause_turn":
+            s.messages.append({"role": "assistant", "content": response.content})
+            return None
+
+        if stop == "refusal":
+            # A refusal may be empty or cut a tool call off; neither can stay in
+            # the history, so the whole turn is discarded.
+            details = getattr(response, "stop_details", None)
+            category = getattr(details, "category", None) if details else None
+            raise TurnDiscarded(f"Claude declined this request{f' ({category})' if category else ''}.")
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+        if stop != "tool_use" and tool_uses:
+            # Truncation cut a tool call off. A tool_use without a tool_result
+            # would break the next request, so drop the whole turn.
+            raise TurnDiscarded(f"Claude's reply was cut off mid tool call ({stop}).")
+        s.messages.append({"role": "assistant", "content": response.content})
+        if stop in ("max_tokens", "model_context_window_exceeded"):
+            # Never run tools from a truncated turn: their input may be cut off.
+            what = "the reply length limit" if stop == "max_tokens" else "the context window"
+            self.emit({"type": "chat.error", "session_id": sid,
+                       "message": f"The reply was cut off at {what}. Start a new design to continue."})
+            return stop
+        if stop != "tool_use":
+            return stop or "end_turn"
+
+        results = []
+        for block in tool_uses:
+            self._check_cancel(s)
+            results.append(self._run_tool(s, block))
+        s.messages.append({"role": "user", "content": results})
+        return None
 
     def _forward(self, sid: str, event: Any) -> None:
         if event.type == "content_block_start":
@@ -303,6 +317,8 @@ class Agent:
 
 
 def _describe_error(exc: Exception) -> str:
+    if isinstance(exc, (TurnDiscarded, ValueError, RuntimeError)):
+        return str(exc)
     if isinstance(exc, anthropic.AuthenticationError):
         return "The Anthropic API key was rejected. Check it in Settings."
     if isinstance(exc, anthropic.PermissionDeniedError):

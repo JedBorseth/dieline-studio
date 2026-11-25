@@ -58,3 +58,8 @@ These are placeholders until checked against our ArtiosCAD (see PLAN.md):
 - CF2 line-type codes (1 cut, 2 crease, 3 perforation, 4 score), the `UM`/`UI` units keywords and the arc direction flag (`cf2.py`, `app/src/lib/cf2.ts`).
 - RSC allowances (`styles/rsc.py`) and board calipers (`boards.py`). Every RSC design carries a "not calibrated" warning until milestone 4.
 - Sheet-size limit (`checks.py`).
+
+## Known gaps
+
+- The shell stops the engine by closing its stdin, then kills it after two seconds. The PyInstaller one-file sidecar runs Python as a child process, so a hard kill can leave that child running. Putting the engine in a Windows Job Object with kill-on-close would make cleanup certain.
+- Arcs aren't yet included in the line-crossing check.

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import platformdirs
@@ -108,21 +108,27 @@ class SettingsStore:
     # Settings ----------------------------------------------------------------
 
     def update(self, changes: dict) -> None:
+        """Validate every field first, then apply all of them, so a bad value changes nothing."""
+        new = replace(self.settings)
+        if "model" in changes:
+            model = str(changes["model"])
+            if model not in {m["id"] for m in MODELS}:
+                raise ValueError(f"unknown model {model!r}")
+            new.model = model
+        if "effort" in changes:
+            effort = str(changes["effort"])
+            if effort not in EFFORTS:
+                raise ValueError(f"unknown effort {effort!r}")
+            new.effort = effort
+        if "output_dir" in changes:
+            out = str(changes["output_dir"] or "").strip()
+            if out and not Path(out).is_absolute():
+                raise ValueError("the export folder must be a full path, e.g. C:\\Users\\me\\Documents\\Dielines")
+            new.output_dir = out
         if "api_key" in changes:
-            self.set_api_key(changes["api_key"])
+            self.set_api_key(changes["api_key"])  # validates, raises before anything else is saved
         with self._lock:
-            if "model" in changes:
-                model = str(changes["model"])
-                if model not in {m["id"] for m in MODELS}:
-                    raise ValueError(f"unknown model {model!r}")
-                self.settings.model = model
-            if "effort" in changes:
-                effort = str(changes["effort"])
-                if effort not in EFFORTS:
-                    raise ValueError(f"unknown effort {effort!r}")
-                self.settings.effort = effort
-            if "output_dir" in changes:
-                self.settings.output_dir = str(changes["output_dir"] or "")
+            self.settings = new
             self._save()
 
     def public(self) -> dict:

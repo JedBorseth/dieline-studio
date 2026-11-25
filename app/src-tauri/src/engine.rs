@@ -115,9 +115,15 @@ impl Engine {
         let pending = self.pending.clone();
         let running = self.running.clone();
         tauri::async_runtime::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                route(&app, &pending, &line).await;
+            // Read raw lines and decode lossily: one bad byte must not stop the reader.
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => route(&app, &pending, String::from_utf8_lossy(&buf).trim_end()).await,
+                }
             }
             // Holding `running` means no new request can be sent to this
             // generation and no replacement can start until cleanup is done.

@@ -132,12 +132,23 @@ class _Affine:
         return abs(n1 - n2) <= 1e-9 * max(n1, n2, 1.0) and abs(dot) <= 1e-9 * max(n1 * n2, 1.0)
 
 
+def _float(v: str) -> float:
+    if not v.strip():
+        raise ValueError("empty number")
+    return float(v)
+
+
 def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
-    """Parse CF2 text into a Dieline (millimetres). Unknown records are skipped."""
+    """Parse CF2 text into a Dieline (millimetres). Unknown records are skipped.
+
+    The units keyword (UM/UI) is honoured wherever it appears, including the
+    header. A block's SCALE,sx,sy record scales that block's own coordinates.
+    """
     blocks: dict[str, list[list[str]]] = {}
+    block_scale: dict[str, tuple[float, float]] = {}
     main_name: str | None = None
-    current: list[list[str]] | None = None
-    units = UNITS_MM
+    current_name: str | None = None
+    units: str | None = None
     warnings: list[str] = []
 
     for raw in text.splitlines():
@@ -146,68 +157,78 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
             continue
         fields = [f.strip() for f in line.split(",")]
         key = fields[0].upper()
-        if key in ("MAIN", "SUB") and len(fields) > 1:
-            name = fields[1]
-            current = blocks.setdefault(name, [])
+        if key in (UNITS_MM, UNITS_INCH):
+            if units is not None and units != key:
+                warnings.append(f"conflicting units {units} and {key}; using {units}")
+            units = units or key
+        elif key in ("MAIN", "SUB") and len(fields) > 1:
+            current_name = fields[1]
+            blocks.setdefault(current_name, [])
             if key == "MAIN":
-                main_name = name
+                main_name = current_name
         elif key == "END":
-            current = None
-        elif current is not None:
-            if key in (UNITS_MM, UNITS_INCH):
-                units = key
+            current_name = None
+        elif current_name is not None:
+            if key == "SCALE" and len(fields) >= 3:
+                try:
+                    block_scale[current_name] = (_float(fields[1]), _float(fields[2]))
+                except ValueError:
+                    warnings.append(f"unparseable record skipped: {line}")
             else:
-                current.append(fields)
+                blocks[current_name].append(fields)
 
     if main_name is None:
         raise ValueError("not a CF2 file: no MAIN block")
 
-    scale = 25.4 if units == UNITS_INCH else 1.0
+    units = units or UNITS_MM
+    unit = 25.4 if units == UNITS_INCH else 1.0
     dieline = Dieline(name=main_name)
     raw_codes: dict[int, int] = {}
 
     def to_type(code_s: str) -> LineType:
-        code = int(float(code_s))
+        code = int(_float(code_s))
         raw_codes[code] = raw_codes.get(code, 0) + 1
         return CF2_CODE_TYPES.get(code, LineType.ANNOTATION)
 
     def emit(name: str, xf: _Affine, depth: int) -> None:
+        """xf maps this block's file coordinates to world millimetres."""
         if depth > max_depth:
             warnings.append(f"subroutine nesting deeper than {max_depth} at {name!r}; skipped")
             return
+        bsx, bsy = block_scale.get(name, (1.0, 1.0))
+        local = _Affine(bsx, 0.0, 0.0, bsy, 0.0, 0.0).then(xf)  # block SCALE, then placement
         for f in blocks.get(name, []):
             key = f[0].upper()
             try:
                 if key == "L" and len(f) >= 8:
-                    t = to_type(f[2])
-                    p1 = xf.apply((float(f[4]) * scale, float(f[5]) * scale))
-                    p2 = xf.apply((float(f[6]) * scale, float(f[7]) * scale))
-                    dieline.add_line(p1, p2, t)
+                    p1 = local.apply((_float(f[4]), _float(f[5])))
+                    p2 = local.apply((_float(f[6]), _float(f[7])))
+                    dieline.add_line(p1, p2, to_type(f[2]))
                 elif key == "A" and len(f) >= 11:
-                    t = to_type(f[2])
-                    s = xf.apply((float(f[4]) * scale, float(f[5]) * scale))
-                    e = xf.apply((float(f[6]) * scale, float(f[7]) * scale))
-                    c = xf.apply((float(f[8]) * scale, float(f[9]) * scale))
-                    cw = int(float(f[10])) == ARC_CW
-                    if xf.mirrored:
+                    s = local.apply((_float(f[4]), _float(f[5])))
+                    e = local.apply((_float(f[6]), _float(f[7])))
+                    c = local.apply((_float(f[8]), _float(f[9])))
+                    cw = int(_float(f[10])) == ARC_CW
+                    if local.mirrored:
                         cw = not cw
-                    if not xf.conformal:
+                    if not local.conformal:
                         warnings.append(
                             f"arc in {name!r} is scaled non-uniformly; drawn as a circular arc (approximate)"
                         )
-                    dieline.segments.append(Arc(s, e, c, cw, t))
+                    dieline.segments.append(Arc(s, e, c, cw, to_type(f[2])))
                 elif key == "C" and len(f) >= 3:
                     sub = f[1]
                     if sub not in blocks:
                         warnings.append(f"call to undefined subroutine {sub!r}")
                         continue
-                    nums = [float(v) for v in f[2:7]] + [0.0, 0.0, 0.0, 1.0, 1.0][len(f[2:7]) :]
-                    inner = _Affine.call(nums[0] * scale, nums[1] * scale, nums[2], nums[3], nums[4])
-                    emit(sub, inner.then(xf), depth + 1)
+                    defaults = [0.0, 0.0, 0.0, 1.0, 1.0]
+                    n = [_float(f[2 + i]) if 2 + i < len(f) and f[2 + i] else defaults[i] for i in range(5)]
+                    call = _Affine.call(n[0], n[1], n[2], n[3], n[4])
+                    emit(sub, call.then(local), depth + 1)
             except ValueError:
                 warnings.append(f"unparseable record skipped: {','.join(f)}")
 
-    emit(main_name, _Affine(), 0)
+    emit(main_name, _Affine(unit, 0.0, 0.0, unit, 0.0, 0.0), 0)
     return Cf2ReadResult(dieline=dieline, units=units, warnings=warnings, raw_codes=raw_codes)
 
 

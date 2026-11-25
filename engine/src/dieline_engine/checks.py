@@ -147,9 +147,11 @@ def check_crossings(d: Dieline) -> CheckResult:
 
 def check_sheet_fit(d: Dieline, limits: SheetLimits = SheetLimits()) -> CheckResult:
     w, h = d.size()
-    fits = (w <= limits.max_width and h <= limits.max_height) or (
-        h <= limits.max_width and w <= limits.max_height
-    )
+    fits = w <= limits.max_width and h <= limits.max_height
+    if not d.meta.get("corrugated", True):
+        # Folding carton can be turned on the sheet; corrugated can't, because the
+        # flute direction fixes the blank's orientation.
+        fits = fits or (h <= limits.max_width and w <= limits.max_height)
     msg = f"blank {w:.1f} x {h:.1f} mm vs sheet limit {limits.max_width:g} x {limits.max_height:g} mm"
     return CheckResult("sheet_fit", "pass" if fits else "fail", msg)
 
@@ -177,10 +179,21 @@ def check_rsc_manufacturing(d: Dieline) -> list[CheckResult]:
             f"smallest inside dimension {smallest:g} mm (RSC below 50 mm is hard to run)",
         )
     )
-    if float(dims["width"]) > float(dims["length"]):  # type: ignore[index]
+    # Every RSC flap is half the width deep, so the two inner flaps (on the width
+    # panels) collide when their combined depth exceeds the length panel.
+    flap = float(panels["flap_depth"])  # type: ignore[index]
+    length_panel = float(panels["length_panel"])  # type: ignore[index]
+    if 2 * flap > length_panel:
         out.append(
-            CheckResult("length_width", "warn", "width is greater than length; RSC convention is L >= W")
+            CheckResult(
+                "inner_flaps",
+                "fail",
+                f"inner flaps ({2 * flap:.1f} mm together) overlap across the {length_panel:.1f} mm length panel; "
+                "RSC needs length >= width",
+            )
         )
+    else:
+        out.append(CheckResult("inner_flaps", "pass", "inner flaps fit across the length panel"))
     if not meta.get("calibrated", False):
         out.append(
             CheckResult(
