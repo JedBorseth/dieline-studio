@@ -38,6 +38,9 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
   const svgRef = useRef<SVGSVGElement>(null);
   const [view, setView] = useState<ViewBox>(() => fitBox(doc));
   const drag = useRef<{ x: number; y: number } | null>(null);
+  const fitRef = useRef<ViewBox>(fitBox(doc));
+  fitRef.current = useMemo(() => fitBox(doc), [doc]);
+  const endDrag = () => (drag.current = null);
 
   useEffect(() => setView(fitBox(doc)), [doc, fitToken]);
 
@@ -58,6 +61,15 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
     return () => cancelAnimationFrame(id);
   }, [view, onZoom, scale]);
 
+  // The scale also changes when the pane is resized (splitter, window).
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const ro = new ResizeObserver(() => onZoom(scale()));
+    ro.observe(svg);
+    return () => ro.disconnect();
+  }, [onZoom, scale]);
+
   const toModel = (clientX: number, clientY: number) => {
     const svg = svgRef.current;
     const ctm = svg?.getScreenCTM();
@@ -75,13 +87,13 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
       const ctm = svg.getScreenCTM();
       if (!ctm) return;
       const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(ctm.inverse());
-      const f = Math.exp(e.deltaY * 0.0015);
-      setView((v) => ({
-        x: p.x - (p.x - v.x) * f,
-        y: p.y - (p.y - v.y) * f,
-        w: v.w * f,
-        h: v.h * f,
-      }));
+      const delta = Math.max(-200, Math.min(200, e.deltaY)); // one notch at most, however fast the wheel
+      setView((v) => {
+        // Keep zoom between 1/1000 and 20x of the fitted view so the viewBox stays finite.
+        const fit = fitRef.current;
+        const f = Math.min(Math.max(Math.exp(delta * 0.0015), (fit.w * 1e-3) / v.w), (fit.w * 20) / v.w);
+        return { x: p.x - (p.x - v.x) * f, y: p.y - (p.y - v.y) * f, w: v.w * f, h: v.h * f };
+      });
     };
     svg.addEventListener("wheel", onWheel, { passive: false });
     return () => svg.removeEventListener("wheel", onWheel);
@@ -94,6 +106,7 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
       viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
       preserveAspectRatio="xMidYMid meet"
       onPointerDown={(e) => {
+        if (e.button !== 0) return; // pan with the primary button only
         drag.current = { x: e.clientX, y: e.clientY };
         e.currentTarget.setPointerCapture(e.pointerId);
       }}
@@ -101,12 +114,15 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
         onCursor(toModel(e.clientX, e.clientY));
         if (!drag.current) return;
         const s = scale();
+        if (!Number.isFinite(s) || s <= 0) return;
         const dx = (e.clientX - drag.current.x) / s;
         const dy = (e.clientY - drag.current.y) / s;
         drag.current = { x: e.clientX, y: e.clientY };
         setView((v) => ({ ...v, x: v.x - dx, y: v.y - dy }));
       }}
-      onPointerUp={() => (drag.current = null)}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
       onPointerLeave={() => onCursor(null)}
       onDoubleClick={() => setView(fitBox(doc))}
     >

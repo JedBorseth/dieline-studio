@@ -223,6 +223,9 @@ async fn reap(r: Running) -> Option<i32> {
     let code = match timeout(EXIT_GRACE, child.wait()).await {
         Ok(status) => status.ok().and_then(|s| s.code()),
         Err(_) => {
+            if let Some(tree) = &tree {
+                tree.kill();
+            }
             let _ = child.start_kill();
             child.wait().await.ok().and_then(|s| s.code())
         }

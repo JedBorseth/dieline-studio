@@ -168,16 +168,20 @@ class Agent:
         """Validate and start a turn on a worker thread; progress arrives as events."""
         if not text.strip():
             raise ValueError("empty message")
-        key = self.settings.api_key()
-        if not key:
-            raise RuntimeError("No Anthropic API key set. Add one in Settings.")
-        with self._lock:  # look up and reserve atomically so reset/send can't race
+        with self._lock:  # reserve first, so a Stop sent right after Send always finds the turn
             s = self.sessions.setdefault(session_id, Session(session_id))
             if s.busy:
                 raise RuntimeError("a turn is already running in this session")
             s.turns += 1
             t = Turn(s.id, s.turns, [*s.messages, {"role": "user", "content": text}], s.current)
             s.active = t
+        key = self.settings.api_key()  # may be slow (OS credential store), so outside the lock
+        with self._lock:
+            if s.active is not t:
+                return  # stopped while we were reading the key; cancel() already reported it
+            if not key:
+                s.active = None
+                raise RuntimeError("No Anthropic API key set. Add one in Settings.")
         threading.Thread(target=self._run_turn, args=(s, t, key), daemon=True).start()
 
     def _emit(self, t: Turn, event: dict[str, Any]) -> None:
@@ -248,6 +252,7 @@ class Agent:
                 fallbacks="default",
             ) as stream:
                 s.stream = stream
+                self._check_cancel(s)  # Stop may have arrived while connecting
                 for event in stream:
                     self._check_cancel(s)
                     self._forward(s, event)

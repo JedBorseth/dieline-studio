@@ -2,6 +2,8 @@
 
 ## Code adapted from T3 Code
 
+Dieline Studio is an independent project. It is not affiliated with, endorsed by, or maintained by T3 Tools, Inc.
+
 Some UI primitives in this app are adapted from [T3 Code](https://github.com/pingdotgg/t3code)
 (MIT License). Each adapted file starts with a header comment naming its upstream path.
 Changes from upstream: imports rewritten to relative paths; i18n (`gt-react`) replaced with

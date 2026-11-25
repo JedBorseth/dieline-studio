@@ -21,6 +21,19 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [previewWidth, setPreviewWidth] = useState(() => loadNumber("previewWidth", 640));
   const mainRef = useRef<HTMLDivElement>(null);
+  const [mainWidth, setMainWidth] = useState(0);
+
+  // Track the space beside the sidebar so the preview never squeezes the chat
+  // below MIN_CHAT (or overflows) when the window is resized.
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setMainWidth(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const maxPreview = mainWidth ? Math.max(MIN_PREVIEW, mainWidth - MIN_CHAT) : Infinity;
+  const effectivePreview = Math.min(Math.max(previewWidth, MIN_PREVIEW), maxPreview);
 
   const refreshInfo = useCallback(async () => {
     try {
@@ -54,14 +67,17 @@ export default function App() {
     }
   }, []);
 
-  const resizePreview = useCallback((dx: number) => {
-    const total = mainRef.current?.clientWidth ?? 1200;
-    setPreviewWidth((w) => {
-      const next = Math.min(Math.max(w - dx, MIN_PREVIEW), total - MIN_CHAT);
+  const resizePreview = useCallback(
+    (dx: number) => {
+      const next = Math.min(Math.max(effectivePreview - dx, MIN_PREVIEW), maxPreview);
+      setPreviewWidth(next);
       saveNumber("previewWidth", next);
-      return next;
-    });
-  }, []);
+    },
+    [effectivePreview, maxPreview],
+  );
+  const openSettings = useCallback(() => {
+    if (info) setSettingsOpen(true); // nothing to show until the engine has reported its settings
+  }, [info]);
 
   return (
     <TooltipProvider delay={400}>
@@ -71,7 +87,7 @@ export default function App() {
           activeId={state.activeId}
           onNew={() => dispatch({ type: "new_session" })}
           onSelect={(id) => dispatch({ type: "select_session", id })}
-          onSettings={() => setSettingsOpen(true)}
+          onSettings={openSettings}
           engineReady={state.engineReady}
           engineVersion={info?.version}
         />
@@ -82,11 +98,16 @@ export default function App() {
             engineError={engineError}
             onSend={(text) => void send(active.id, text)}
             onStop={() => void request("chat.cancel", { session_id: active.id }).catch(() => undefined)}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={openSettings}
           />
-          <Splitter onDrag={resizePreview} />
+          <Splitter
+            onDrag={resizePreview}
+            value={effectivePreview}
+            min={MIN_PREVIEW}
+            max={Number.isFinite(maxPreview) ? maxPreview : effectivePreview}
+          />
           <PreviewPane
-            width={previewWidth}
+            width={effectivePreview}
             source={state.preview}
             info={info}
             onPreview={(source) => dispatch({ type: "preview", source })}
@@ -96,7 +117,7 @@ export default function App() {
           <SettingsDialog
             settings={info.settings}
             onClose={() => setSettingsOpen(false)}
-            onSaved={(settings) => setInfo({ ...info, settings })}
+            onSaved={(settings) => setInfo((prev) => (prev ? { ...prev, settings } : prev))}
           />
         )}
       </div>

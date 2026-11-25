@@ -12,7 +12,7 @@ import {
   SquareDashedIcon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, parseCf2 } from "../lib/cf2";
 import { EngineError, request } from "../lib/engine";
@@ -55,6 +55,9 @@ export function PreviewPane({ width, source, info, onPreview }: Props) {
   const [status, setStatus] = useState<{ tone: "info" | "error"; text: string } | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // A status message belongs to the dieline it was about.
+  useEffect(() => setStatus(null), [source]);
 
   const parsed = useMemo((): { doc: Cf2Doc | null; error: string | null } => {
     if (!source) return { doc: null, error: null };
@@ -130,7 +133,6 @@ export function PreviewPane({ width, source, info, onPreview }: Props) {
           info={info}
           initial={design?.params}
           onCreated={(d) => onPreview({ kind: "design", design: d, origin: "form" })}
-          onError={(text) => setStatus({ tone: "error", text })}
         />
       )}
 
@@ -206,12 +208,27 @@ export function PreviewPane({ width, source, info, onPreview }: Props) {
             )}
           </>
         )}
-        {status && (
-          <span className={cn("min-w-0 truncate", status.tone === "error" && "text-destructive-foreground")}>
-            {status.text}
-          </span>
-        )}
       </footer>
+      {status && (
+        // Its own wrapping row, so long paths and errors are never squeezed out by the readouts.
+        <div
+          role={status.tone === "error" ? "alert" : "status"}
+          className={cn(
+            "flex shrink-0 items-start gap-2 border-t px-3 py-1.5 text-xs wrap-anywhere",
+            status.tone === "error" ? "text-destructive-foreground" : "text-muted-foreground",
+          )}
+        >
+          <span className="min-w-0 flex-1 select-text">{status.text}</span>
+          <button
+            type="button"
+            className="shrink-0 rounded px-1 hover:bg-accent"
+            aria-label="Dismiss"
+            onClick={() => setStatus(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -286,10 +303,22 @@ function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind:
   );
 }
 
-function Field({ label, className, children }: { label: string; className?: string; children: React.ReactNode }) {
+function Field({
+  label,
+  id,
+  className,
+  children,
+}: {
+  label: string;
+  id: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className={cn("flex min-w-0 flex-col gap-1.5", className)}>
-      <Label className="font-normal text-muted-foreground text-xs sm:text-xs">{label}</Label>
+      <Label htmlFor={id} className="font-normal text-muted-foreground text-xs sm:text-xs">
+        {label}
+      </Label>
       {children}
     </div>
   );
@@ -299,8 +328,10 @@ function QuickBox(props: {
   info: EngineInfo;
   initial?: BoxParams;
   onCreated: (d: Awaited<ReturnType<typeof request<"box.create">>>) => void;
-  onError: (msg: string) => void;
 }) {
+  const uid = useId();
+  const fid = (name: string) => `${uid}-${name}`;
+  const [error, setError] = useState<string | null>(null);
   const { info } = props;
   const [p, setP] = useState<BoxParams>(
     props.initial ?? {
@@ -338,22 +369,24 @@ function QuickBox(props: {
 
   return (
     <form
+      noValidate
       className="grid shrink-0 grid-cols-12 gap-x-2 gap-y-3 border-b bg-background/50 p-3"
       onSubmit={(e) => {
         e.preventDefault();
         const params = parsed();
-        if (typeof params === "string") return props.onError(params);
+        if (typeof params === "string") return setError(params);
+        setError(null);
         setP(params);
         setBusy(true);
         request("box.create", params)
           .then(props.onCreated)
-          .catch((err: unknown) => props.onError(err instanceof Error ? err.message : String(err)))
+          .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
           .finally(() => setBusy(false));
       }}
     >
-      <Field label="Style" className="col-span-12 @[30rem]:col-span-6">
+      <Field label="Style" id={fid("style")} className="col-span-12 @[30rem]:col-span-6">
         <Select items={styleItems} value={p.style} onValueChange={(v) => v !== null && setP({ ...p, style: v })}>
-          <SelectTrigger size="sm" className="min-w-0" aria-label="Style">
+          <SelectTrigger size="sm" className="min-w-0" id={fid("style")}>
             <SelectValue />
           </SelectTrigger>
           <SelectPopup>
@@ -365,9 +398,9 @@ function QuickBox(props: {
           </SelectPopup>
         </Select>
       </Field>
-      <Field label="Board" className="col-span-12 @[30rem]:col-span-6">
+      <Field label="Board" id={fid("board")} className="col-span-12 @[30rem]:col-span-6">
         <Select items={boardItems} value={p.board} onValueChange={(v) => v !== null && setP({ ...p, board: v })}>
-          <SelectTrigger size="sm" className="min-w-0" aria-label="Board">
+          <SelectTrigger size="sm" className="min-w-0" id={fid("board")}>
             <SelectValue />
           </SelectTrigger>
           <SelectPopup>
@@ -379,22 +412,22 @@ function QuickBox(props: {
           </SelectPopup>
         </Select>
       </Field>
-      <Field label="Length" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.length} onChange={num("length")} aria-label="Length" />
+      <Field label="Length" id={fid("length")} className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" id={fid("length")} type="text" inputMode="decimal" autoComplete="off" value={dims.length} onChange={num("length")} />
       </Field>
-      <Field label="Width" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.width} onChange={num("width")} aria-label="Width" />
+      <Field label="Width" id={fid("width")} className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" id={fid("width")} type="text" inputMode="decimal" autoComplete="off" value={dims.width} onChange={num("width")} />
       </Field>
-      <Field label="Depth" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.depth} onChange={num("depth")} aria-label="Depth" />
+      <Field label="Depth" id={fid("depth")} className="col-span-3 @[30rem]:col-span-2">
+        <Input size="sm" id={fid("depth")} type="text" inputMode="decimal" autoComplete="off" value={dims.depth} onChange={num("depth")} />
       </Field>
-      <Field label="Units" className="col-span-3 @[30rem]:col-span-2">
+      <Field label="Units" id={fid("units")} className="col-span-3 @[30rem]:col-span-2">
         <Select
           items={unitItems}
           value={p.units}
           onValueChange={(v) => v !== null && setP({ ...p, units: v as "mm" | "in" })}
         >
-          <SelectTrigger size="sm" className="min-w-0" aria-label="Units">
+          <SelectTrigger size="sm" className="min-w-0" id={fid("units")}>
             <SelectValue />
           </SelectTrigger>
           <SelectPopup>
@@ -412,6 +445,11 @@ function QuickBox(props: {
           Generate
         </Button>
       </div>
+      {error && (
+        <p role="alert" className="col-span-12 text-destructive-foreground text-xs wrap-anywhere">
+          {error}
+        </p>
+      )}
     </form>
   );
 }
