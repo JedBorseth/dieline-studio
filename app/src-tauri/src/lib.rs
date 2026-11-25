@@ -1,10 +1,10 @@
 mod engine;
 
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(engine::Engine::new())
         .setup(|app| {
             // Start the engine early so the first request doesn't wait for Python.
@@ -17,6 +17,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![engine::engine_request])
-        .run(tauri::generate_context!())
-        .expect("error while running Dieline Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building Dieline Studio");
+
+    app.run(|handle, event| {
+        if let RunEvent::Exit = event {
+            tauri::async_runtime::block_on(handle.state::<engine::Engine>().shutdown());
+        }
+    });
 }

@@ -57,3 +57,12 @@ test("arc direction maps to the SVG sweep flag", () => {
 test("rejects text without a MAIN block", () => {
   assert.throws(() => parseCf2("hello"), /no MAIN block/);
 });
+
+test("subroutine transforms compose as affine maps (mirror after rotation)", () => {
+  const nested = ["MAIN,m", "C,outer,0,0,0,-1,1", "END", "SUB,outer", "C,inner,0,0,90,1,1", "END",
+    "SUB,inner", "L,2,1,0,0,0,1,0,0,0", "END"].join("\n");
+  const a = parseCf2(nested).primitives[0];
+  assert.ok(a.kind === "line" && Math.abs(a.x2) < 1e-9 && Math.abs(a.y2 - 1) < 1e-9);
+  const single = parseCf2("MAIN,m\nC,s,0,0,90,1,-1\nEND\nSUB,s\nL,2,1,0,0,0,1,0,0,0\nEND").primitives[0];
+  assert.ok(single.kind === "line" && Math.abs(single.x2) < 1e-9 && Math.abs(single.y2 + 1) < 1e-9);
+});

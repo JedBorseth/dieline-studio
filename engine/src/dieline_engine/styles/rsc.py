@@ -52,7 +52,8 @@ def build(length: float, width: float, depth: float, board: Board) -> Dieline:
     flap = (width + a.flap) / 2
     body = depth + a.depth
     s = a.slot_width
-    tg = a.glue_taper
+    # Keep at least half the glue flap's free edge straight on shallow boxes.
+    tg = min(a.glue_taper, body / 4)
 
     xs = [gf]
     for p in panels:
@@ -99,7 +100,7 @@ def build(length: float, width: float, depth: float, board: Board) -> Dieline:
         "inside_dims_mm": {"length": length, "width": width, "depth": depth},
         "board": board.id,
         "caliper_mm": board.caliper_mm,
-        "allowances_mm": asdict(a),
+        "allowances_mm": {**asdict(a), "glue_taper": tg},
         "calibrated": False,
         "panels_mm": {
             "glue_flap": gf,

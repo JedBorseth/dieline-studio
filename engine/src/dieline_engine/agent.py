@@ -105,6 +105,7 @@ class Session:
     current: BoxParams | None = None
     busy: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
+    stream: Any = None  # the in-flight SDK stream, closed by cancel()
 
 
 class Agent:
@@ -114,21 +115,25 @@ class Agent:
         self.sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
 
-    def session(self, session_id: str) -> Session:
-        with self._lock:
-            return self.sessions.setdefault(session_id, Session(session_id))
-
     def reset(self, session_id: str) -> None:
         with self._lock:
             s = self.sessions.get(session_id)
             if s and s.busy:
-                raise RuntimeError("session is busy; cancel the turn first")
+                raise RuntimeError("session is busy; stop the turn first")
             self.sessions.pop(session_id, None)
 
     def cancel(self, session_id: str) -> None:
-        s = self.sessions.get(session_id)
-        if s:
+        with self._lock:
+            s = self.sessions.get(session_id)
+            if not s or not s.busy:
+                return
             s.cancel.set()
+            stream = s.stream
+        if stream is not None:
+            try:
+                stream.close()  # unblocks a stalled read in the worker
+            except Exception:  # closing a finished stream is harmless
+                pass
 
     def start_turn(self, session_id: str, text: str) -> None:
         """Validate and start a turn on a worker thread; progress arrives as events."""
@@ -137,8 +142,8 @@ class Agent:
         key = self.settings.api_key()
         if not key:
             raise RuntimeError("No Anthropic API key set. Add one in Settings.")
-        s = self.session(session_id)
-        with self._lock:
+        with self._lock:  # look up and reserve atomically so reset/send can't race
+            s = self.sessions.setdefault(session_id, Session(session_id))
             if s.busy:
                 raise RuntimeError("a turn is already running in this session")
             s.busy = True
@@ -150,19 +155,27 @@ class Agent:
     def _run_turn(self, s: Session, text: str, api_key: str) -> None:
         checkpoint = len(s.messages)
         s.messages.append({"role": "user", "content": text})
-        sid = s.id
+        events: list[dict[str, Any]] = []
         try:
             stop_reason = self._loop(s, api_key)
-            self.emit({"type": "chat.turn_end", "session_id": sid, "stop_reason": stop_reason})
         except TurnCancelled:
             del s.messages[checkpoint:]  # drop the whole turn; history stays append-only
-            self.emit({"type": "chat.turn_end", "session_id": sid, "stop_reason": "cancelled"})
+            stop_reason = "cancelled"
         except Exception as exc:  # surface every failure to the UI, keep the engine alive
+            log.warning("turn failed: %s", exc)
             del s.messages[checkpoint:]
-            self.emit({"type": "chat.error", "session_id": sid, "message": _describe_error(exc)})
-            self.emit({"type": "chat.turn_end", "session_id": sid, "stop_reason": "error"})
-        finally:
+            events.append({"type": "chat.error", "session_id": s.id, "message": _describe_error(exc)})
+            stop_reason = "error"
+        with self._lock:  # release before announcing, so an immediate follow-up is accepted
             s.busy = False
+            s.stream = None
+        for event in events:
+            self.emit(event)
+        self.emit({"type": "chat.turn_end", "session_id": s.id, "stop_reason": stop_reason})
+
+    def _check_cancel(self, s: Session) -> None:
+        if s.cancel.is_set():
+            raise TurnCancelled()
 
     def _loop(self, s: Session, api_key: str) -> str:
         cfg = self.settings.settings
@@ -170,6 +183,7 @@ class Agent:
         sid = s.id
         json_retries = 0
         for _ in range(MAX_STEPS):
+            self._check_cancel(s)
             try:
                 with client.beta.messages.stream(
                     model=cfg.model,
@@ -183,39 +197,58 @@ class Agent:
                     betas=[FALLBACK_BETA],
                     fallbacks="default",
                 ) as stream:
+                    s.stream = stream
                     for event in stream:
-                        if s.cancel.is_set():
-                            raise TurnCancelled()
+                        self._check_cancel(s)
                         self._forward(sid, event)
+                    self._check_cancel(s)
                     response = stream.get_final_message()
                 json_retries = 0
+            except TurnCancelled:
+                raise
             except ValueError:
                 # Tool input JSON the SDK could not parse at all; re-issue the step.
                 json_retries += 1
                 if json_retries > 2:
                     raise
                 continue
+            except Exception:
+                if s.cancel.is_set():  # the stream was closed under us by cancel()
+                    raise TurnCancelled() from None
+                raise
+            finally:
+                s.stream = None
 
-            if response.stop_reason == "pause_turn":
+            stop = response.stop_reason
+            if stop == "pause_turn":
                 s.messages.append({"role": "assistant", "content": response.content})
                 continue
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if response.stop_reason == "refusal":
-                s.messages.append({"role": "assistant", "content": response.content})
+            if stop != "tool_use" and tool_uses:
+                # A refusal or truncation cut a tool call off. A tool_use without a
+                # tool_result would break the next request, so drop the whole turn.
+                raise RuntimeError(f"Claude's reply ended mid tool call ({stop}); this turn was discarded.")
+            s.messages.append({"role": "assistant", "content": response.content})
+            if stop == "refusal":
                 details = getattr(response, "stop_details", None)
                 category = getattr(details, "category", None) if details else None
                 self.emit({"type": "chat.error", "session_id": sid,
                            "message": f"Claude declined this request{f' ({category})' if category else ''}."})
                 return "refusal"
-            if response.stop_reason == "max_tokens" and tool_uses:
-                raise RuntimeError("tool input was cut off at max_tokens")
+            if stop in ("max_tokens", "model_context_window_exceeded"):
+                # Never run tools from a truncated turn: their input may be cut off.
+                what = "the reply length limit" if stop == "max_tokens" else "the context window"
+                self.emit({"type": "chat.error", "session_id": sid,
+                           "message": f"The reply was cut off at {what}. Start a new design to continue."})
+                return stop
+            if stop != "tool_use":
+                return stop or "end_turn"
 
-            s.messages.append({"role": "assistant", "content": response.content})
-            if not tool_uses:
-                return response.stop_reason or "end_turn"
-
-            results = [self._run_tool(s, b) for b in tool_uses]
+            results = []
+            for block in tool_uses:
+                self._check_cancel(s)
+                results.append(self._run_tool(s, block))
             s.messages.append({"role": "user", "content": results})
         return "max_steps"
 

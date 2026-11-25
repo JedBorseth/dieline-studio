@@ -86,28 +86,50 @@ class Cf2ReadResult:
 
 
 @dataclass(frozen=True, slots=True)
-class _Xform:
-    dx: float = 0.0
-    dy: float = 0.0
-    angle_deg: float = 0.0
-    sx: float = 1.0
-    sy: float = 1.0
+class _Affine:
+    """x' = a*x + b*y + e,  y' = c*x + d*y + f"""
+
+    a: float = 1.0
+    b: float = 0.0
+    c: float = 0.0
+    d: float = 1.0
+    e: float = 0.0
+    f: float = 0.0
+
+    @staticmethod
+    def call(dx: float, dy: float, angle_deg: float, sx: float, sy: float) -> "_Affine":
+        # CFF2 subroutine call: rotate, then scale/mirror, then translate.
+        r = math.radians(angle_deg)
+        cos, sin = math.cos(r), math.sin(r)
+        return _Affine(sx * cos, -sx * sin, sy * sin, sy * cos, dx, dy)
 
     def apply(self, p: Point) -> Point:
-        x, y = p[0] * self.sx, p[1] * self.sy
-        a = math.radians(self.angle_deg)
-        c, s = math.cos(a), math.sin(a)
-        return (x * c - y * s + self.dx, x * s + y * c + self.dy)
+        x, y = p
+        return (self.a * x + self.b * y + self.e, self.c * x + self.d * y + self.f)
 
-    def then(self, outer: "_Xform") -> "_Xform":
-        # Compose: apply self, then outer. Only exact for uniform scale, which is
-        # what CF2 producers use in practice.
-        dx, dy = outer.apply((self.dx, self.dy))
-        return _Xform(dx, dy, self.angle_deg + outer.angle_deg, self.sx * outer.sx, self.sy * outer.sy)
+    def then(self, outer: "_Affine") -> "_Affine":
+        """The transform that applies self first, then outer."""
+        o = outer
+        return _Affine(
+            o.a * self.a + o.b * self.c,
+            o.a * self.b + o.b * self.d,
+            o.c * self.a + o.d * self.c,
+            o.c * self.b + o.d * self.d,
+            o.a * self.e + o.b * self.f + o.e,
+            o.c * self.e + o.d * self.f + o.f,
+        )
 
     @property
     def mirrored(self) -> bool:
-        return (self.sx < 0) != (self.sy < 0)
+        return self.a * self.d - self.b * self.c < 0
+
+    @property
+    def conformal(self) -> bool:
+        """True if circles stay circles (rotation + uniform scale, optionally mirrored)."""
+        n1 = math.hypot(self.a, self.c)
+        n2 = math.hypot(self.b, self.d)
+        dot = self.a * self.b + self.c * self.d
+        return abs(n1 - n2) <= 1e-9 * max(n1, n2, 1.0) and abs(dot) <= 1e-9 * max(n1 * n2, 1.0)
 
 
 def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
@@ -149,7 +171,7 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
         raw_codes[code] = raw_codes.get(code, 0) + 1
         return CF2_CODE_TYPES.get(code, LineType.ANNOTATION)
 
-    def emit(name: str, xf: _Xform, depth: int) -> None:
+    def emit(name: str, xf: _Affine, depth: int) -> None:
         if depth > max_depth:
             warnings.append(f"subroutine nesting deeper than {max_depth} at {name!r}; skipped")
             return
@@ -169,6 +191,10 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
                     cw = int(float(f[10])) == ARC_CW
                     if xf.mirrored:
                         cw = not cw
+                    if not xf.conformal:
+                        warnings.append(
+                            f"arc in {name!r} is scaled non-uniformly; drawn as a circular arc (approximate)"
+                        )
                     dieline.segments.append(Arc(s, e, c, cw, t))
                 elif key == "C" and len(f) >= 3:
                     sub = f[1]
@@ -176,12 +202,12 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
                         warnings.append(f"call to undefined subroutine {sub!r}")
                         continue
                     nums = [float(v) for v in f[2:7]] + [0.0, 0.0, 0.0, 1.0, 1.0][len(f[2:7]) :]
-                    inner = _Xform(nums[0] * scale, nums[1] * scale, nums[2], nums[3], nums[4])
+                    inner = _Affine.call(nums[0] * scale, nums[1] * scale, nums[2], nums[3], nums[4])
                     emit(sub, inner.then(xf), depth + 1)
             except ValueError:
                 warnings.append(f"unparseable record skipped: {','.join(f)}")
 
-    emit(main_name, _Xform(), 0)
+    emit(main_name, _Affine(), 0)
     return Cf2ReadResult(dieline=dieline, units=units, warnings=warnings, raw_codes=raw_codes)
 
 

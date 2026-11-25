@@ -65,15 +65,30 @@ def agent_view(design: dict) -> dict:
 _SAFE = re.compile(r"[^A-Za-z0-9._ -]+")
 
 
+# Device names Windows reserves regardless of extension.
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)), *(f"LPT{i}" for i in range(10))}
+
+
 def safe_filename(name: str) -> str:
     stem = _SAFE.sub("_", name).strip(" ._") or "design"
     stem = stem[:120]
-    return stem if stem.lower().endswith(".cf2") else f"{stem}.cf2"
+    if stem.lower().endswith(".cf2"):
+        stem = stem[:-4].rstrip(" .") or "design"
+    if stem.split(".")[0].upper() in _RESERVED:
+        stem = f"_{stem}"
+    return f"{stem}.cf2"
+
+
+class DesignCheckFailed(ValueError):
+    """Raised when asked to export a design whose checks fail."""
 
 
 def export_cf2(params: BoxParams, output_dir: Path, filename: str | None = None) -> dict:
     """Regenerate deterministically from params and write the CF2 file."""
     design = create_box(params)
+    if design["overall"] == "fail":
+        failed = "; ".join(c["message"] for c in design["checks"] if c["status"] == "fail")
+        raise DesignCheckFailed(f"not exported: the design fails its checks ({failed})")
     output_dir.mkdir(parents=True, exist_ok=True)
     target = (output_dir / safe_filename(filename or design["name"])).resolve()
     if target.parent != output_dir.resolve():

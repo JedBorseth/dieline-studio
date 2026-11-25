@@ -84,7 +84,8 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         activeId: action.id,
-        preview: s?.design ? { kind: "design", design: s.design, origin: "agent" } : state.preview,
+        // Show the selected session's own design, never one left over from another session.
+        preview: s?.design ? { kind: "design", design: s.design, origin: "agent" } : null,
       };
     }
     case "user_message":
@@ -139,7 +140,11 @@ function applyEvent(state: State, e: EngineEvent): State {
       return updateSession(state, e.session_id, (s) => notice(s, "error", e.message));
     case "chat.turn_end":
       return updateSession(state, e.session_id, (s) => {
-        const ended = { ...s, busy: false };
+        // Tool calls still "running" when a turn ends never got a result.
+        const items = s.items.map((it) =>
+          it.kind === "tool" && it.status === "running" ? { ...it, status: "error" as const } : it,
+        );
+        const ended = { ...s, items, busy: false };
         if (e.stop_reason === "cancelled")
           return notice(ended, "info", "Stopped. This turn was not kept in the conversation.");
         if (e.stop_reason === "error") return notice(ended, "info", "This turn was not kept in the conversation.");

@@ -39,26 +39,48 @@ export interface Cf2Doc {
   warnings: string[];
 }
 
-interface Xform {
-  dx: number;
-  dy: number;
-  angle: number; // degrees
-  sx: number;
-  sy: number;
+/** x' = a*x + b*y + e,  y' = c*x + d*y + f */
+interface Affine {
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+  e: number;
+  f: number;
 }
 
-const IDENTITY: Xform = { dx: 0, dy: 0, angle: 0, sx: 1, sy: 1 };
+const IDENTITY: Affine = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
 
-function apply(t: Xform, x: number, y: number): [number, number] {
-  const a = (t.angle * Math.PI) / 180;
-  const px = x * t.sx;
-  const py = y * t.sy;
-  return [px * Math.cos(a) - py * Math.sin(a) + t.dx, px * Math.sin(a) + py * Math.cos(a) + t.dy];
+/** CFF2 subroutine call: rotate, then scale/mirror, then translate. */
+function callTransform(dx: number, dy: number, angleDeg: number, sx: number, sy: number): Affine {
+  const r = (angleDeg * Math.PI) / 180;
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  return { a: sx * cos, b: -sx * sin, c: sy * sin, d: sy * cos, e: dx, f: dy };
 }
 
-function compose(inner: Xform, outer: Xform): Xform {
-  const [dx, dy] = apply(outer, inner.dx, inner.dy);
-  return { dx, dy, angle: inner.angle + outer.angle, sx: inner.sx * outer.sx, sy: inner.sy * outer.sy };
+function apply(t: Affine, x: number, y: number): [number, number] {
+  return [t.a * x + t.b * y + t.e, t.c * x + t.d * y + t.f];
+}
+
+/** The transform that applies `inner` first, then `outer`. */
+function compose(inner: Affine, outer: Affine): Affine {
+  const o = outer;
+  return {
+    a: o.a * inner.a + o.b * inner.c,
+    b: o.a * inner.b + o.b * inner.d,
+    c: o.c * inner.a + o.d * inner.c,
+    d: o.c * inner.b + o.d * inner.d,
+    e: o.a * inner.e + o.b * inner.f + o.e,
+    f: o.c * inner.e + o.d * inner.f + o.f,
+  };
+}
+
+function isConformal(t: Affine): boolean {
+  const n1 = Math.hypot(t.a, t.c);
+  const n2 = Math.hypot(t.b, t.d);
+  const dot = t.a * t.b + t.c * t.d;
+  return Math.abs(n1 - n2) <= 1e-9 * Math.max(n1, n2, 1) && Math.abs(dot) <= 1e-9 * Math.max(n1 * n2, 1);
 }
 
 export function parseCf2(text: string, maxDepth = 16): Cf2Doc {
@@ -101,12 +123,13 @@ export function parseCf2(text: string, maxDepth = 16): Cf2Doc {
     return v;
   };
 
-  const emit = (name: string, t: Xform, depth: number) => {
+  const emit = (name: string, t: Affine, depth: number) => {
     if (depth > maxDepth) {
       warnings.push(`subroutine nesting deeper than ${maxDepth} at "${name}"`);
       return;
     }
-    const mirrored = t.sx < 0 !== t.sy < 0;
+    const mirrored = t.a * t.d - t.b * t.c < 0;
+    const conformal = isConformal(t);
     for (const f of blocks.get(name) ?? []) {
       const key = f[0].toUpperCase();
       try {
@@ -122,6 +145,7 @@ export function parseCf2(text: string, maxDepth = 16): Cf2Doc {
           const [cx, cy] = apply(t, num(f[8]) * scale, num(f[9]) * scale);
           let cw = Math.trunc(num(f[10])) === -1;
           if (mirrored) cw = !cw;
+          if (!conformal) warnings.push(`arc in "${name}" is scaled non-uniformly; drawn as a circular arc`);
           primitives.push({ kind: "arc", code, type, sx, sy, ex, ey, cx, cy, cw });
         } else if (key === "C" && f.length >= 3) {
           if (!blocks.has(f[1])) {
@@ -129,7 +153,7 @@ export function parseCf2(text: string, maxDepth = 16): Cf2Doc {
             continue;
           }
           const n = [...f.slice(2, 7).map(num), ...[0, 0, 0, 1, 1].slice(f.slice(2, 7).length)];
-          const inner: Xform = { dx: n[0] * scale, dy: n[1] * scale, angle: n[2], sx: n[3], sy: n[4] };
+          const inner = callTransform(n[0] * scale, n[1] * scale, n[2], n[3], n[4]);
           emit(f[1], compose(inner, t), depth + 1);
         }
       } catch {

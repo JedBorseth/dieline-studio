@@ -25,6 +25,8 @@
 4. **Calibrate against ArtiosCAD's RSC** using exported scoreline data.
 5. Then add the agent tools, fold simulation, more styles, DXF export and previews.
 
+**Progress (2026-11-25):** the Windows desktop app is scaffolded (see [ARCHITECTURE.md](ARCHITECTURE.md)). Milestone 1 is in place with placeholder allowances; milestone 2 has the geometry checks and first manufacturing checks. The agent tools and CF2 preview from milestone 5 came early so the whole pipeline can be exercised. Milestones 3 and 4 (ArtiosCAD import test and calibration) are next.
+
 ## Open questions
 
 - Which 2–3 box styles does the company use most?

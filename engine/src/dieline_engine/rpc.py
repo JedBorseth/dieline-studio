@@ -109,7 +109,8 @@ class Server:
         self.emit({"type": "engine.ready", "version": __version__})
         for line in inp:
             self.handle_line(line)
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        # stdin closed (the app quit): finish requests already received, then exit.
+        self._pool.shutdown(wait=True)
 
     # ---------------------------------------------------------------- methods
 

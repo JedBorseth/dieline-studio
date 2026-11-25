@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 APP_NAME = "Dieline Studio"
 KEYRING_SERVICE = "dieline-studio"
 KEYRING_USER = "anthropic-api-key"
+API_KEY_PREFIX = "sk-ant-api"
 
 MODELS = [
     {"id": "claude-opus-5-5", "label": "Claude Opus 5.5"},
@@ -47,7 +48,6 @@ class SettingsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or Path(platformdirs.user_config_dir(APP_NAME, appauthor=False)) / "settings.json"
         self._lock = threading.Lock()
-        self._memory_key: str | None = None  # fallback when no keyring backend exists
         self.settings = self._load()
 
     def _load(self) -> Settings:
@@ -70,6 +70,7 @@ class SettingsStore:
     # API key -----------------------------------------------------------------
 
     def api_key(self) -> str | None:
+        """The stored key, else ANTHROPIC_API_KEY from the environment (dev use)."""
         try:
             import keyring
 
@@ -77,12 +78,15 @@ class SettingsStore:
             if stored:
                 return stored
         except Exception as exc:  # no backend (headless Linux) or a locked store
-            log.debug("keyring unavailable: %s", exc)
-        return self._memory_key or os.environ.get("ANTHROPIC_API_KEY") or None
+            log.debug("keyring unavailable: %s", type(exc).__name__)
+        return os.environ.get("ANTHROPIC_API_KEY") or None
 
-    def set_api_key(self, key: str | None) -> str:
-        """Store (or clear, with None/'') the key. Returns where it went."""
+    def set_api_key(self, key: str | None) -> None:
+        """Store the key in the OS credential store, or clear it with None/''."""
         key = (key or "").strip() or None
+        if key is not None and not key.startswith(API_KEY_PREFIX):
+            # The shipped app may only use API keys: no OAuth, subscription or admin tokens.
+            raise ValueError("That isn't an Anthropic API key. API keys start with sk-ant-api.")
         try:
             import keyring
 
@@ -93,16 +97,19 @@ class SettingsStore:
                     keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
                 except keyring.errors.PasswordDeleteError:
                     pass
-            self._memory_key = None
-            return "keyring"
+        except ValueError:
+            raise
         except Exception as exc:
-            log.warning("keyring unavailable, keeping API key in memory for this session: %s", exc)
-            self._memory_key = key
-            return "memory"
+            # Never include the key in the message; the exception text could echo it.
+            raise RuntimeError(
+                f"Couldn't save to the system credential store ({type(exc).__name__}). The key was not stored."
+            ) from None
 
     # Settings ----------------------------------------------------------------
 
     def update(self, changes: dict) -> None:
+        if "api_key" in changes:
+            self.set_api_key(changes["api_key"])
         with self._lock:
             if "model" in changes:
                 model = str(changes["model"])
@@ -117,8 +124,6 @@ class SettingsStore:
             if "output_dir" in changes:
                 self.settings.output_dir = str(changes["output_dir"] or "")
             self._save()
-            if "api_key" in changes:
-                self.set_api_key(changes["api_key"])
 
     def public(self) -> dict:
         return {

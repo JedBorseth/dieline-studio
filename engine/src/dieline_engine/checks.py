@@ -88,14 +88,61 @@ def check_overlaps(d: Dieline) -> CheckResult:
             if lo < reach - EPS * 10:
                 overlaps += 1
             reach = max(reach, hi)
-    arcs = [s for s in d.segments if isinstance(s, Arc)]
-    arc_keys = Counter(
-        (frozenset((_key(a.start), _key(a.end))), _key(a.center)) for a in arcs
-    )
-    overlaps += sum(n - 1 for n in arc_keys.values() if n > 1)
+    overlaps += _arc_overlaps([s for s in d.segments if isinstance(s, Arc) and s.type != LineType.ANNOTATION])
     if overlaps:
         return CheckResult("overlaps", "fail", f"{overlaps} duplicate or overlapping segment(s)")
     return CheckResult("overlaps", "pass", "no duplicate or overlapping segments")
+
+
+def _arc_overlaps(arcs: list[Arc]) -> int:
+    """Count pairs of arcs on the same circle whose swept intervals overlap."""
+    circles: dict[tuple, list[tuple[float, float, float]]] = {}
+    for a in arcs:
+        sweep = a.sweep
+        start = a.end if a.clockwise else a.start  # normalise to a CCW interval
+        a0 = math.atan2(start[1] - a.center[1], start[0] - a.center[0]) % math.tau
+        key = (_key(a.center), round(a.radius, PRECISION - 1))
+        circles.setdefault(key, []).append((a0, abs(sweep), a.radius))
+    count = 0
+    for spans in circles.values():
+        for i in range(len(spans)):
+            for j in range(i + 1, len(spans)):
+                a1, l1, r = spans[i]
+                a2, l2, _ = spans[j]
+                eps = EPS * 10 / max(r, EPS)
+                d = (a2 - a1) % math.tau  # where interval j starts, relative to i
+                if d < l1 - eps or d + l2 > math.tau + eps:
+                    count += 1
+    return count
+
+
+def check_crossings(d: Dieline) -> CheckResult:
+    """No two lines may cross through each other's interiors.
+
+    T-junctions (a crease ending on a cut) and shared endpoints are fine; a
+    crossing means a self-intersecting outline or a rule cutting through a
+    panel. Arcs are not yet included.
+    """
+    lines = [s for s in d.segments if isinstance(s, Line) and s.type != LineType.ANNOTATION]
+    crossings: list[Point] = []
+    for i in range(len(lines)):
+        (ax, ay), (bx, by) = lines[i].start, lines[i].end
+        for j in range(i + 1, len(lines)):
+            (cx, cy), (dx, dy) = lines[j].start, lines[j].end
+            rx, ry, sx, sy = bx - ax, by - ay, dx - cx, dy - cy
+            denom = rx * sy - ry * sx
+            if abs(denom) < 1e-12:
+                continue  # parallel or collinear: check_overlaps handles those
+            t = ((cx - ax) * sy - (cy - ay) * sx) / denom
+            u = ((cx - ax) * ry - (cy - ay) * rx) / denom
+            tol_t = EPS * 10 / math.hypot(rx, ry)
+            tol_u = EPS * 10 / math.hypot(sx, sy)
+            if tol_t < t < 1 - tol_t and tol_u < u < 1 - tol_u:
+                crossings.append((ax + t * rx, ay + t * ry))
+    if crossings:
+        sample = ", ".join(f"({x:.1f}, {y:.1f})" for x, y in crossings[:4])
+        return CheckResult("crossings", "fail", f"{len(crossings)} crossing line(s), e.g. at {sample}")
+    return CheckResult("crossings", "pass", "no lines cross")
 
 
 def check_sheet_fit(d: Dieline, limits: SheetLimits = SheetLimits()) -> CheckResult:
@@ -151,6 +198,7 @@ def run_checks(d: Dieline) -> list[CheckResult]:
         check_zero_length(d),
         check_closed_outline(d),
         check_overlaps(d),
+        check_crossings(d),
         check_sheet_fit(d),
     ]
     results += check_rsc_manufacturing(d)
