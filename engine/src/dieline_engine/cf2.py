@@ -1,9 +1,14 @@
 """CF2 (Common Format 2) writer and reader.
 
-UNCONFIRMED CONVENTIONS. The line-type codes, the units keyword and the arc
-direction flag below follow Kodak's published CF2 description. docs/CONTEXT.md
-warns that codes vary between systems: confirm every value against a CF2
-exported from our ArtiosCAD (docs/PLAN.md open questions) before relying on it.
+Line-type codes: R&L's CF2 import tuning (ServerLib `Artios_CFF2.ITUNE`, the
+shop default) maps CF2 types 1, 2, 3 and 4 straight onto ArtiosCAD line types
+1, 2, 3 and 4, and the shop's standards draw cuts as type 1 and creases as
+type 2. So cut = 1 and crease = 2 are confirmed for import here; what 3 and 4
+mean in our line-type set is not.
+
+STILL UNCONFIRMED: the units keyword (UI/UM) and the arc direction flag follow
+Kodak's published CF2 description. Confirm them with the first CF2 import test
+on the ArtiosCAD workstation (docs/PLAN.md milestone 3).
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from dataclasses import dataclass, field
 
 from .geometry import Arc, Dieline, Line, LineType, Point, Segment
 
-# LineType -> CF2 line-type code. UNCONFIRMED (see module docstring).
+# LineType -> CF2 line-type code (cut and crease confirmed; see module docstring).
 CF2_LINE_CODES: dict[LineType, int] = {
     LineType.CUT: 1,
     LineType.CREASE: 2,
@@ -34,7 +39,7 @@ UNITS_INCH = "UI"
 
 
 def _num(v: float) -> str:
-    s = f"{v:.4f}".rstrip("0").rstrip(".")
+    s = f"{v:.6f}".rstrip("0").rstrip(".")
     return "0" if s in ("-0", "") else s
 
 
@@ -53,7 +58,7 @@ def write_cf2(dieline: Dieline, pointage: float = DEFAULT_POINTAGE) -> str:
         name,
         "END",
         f"MAIN,{name}",
-        UNITS_MM,
+        UNITS_INCH if dieline.units == "in" else UNITS_MM,
         f"LL,{_num(xmin)},{_num(ymin)}",
         f"UR,{_num(xmax)},{_num(ymax)}",
         "SCALE,1,1",
@@ -138,7 +143,10 @@ def _float(v: str) -> float:
     return float(v)
 
 
-def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
+MAX_SEGMENTS = 200_000
+
+
+def read_cf2(text: str, max_depth: int = 16, max_segments: int = MAX_SEGMENTS) -> Cf2ReadResult:
     """Parse CF2 text into a Dieline (millimetres). Unknown records are skipped.
 
     The units keyword (UM/UI) is honoured wherever it appears, including the
@@ -198,6 +206,11 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
         bsx, bsy = block_scale.get(name, (1.0, 1.0))
         local = _Affine(bsx, 0.0, 0.0, bsy, 0.0, 0.0).then(xf)  # block SCALE, then placement
         for f in blocks.get(name, []):
+            if len(dieline.segments) >= max_segments:
+                if not truncated:
+                    truncated.append(True)
+                    warnings.append(f"stopped after {max_segments} segments (subroutines repeat too much)")
+                return
             key = f[0].upper()
             try:
                 if key == "L" and len(f) >= 8:
@@ -228,6 +241,7 @@ def read_cf2(text: str, max_depth: int = 16) -> Cf2ReadResult:
             except ValueError:
                 warnings.append(f"unparseable record skipped: {','.join(f)}")
 
+    truncated: list[bool] = []
     emit(main_name, _Affine(unit, 0.0, 0.0, unit, 0.0, 0.0), 0)
     return Cf2ReadResult(dieline=dieline, units=units, warnings=warnings, raw_codes=raw_codes)
 

@@ -1,19 +1,17 @@
 # Dieline Studio
 
-An app that lets AI agents (and people) design packaging, such as corrugated boxes and folding cartons. It creates the flat dieline as **CF2** or **DXF** and checks that it folds correctly before it goes into ArtiosCAD.
+An app that lets AI agents (and people) design packaging, such as corrugated boxes and folding cartons. It creates the flat dieline as **CF2** or **DXF** for use in ArtiosCAD and on a sample table.
 
-**Status:** early scaffold. The Windows desktop app runs: chat on the left, a live CF2 preview on the right, one box style (RSC / FEFCO 0201) with placeholder allowances that aren't calibrated against ArtiosCAD yet.
+The Windows desktop app supports glued slotted boxes, extended glue lugs, half-slotted containers and sleeves. It checks geometry and manufacturing constraints. ArtiosCAD import, fold and sample-table acceptance checks are tracked in [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md).
 
-## The idea in one paragraph
-
-ArtiosCAD's automation API (CAD-X) is installed but locked by our license. Rather than pay to unlock it, we generate the dielines ourselves. A deterministic geometry engine turns a **box style + dimensions + board** into an exact dieline. Agents pick only those inputs. They never draw lines themselves. Automated checks confirm the geometry, manufacturability and folding. The result is exported as CF2 (main format) or DXF and imported into ArtiosCAD, which our current license already supports.
+The geometry engine generates dielines from a style, dimensions and board. The chat assistant can inspect previews, measure the resulting geometry, and search read-only reference folders, including the work OneDrive synced to the PC. Public web research uses Exa or Tavily independently of the OpenRouter chat model.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `app/` | Desktop app: React UI (`src/`), Tauri 2 shell (`src-tauri/`) |
-| `engine/` | Python engine: styles, geometry, CF2, checks, Claude tool loop, stdio JSON-RPC server |
+| `engine/` | Python engine: styles, geometry, CF2, checks, model tool loop (OpenRouter), stdio JSON-RPC server |
 | `docs/` | Context, plan, architecture |
 
 ## Developing on Windows 11
@@ -34,7 +32,7 @@ pnpm typecheck; pnpm test
 cd ..\engine; uv run pytest
 ```
 
-Chat needs an Anthropic API key, entered in **Settings** and stored in Windows Credential Manager. The **Parameters** form in the preview pane drives the same engine without a key.
+Chat needs an OpenRouter API key, entered in **Settings** and stored in Windows Credential Manager. The **Parameters** form in the preview pane drives the same engine without a key.
 
 Environment overrides: `DIELINE_ENGINE_CMD` (JSON array, the command that starts the engine) and `DIELINE_OUTPUT_DIR` (export folder).
 

@@ -110,6 +110,7 @@ export default function App() {
             width={effectivePreview}
             source={state.preview}
             info={info}
+            sessionId={active.id}
             onPreview={(source) => dispatch({ type: "preview", source })}
           />
         </main>

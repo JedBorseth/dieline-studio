@@ -27,10 +27,13 @@
 
 **Progress (2026-11-25):** the Windows desktop app is scaffolded (see [ARCHITECTURE.md](ARCHITECTURE.md)). Milestone 1 is in place with placeholder allowances; milestone 2 has the geometry checks and first manufacturing checks. The agent tools and CF2 preview from milestone 5 came early so the whole pipeline can be exercised. Milestones 3 and 4 (ArtiosCAD import test and calibration) are next.
 
+**Progress (2026-11-25, later):** the engine now replicates R&L's own ServerLib standards (REG-GLIO-NX, HSC_GL, Tube_Glued) in inches with their board codes. It also writes the sample table's DXF format. The formulas reproduce two real R&L blanks to the 1/10,000". Research and evidence: `.local/ARTIOS-WORKFLOW.md` (private). Next: the import test (milestone 3), confirming board values from the board library, then 5PW, die-cut trays and the wing-lock mailers.
+
 ## Open questions
 
-- Which 2–3 box styles does the company use most?
-- Confirm the CF2 line-type codes our ArtiosCAD uses (export a reference CF2).
+- ~~Which box styles does the company use most?~~ From this year's designs: REG-GLIO-NX (RSC) by far, then REG_GLI_EXT, HSC_GL, MEATBOX wing-lock, Tube_Glued, die-cut trays, 5PW.
+- Confirm the CF2 units keyword and arc direction on import. (Cut = 1 and crease = 2 are confirmed by the shop's import tuning.)
+- Copy the real board values (CAL, IL, OG, CRRV) for each board code from ArtiosCAD's board library.
 - Find or rebuild the "export to YAML" ArtiosCAD Output, and decide on its fields.
 - The die maker's and sample cutter's accepted formats (CF2 directly?).
 - Ownership and licensing of the code (see the local notes).

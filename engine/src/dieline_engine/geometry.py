@@ -1,7 +1,9 @@
 """Internal dieline model: lines and arcs tagged with a line type.
 
-All coordinates are millimetres, origin at the blank's lower-left corner,
-x to the right, y up. CF2 and DXF are only ways of writing this model out.
+Coordinates are in the dieline's `units` ("in" for the R&L styles, which
+compute in inches exactly as their ArtiosCAD standards do; "mm" for CF2 read
+back in millimetres). Origin at the blank's lower-left corner, x to the right,
+y up. CF2 and DXF are only ways of writing this model out.
 """
 
 from __future__ import annotations
@@ -13,7 +15,8 @@ from enum import StrEnum
 Point = tuple[float, float]
 
 # Coordinates are rounded to this many decimals when compared or written.
-PRECISION = 4
+# Six keeps 1/32" and 1/64" exact.
+PRECISION = 6
 EPS = 10**-PRECISION
 
 
@@ -78,6 +81,7 @@ Segment = Line | Arc
 @dataclass(slots=True)
 class Dieline:
     name: str
+    units: str = "mm"  # "in" or "mm"
     segments: list[Segment] = field(default_factory=list)
     # Free-form facts about how the dieline was made (style, dims, board, ...).
     meta: dict[str, object] = field(default_factory=dict)
@@ -96,12 +100,12 @@ class Dieline:
     def of_type(self, type: LineType) -> list[Segment]:
         return [s for s in self.segments if s.type == type]
 
-    def bounds(self) -> tuple[float, float, float, float]:
+    def bounds(self, *, include_annotations: bool = False) -> tuple[float, float, float, float]:
         """(xmin, ymin, xmax, ymax) over manufactured segments (arcs use endpoints + extrema)."""
         xs: list[float] = []
         ys: list[float] = []
         for s in self.segments:
-            if s.type == LineType.ANNOTATION:
+            if s.type == LineType.ANNOTATION and not include_annotations:
                 continue
             for x, y in _segment_extent_points(s):
                 xs.append(x)
@@ -109,6 +113,10 @@ class Dieline:
         if not xs:
             return (0.0, 0.0, 0.0, 0.0)
         return (min(xs), min(ys), max(xs), max(ys))
+
+    @property
+    def mm_per_unit(self) -> float:
+        return 25.4 if self.units == "in" else 1.0
 
     def size(self) -> tuple[float, float]:
         xmin, ymin, xmax, ymax = self.bounds()

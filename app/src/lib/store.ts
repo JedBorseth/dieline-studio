@@ -12,6 +12,10 @@ export type ChatItem =
       status: "running" | "done" | "error";
       input?: Record<string, unknown> | null;
       result?: unknown;
+      /** PNG data URL of what the model was shown. */
+      image?: string;
+      /** Set when an older preview image was dropped to cap memory in long sessions. */
+      imageCleared?: boolean;
     }
   | { kind: "notice"; id: string; tone: "error" | "info"; text: string };
 
@@ -21,10 +25,19 @@ export interface Session {
   items: ChatItem[];
   busy: boolean;
   design: Design | null;
+  preview: PreviewSource | null;
 }
 
 export type PreviewSource =
-  | { kind: "design"; design: Design; origin: "agent" | "form" }
+  | {
+      kind: "design";
+      design: Design;
+      origin: "agent" | "form" | "job";
+      /** File name of the job it was opened from, reused as the export name. */
+      stem?: string | null;
+      /** Differences found when reopening a job (board values, geometry). */
+      notes?: string[];
+    }
   | { kind: "file"; name: string; text: string };
 
 export interface State {
@@ -46,7 +59,7 @@ export type Action =
 const uid = () => crypto.randomUUID();
 
 export function newSession(): Session {
-  return { id: uid(), title: "New design", items: [], busy: false, design: null };
+  return { id: uid(), title: "New design", items: [], busy: false, design: null, preview: null };
 }
 
 export function initialState(): State {
@@ -77,6 +90,38 @@ function markUnfinishedTools(s: Session): Session {
   };
 }
 
+/** Keep the most recent N tool preview images per session so long sessions stay lean. */
+export const MAX_RETAINED_IMAGES = 24;
+
+function pruneOldImages(items: ChatItem[], maxImages = MAX_RETAINED_IMAGES): ChatItem[] {
+  let kept = 0;
+  let needsPrune = false;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === "tool" && it.image) {
+      kept++;
+      if (kept > maxImages) {
+        needsPrune = true;
+        break;
+      }
+    }
+  }
+  if (!needsPrune) return items;
+  let seen = 0;
+  const out = items.slice();
+  for (let i = out.length - 1; i >= 0; i--) {
+    const it = out[i];
+    if (it.kind === "tool" && it.image) {
+      seen++;
+      if (seen > maxImages) {
+        const { image: _dropped, ...rest } = it;
+        out[i] = { ...rest, imageCleared: true };
+      }
+    }
+  }
+  return out;
+}
+
 function notice(s: Session, tone: "error" | "info", text: string): Session {
   return { ...s, items: [...s.items, { kind: "notice", id: uid(), tone, text }] };
 }
@@ -92,8 +137,8 @@ export function reducer(state: State, action: Action): State {
       return {
         ...state,
         activeId: action.id,
-        // Show the selected session's own design, never one left over from another session.
-        preview: s?.design ? { kind: "design", design: s.design, origin: "agent" } : null,
+        // Show the selected session's own preview, never one left over from another session.
+        preview: s?.preview ?? (s?.design ? { kind: "design", design: s.design, origin: "agent" } : null),
       };
     }
     case "user_message":
@@ -105,8 +150,16 @@ export function reducer(state: State, action: Action): State {
       }));
     case "send_failed":
       return updateSession(state, action.sessionId, (s) => ({ ...notice(s, "error", action.message), busy: false }));
-    case "preview":
-      return { ...state, preview: action.source };
+    case "preview": {
+      // Keep the active session's stored preview/design in sync with what the preview shows,
+      // so switching sessions and coming back never disagrees with the engine's chat.set_design.
+      const next = updateSession(state, state.activeId, (s) => ({
+        ...s,
+        preview: action.source,
+        design: action.source.kind === "design" ? action.source.design : s.design,
+      }));
+      return { ...next, preview: action.source };
+    }
     case "engine_ready":
       return { ...state, engineReady: action.ready };
     case "engine":
@@ -136,14 +189,26 @@ function applyEvent(state: State, e: EngineEvent): State {
         items: [...s.items, { kind: "tool", id: e.tool_use_id, name: e.name, status: "running" }],
       }));
     case "chat.tool_result":
-      return updateSession(state, e.session_id, (s) => ({
-        ...s,
-        items: s.items.map((it) =>
-          it.kind === "tool" && it.id === e.tool_use_id
-            ? { ...it, status: e.is_error ? "error" : "done", input: e.input, result: e.result }
-            : it,
-        ),
-      }));
+      return updateSession(state, e.session_id, (s) => {
+        const done = {
+          status: (e.is_error ? "error" : "done") as "error" | "done",
+          input: e.input,
+          result: e.result,
+          image: e.image,
+          imageCleared: undefined as boolean | undefined,
+        };
+        const hasMatch = Boolean(e.tool_use_id) && s.items.some((it) => it.kind === "tool" && it.id === e.tool_use_id);
+        const items: ChatItem[] = hasMatch
+          ? s.items.map((it) =>
+              it.kind === "tool" && it.id === e.tool_use_id ? { ...it, name: e.name || it.name, ...done } : it,
+            )
+          : [
+              ...s.items,
+              // Guard against tool results arriving without a start event (or with an empty id).
+              { kind: "tool", id: e.tool_use_id || uid(), name: e.name, ...done },
+            ];
+        return { ...s, items: e.image ? pruneOldImages(items) : items };
+      });
     case "chat.error":
       return updateSession(state, e.session_id, (s) => notice(s, "error", e.message));
     case "chat.turn_end":
@@ -155,12 +220,13 @@ function applyEvent(state: State, e: EngineEvent): State {
         return ended;
       });
     case "design": {
+      const preview: PreviewSource = { kind: "design", design: e.design, origin: "agent" };
       const withDesign = e.session_id
-        ? updateSession(state, e.session_id, (s) => ({ ...s, design: e.design }))
+        ? updateSession(state, e.session_id, (s) => ({ ...s, design: e.design, preview }))
         : state;
       // Only replace the preview if the design belongs to the session on screen.
       if (e.session_id && e.session_id !== state.activeId) return withDesign;
-      return { ...withDesign, preview: { kind: "design", design: e.design, origin: "agent" } };
+      return { ...withDesign, preview };
     }
   }
 }

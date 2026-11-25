@@ -102,6 +102,8 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
   return (
     <svg
       ref={svgRef}
+      role="img"
+      aria-label={`Dieline preview: ${doc.name}`}
       className="canvas"
       viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
       preserveAspectRatio="xMidYMid meet"

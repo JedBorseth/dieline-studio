@@ -61,7 +61,8 @@ Research summary, collected 2026-11-24 to 2026-11-25. Prices and terms change, s
 
 ## AI usage and cost
 
-- The shipped app **must use an Anthropic API key**. Pro/Max subscriptions can't power a product. The Agent SDK docs prohibit offering claude.ai login or subscription rate limits in third-party products, and the consumer terms bar automated access except through an API key, sharing accounts, and reselling.
-- Building the app with Claude Code on a subscription is fine.
-- Expected cost is low because the AI only chooses parameters. At roughly 20k input and 3k output tokens per box: Haiku 5.5 ~$0.004, Sonnet 5.5 ~$0.07, Opus 5.5 ~$0.14 per box. Re-measure once it's built.
-- Options: the client supplies their own API key; a spend limit on the key; make the AI optional so a plain form can drive the same engine.
+- **The app calls models through OpenRouter** (decided 2026-11-25), with the user's OpenRouter API key, so any model with tool calling and image input can drive the chat: Claude, GPT, Gemini and others. The default is `anthropic/claude-opus-5.5`. It's an API key, never subscription or OAuth credentials; consumer AI subscriptions can't power a product.
+- **Web search and fetch run client-side**, as in OpenCode. The search providers are Exa and Tavily: keyless (rate-limited) or with the user's own key. They work with any model.
+- **Building the app** with Claude Code on a subscription is fine.
+- **Cost:** low, because the model only chooses parameters, but each design now also sends a picture (about 1.5–3k input tokens). Re-measure per model once in use; OpenRouter returns the cost of every request.
+- **Options to limit spend:** the client supplies their own key, a spend limit on the OpenRouter key, and the plain form drives the same engine with no AI at all.

@@ -1,7 +1,9 @@
 """Checks run on every generated dieline (docs/PLAN.md, architecture step 4).
 
-Implemented: geometry checks and the first manufacturing checks.
-Not yet: fold simulation, comparison with ArtiosCAD references.
+Implemented: geometry checks, the standards' own checks, and which of R&L's
+machines can run the blank. Not yet: fold simulation, comparison with
+ArtiosCAD references. No shop thresholds are invented here: a limit appears
+only when it comes from the shop's standards or machines.
 """
 
 from __future__ import annotations
@@ -24,11 +26,35 @@ class CheckResult:
 
 
 @dataclass(frozen=True, slots=True)
-class SheetLimits:
-    """Largest blank the corrugator/press/sample table takes, in mm. Placeholder."""
+class Machine:
+    """A machine a blank can run on. Sheet sizes in inches.
 
-    max_width: float = 2500.0
-    max_height: float = 1600.0
+    With `feed` set, sizes are (along the feed, across the machine) and the blank
+    can't be turned: its height (flaps-body-flaps) runs along the feed. Without
+    it, sizes are the press's sheet limits and the blank may be turned either way.
+    """
+
+    name: str
+    max_size: tuple[float, float]
+    min_size: tuple[float, float] | None = None
+    feed: bool = False
+    skip_feed_along: float | None = None  # longer feed length allowed in skip-feed mode
+
+
+# The slotter's rated sheet limits: feeding 1625 x 4600 mm, skip feeding 2200 x 4600 mm, minimum
+# 450 x 650 mm, where the first figure is the feed direction. On a slotter the
+# slots run with the feed, so the blank's height goes along it and its length
+# (the panels) across the machine. The die presses use the sheet min/max fields
+# of their ArtiosCAD die press definitions in ServerLib, not their names.
+MACHINES: list[Machine] = [
+    Machine("Printing slotter die-cutter", (1625 / 25.4, 4600 / 25.4), (450 / 25.4, 650 / 25.4),
+            feed=True, skip_feed_along=2200 / 25.4),
+    Machine("Flatbed 60 x 46", (46.0, 60.0), (10.0, 15.0)),
+    Machine("Bausse 44 x 33", (33.0, 44.0), (16.0, 20.0)),
+    Machine("Pioneer 120 x 100", (120.0, 100.0), (20.4375, 23.625)),
+    Machine("Jumbo 66 x 187", (64.0, 178.0), (17.75, 25.0)),
+    Machine("Jumbo 66 x 190", (65.25, 110.0), (23.0, 23.0)),
+]
 
 
 def _key(p: Point) -> tuple[float, float]:
@@ -145,64 +171,153 @@ def check_crossings(d: Dieline) -> CheckResult:
     return CheckResult("crossings", "pass", "no lines cross")
 
 
-def check_sheet_fit(d: Dieline, limits: SheetLimits = SheetLimits()) -> CheckResult:
-    w, h = d.size()
-    fits = w <= limits.max_width and h <= limits.max_height
-    if not d.meta.get("corrugated", True):
-        # Folding carton can be turned on the sheet; corrugated can't, because the
-        # flute direction fixes the blank's orientation.
-        fits = fits or (h <= limits.max_width and w <= limits.max_height)
-    msg = f"blank {w:.1f} x {h:.1f} mm vs sheet limit {limits.max_width:g} x {limits.max_height:g} mm"
-    return CheckResult("sheet_fit", "pass" if fits else "fail", msg)
+def _fit(w: float, h: float, m: Machine) -> str:
+    """'fits', 'skip' (slotter skip-feed only), 'small' (under the minimum sheet,
+    may still run multi-up) or 'large'. w = blank length, h = blank height."""
+    tol = EPS  # generated endpoints are rounded to six decimals
+    if m.feed:
+        along, across = h, w
+        (mx_al, mx_ac), (mn_al, mn_ac) = m.max_size, m.min_size or (0.0, 0.0)
+        if across > mx_ac + tol:
+            return "large"
+        skip = along > mx_al + tol
+        if skip and (m.skip_feed_along is None or along > m.skip_feed_along + tol):
+            return "large"
+        if along < mn_al - tol or across < mn_ac - tol:
+            return "small"
+        return "skip" if skip else "fits"
+    mx_a, mx_b = m.max_size
+    mn_a, mn_b = m.min_size or (0.0, 0.0)
+    result = "large"
+    for a, b in ((w, h), (h, w)):
+        if a <= mx_a + tol and b <= mx_b + tol:
+            if a >= mn_a - tol and b >= mn_b - tol:
+                return "fits"
+            result = "small"
+    return result
 
 
-def check_rsc_manufacturing(d: Dieline) -> list[CheckResult]:
+def check_machines(d: Dieline, machines: list[Machine] = MACHINES) -> CheckResult:
+    """Which machines take the one-up blank by sheet size alone.
+
+    A first screen, never a reason to block an export (the file may be going to
+    the sample table or to ArtiosCAD for a layout): trims, grippers, multi-up,
+    slotter head spacing and the press's flute direction aren't modelled.
+    """
+    k = d.mm_per_unit / 25.4
+    w, h = (v * k for v in d.size())
+    fits = {m.name: _fit(w, h, m) for m in machines}
+    size = f"blank {fmt_in(w)} x {fmt_in(h)} in"
+    ok = [n for n, f in fits.items() if f == "fits"]
+    skip = [n for n, f in fits.items() if f == "skip"]
+    small = [n for n, f in fits.items() if f == "small"]
+    if ok:
+        extra = f"; {', '.join(skip)} in skip-feed" if skip else ""
+        return CheckResult("machines", "pass", f"{size} is within the sheet limits of {', '.join(ok)}{extra} "
+                                               "(trims and layout not checked)")
+    if skip:
+        return CheckResult("machines", "warn", f"{size} is within the sheet limits only on the "
+                                               f"{', '.join(skip)} in skip-feed mode (trims and layout not checked)")
+    if small:
+        return CheckResult("machines", "warn", f"{size} is under the minimum sheet of {', '.join(small)}; "
+                                               "run it multi-up or on the sample table")
+    return CheckResult("machines", "warn", f"{size} is larger than every R&L machine's maximum sheet; "
+                                           "it needs another route (or a two-piece design)")
+
+
+def check_preflight(d: Dieline) -> list[CheckResult]:
+    """Two checks from the shop's ArtiosCAD Preflight profile (ServerLib
+    'Corrugated - Inch' parameter set) that the engine can evaluate itself."""
     meta = d.meta
-    if meta.get("style") != "fefco-0201":
+    if "panels_in" not in meta:
         return []
     out: list[CheckResult] = []
-    panels = meta["panels_mm"]  # type: ignore[index]
-    gf = float(panels["glue_flap"])  # type: ignore[index]
-    out.append(
-        CheckResult(
-            "glue_flap_width",
-            "pass" if gf >= 30.0 else "fail",
-            f"glue flap {gf:g} mm (minimum 30 mm)",
-        )
-    )
-    dims = meta["inside_dims_mm"]  # type: ignore[index]
-    smallest = min(float(dims["length"]), float(dims["width"]), float(dims["depth"]))  # type: ignore[index]
-    out.append(
-        CheckResult(
-            "min_panel",
-            "pass" if smallest >= 50.0 else "warn",
-            f"smallest inside dimension {smallest:g} mm (RSC below 50 mm is hard to run)",
-        )
-    )
-    # Every RSC flap is half the width deep, so the two inner flaps (on the width
-    # panels) collide when their combined depth exceeds the length panel.
-    flap = float(panels["flap_depth"])  # type: ignore[index]
-    length_panel = float(panels["length_panel"])  # type: ignore[index]
-    if 2 * flap > length_panel:
-        out.append(
-            CheckResult(
-                "inner_flaps",
-                "fail",
-                f"inner flaps ({2 * flap:.1f} mm together) overlap across the {length_panel:.1f} mm length panel; "
-                "RSC needs length >= width",
-            )
-        )
+    cal = float(meta["cal_in"])  # type: ignore[arg-type]
+    p = [float(x) for x in meta["panels_in"]]  # type: ignore[union-attr]
+    # Checks 10/11 "Width/Length panel difference": flag when matching panels
+    # differ by more than CAL x 1 + 0.79375 mm (1/32").
+    limit = cal + 1 / 32
+    diffs = [abs(p[0] - p[2]), abs(p[1] - p[3])]
+    if max(diffs) > limit + 1e-9:
+        out.append(CheckResult(
+            "preflight_panels", "warn",
+            f"matching panels differ by {fmt_in(max(diffs))} in; Preflight flags more than CAL + 1/32 "
+            f"({fmt_in(limit)} in)",
+        ))
     else:
-        out.append(CheckResult("inner_flaps", "pass", "inner flaps fit across the length panel"))
-    if not meta.get("calibrated", False):
-        out.append(
-            CheckResult(
-                "calibration",
-                "warn",
-                "allowances are placeholder rules, not yet calibrated against ArtiosCAD",
-            )
-        )
+        out.append(CheckResult("preflight_panels", "pass", "matching panels within Preflight's CAL + 1/32"))
+    # Checks 15/16 "Crease/Knife pointage allowed by caliper", corrugated rows:
+    # 2 pt up to 4.7625 mm (3/16"), 3 pt from 0.79375 to 9.525 mm,
+    # and 5 pt from 4.7625 to 25.4 mm.
+    pointage = float(meta.get("pointage", 2))  # type: ignore[arg-type]
+    if pointage == 2 and cal > 0.1875 + 1e-9:
+        out.append(CheckResult(
+            "preflight_pointage", "warn",
+            f"2 pt rules on a {fmt_in(cal)} in board; Preflight allows 2 pt only up to 3/16 in. "
+            "The standards draw 2 pt; confirm what the die maker wants",
+        ))
     return out
+
+
+def check_standard(d: Dieline) -> list[CheckResult]:
+    """The checks the ArtiosCAD standard itself enforces, plus what's still unconfirmed."""
+    meta = d.meta
+    if "standard" not in meta:
+        return []
+    out: list[CheckResult] = []
+    dims = meta["inside_in"]  # type: ignore[index]
+    length, width = float(dims["length"]), float(dims["width"])  # type: ignore[index]
+    if length >= width:
+        out.append(CheckResult("length_width", "pass", "length >= width"))
+    else:
+        out.append(CheckResult("length_width", "fail",
+                               f"Length must be >= Width ({meta['standard']} check); swap L and W"))
+    cal = fmt_in(float(meta["cal_in"]))  # type: ignore[arg-type]
+    il = fmt_in(float(meta["il_in"]))  # type: ignore[arg-type]
+    source = meta.get("board_source")
+    if source == "artioscad":
+        out.append(CheckResult("board", "pass", f"{meta['board']} values from ArtiosCAD (CAL {cal}, IL {il})"))
+    elif source == "derived":
+        out.append(CheckResult(
+            "board", "warn",
+            f"{meta['board']} CAL {cal}, IL {il} inferred from real R&L designs; confirm in ArtiosCAD's board library",
+        ))
+    else:
+        out.append(CheckResult(
+            "board", "warn",
+            f"{meta['board']} uses nominal CAL {cal}, IL {il}; confirm in ArtiosCAD's board library before production",
+        ))
+    rounded = meta.get("rounded_in") or {}
+    between = {k: v for k, v in rounded.items() if abs(v * 16 - round(v * 16)) > 1e-9}  # type: ignore[union-attr]
+    if between:
+        listed = ", ".join(f"{k} {fmt_in(v)}" for k, v in between.items())
+        out.append(CheckResult(
+            "rounding", "warn",
+            f"{listed} fall between sixteenths. {meta['standard']} rounds these to 1/16. "
+            "Verify the resulting score and flap positions in ArtiosCAD.",
+        ))
+    elif rounded:
+        out.append(CheckResult("rounding", "pass", "the standard's rounded values are already on 1/16"))
+    if not meta.get("calibrated", False):
+        out.append(CheckResult(
+            "calibration", "warn",
+            f"formulas copied from the {meta['standard']} standard; not yet verified by an ArtiosCAD rebuild",
+        ))
+    return out
+
+
+def fmt_in(x: float) -> str:
+    """Inches as a mixed fraction to the nearest 1/32 when exact, else decimals."""
+    n = round(x * 32)
+    if abs(x * 32 - n) > 1e-6:
+        return f"{x:.4f}".rstrip("0").rstrip(".")
+    whole, rem = divmod(n, 32)
+    if rem == 0:
+        return str(whole)
+    num, den = rem, 32
+    while num % 2 == 0:
+        num, den = num // 2, den // 2
+    return f"{whole} {num}/{den}" if whole else f"{num}/{den}"
 
 
 def run_checks(d: Dieline) -> list[CheckResult]:
@@ -212,9 +327,10 @@ def run_checks(d: Dieline) -> list[CheckResult]:
         check_closed_outline(d),
         check_overlaps(d),
         check_crossings(d),
-        check_sheet_fit(d),
+        check_machines(d),
     ]
-    results += check_rsc_manufacturing(d)
+    results += check_standard(d)
+    results += check_preflight(d)
     return results
 
 

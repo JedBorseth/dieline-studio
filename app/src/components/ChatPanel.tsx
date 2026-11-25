@@ -10,11 +10,15 @@ import {
   DiamondIcon,
   InfoIcon,
   KeyRoundIcon,
+  Maximize2Icon,
   SquareIcon,
+  ZoomInIcon,
+  ZoomOutIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 
+import { formatToolLabel } from "../lib/chat";
 import type { CheckStatus, Settings } from "../lib/protocol";
 import type { ChatItem, Session } from "../lib/store";
 import { cn } from "../lib/utils";
@@ -23,6 +27,7 @@ import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Badge } from "./ui/badge";
 import { Button, InlineButton } from "./ui/button";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "./ui/collapsible";
+import { Dialog, DialogHeader, DialogPanel, DialogPopup, DialogTitle } from "./ui/dialog";
 import { Spinner } from "./ui/spinner";
 import { Textarea } from "./ui/textarea";
 
@@ -49,11 +54,24 @@ export const STATUS_BADGE: Record<CheckStatus, "success" | "warning" | "error"> 
 
 export function ChatPanel({ session, settings, engineError, onSend, onStop, onOpenSettings }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
+  const pinnedToBottomRef = useRef(true);
+  const [lightbox, setLightbox] = useState<{ src: string; title: string } | null>(null);
 
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && pinnedToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [session.items]);
+
+  const handleScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    pinnedToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+  };
+
+  const handleSend = (text: string) => {
+    pinnedToBottomRef.current = true;
+    onSend(text);
+  };
 
   const modelLabel = settings?.models.find((m) => m.id === settings.model)?.label ?? settings?.model;
 
@@ -64,7 +82,7 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
         {session.busy && <Spinner size="sm" tone="muted" />}
       </header>
 
-      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto" ref={listRef}>
+      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto" ref={listRef} onScroll={handleScroll}>
         <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-4 px-5 py-6">
           {engineError && (
             <Alert variant="error" controlAlignment="first-line">
@@ -82,7 +100,7 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
             <Alert variant="info" controlAlignment="first-line">
               <KeyRoundIcon />
               <AlertDescription className="block">
-                Chat needs an Anthropic API key.{" "}
+                Chat needs an OpenRouter API key.{" "}
                 <InlineButton className="text-primary [--inline-button-text-align:start] [--inline-button-white-space:normal]" onClick={onOpenSettings}>
                   Add one in Settings
                 </InlineButton>
@@ -91,9 +109,9 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
             </Alert>
           )}
           {session.items.length === 0 ? (
-            <EmptyState busy={session.busy} onSend={onSend} />
+            <EmptyState busy={session.busy} onSend={handleSend} />
           ) : (
-            session.items.map((item) => <Item key={item.id} item={item} />)
+            session.items.map((item) => <Item key={item.id} item={item} onInspectImage={setLightbox} />)
           )}
           {session.busy && (
             <div className="flex items-center gap-2 text-muted-foreground text-sm">
@@ -106,11 +124,13 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
 
       <Composer
         busy={session.busy}
-        onSend={onSend}
+        onSend={handleSend}
         onStop={onStop}
-        modelLabel={modelLabel ? `${modelLabel} · ${settings?.effort}` : "…"}
+        modelLabel={modelLabel ?? "…"}
+        effort={modelLabel ? settings?.effort : undefined}
         onModelClick={onOpenSettings}
       />
+      {lightbox && <ImageLightbox src={lightbox.src} title={lightbox.title} onClose={() => setLightbox(null)} />}
     </section>
   );
 }
@@ -124,7 +144,7 @@ function EmptyState({ busy, onSend }: { busy: boolean; onSend: (text: string) =>
       <div className="flex flex-col gap-1.5">
         <h2 className="font-semibold text-lg tracking-tight">Describe the box</h2>
         <p className="max-w-md text-muted-foreground text-sm">
-          The engine draws the dieline; Claude only picks the parameters.
+          The engine draws the dieline; the model only picks the parameters.
         </p>
       </div>
       <div className="flex max-w-xl flex-wrap justify-center gap-2">
@@ -145,7 +165,13 @@ function EmptyState({ busy, onSend }: { busy: boolean; onSend: (text: string) =>
   );
 }
 
-function Item({ item }: { item: ChatItem }) {
+const Item = memo(function Item({
+  item,
+  onInspectImage,
+}: {
+  item: ChatItem;
+  onInspectImage: (img: { src: string; title: string }) => void;
+}) {
   switch (item.kind) {
     case "user":
       return (
@@ -178,7 +204,7 @@ function Item({ item }: { item: ChatItem }) {
         </div>
       );
     case "tool":
-      return <ToolCard item={item} />;
+      return <ToolCard item={item} onInspectImage={onInspectImage} />;
     case "notice":
       return (
         <Alert variant={item.tone === "error" ? "error" : "info"} controlAlignment="first-line">
@@ -187,22 +213,29 @@ function Item({ item }: { item: ChatItem }) {
         </Alert>
       );
   }
-}
+});
 
-function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
-  const input = item.input ?? {};
-  let label: string = item.name;
-  if (item.name === "create_box" && item.input) {
-    const { style, length, width, depth, units, board } = input as Record<string, string | number>;
-    label = `create_box · ${style} · ${length} × ${width} × ${depth} ${units} · ${board}`;
-  } else if (item.name === "export_cf2") {
-    const path = (item.result as { path?: string } | undefined)?.path;
-    label = path ? `export_cf2 → ${path}` : "export_cf2";
-  }
+function ToolCard({
+  item,
+  onInspectImage,
+}: {
+  item: Extract<ChatItem, { kind: "tool" }>;
+  onInspectImage: (img: { src: string; title: string }) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const label = formatToolLabel(item.name, item.input, item.result);
   const overall = (item.result as { overall?: CheckStatus } | undefined)?.overall;
   const error = item.status === "error" ? (item.result as { error?: string } | undefined)?.error : undefined;
+  // Format JSON lazily only when the collapsible panel is open so large read_file/get_geometry
+  // payloads never re-serialize during streaming.
+  const formattedResult = useMemo(
+    () => (open && item.result !== undefined ? JSON.stringify(item.result, null, 2) : null),
+    [open, item.result],
+  );
   return (
     <Collapsible
+      open={open}
+      onOpenChange={setOpen}
       className={cn(
         "rounded-lg border bg-card text-sm shadow-xs/5",
         item.status === "error" && "border-destructive/30",
@@ -216,23 +249,94 @@ function ToolCard({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
         ) : (
           <CircleCheckIcon className="size-3.5 shrink-0 text-success" />
         )}
-        <span className="min-w-0 flex-1 truncate font-mono text-xs">{label}</span>
-        {overall && (
-          <Badge variant={STATUS_BADGE[overall]} className="uppercase tracking-wide">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs" title={label}>
+          {label}
+        </span>
+        {overall ? (
+          <Badge variant={STATUS_BADGE[overall]} className="shrink-0 uppercase tracking-wide">
             {overall}
           </Badge>
-        )}
+        ) : item.status === "error" ? (
+          <Badge variant="error" className="shrink-0 uppercase tracking-wide">
+            error
+          </Badge>
+        ) : null}
         <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
       </CollapsibleTrigger>
+      {item.image && (
+        // What the model looked at, so the designer can see what it checked.
+        // Uses an in-app lightbox instead of <a href="data:..."> (blocked by Chromium/WebView2).
+        <div className="border-t p-2">
+          <button
+            type="button"
+            onClick={() => onInspectImage({ src: item.image!, title: label })}
+            aria-label={`Inspect image full size: ${label}`}
+            className="group/img relative block w-full cursor-zoom-in rounded border bg-white outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <img
+              src={item.image}
+              alt={`What the model saw: ${label}`}
+              loading="lazy"
+              decoding="async"
+              className="mx-auto max-h-56 max-w-full w-auto rounded object-contain"
+            />
+            <span className="pointer-events-none absolute right-1.5 bottom-1.5 inline-flex items-center gap-1 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition-opacity group-hover/img:opacity-100 group-focus-visible/img:opacity-100">
+              <Maximize2Icon className="size-2.5" />
+              Inspect
+            </span>
+          </button>
+        </div>
+      )}
+      {!item.image && item.imageCleared && (
+        <div className="border-t px-3 py-1.5 text-muted-foreground text-xs">
+          Earlier preview cleared to save memory.
+        </div>
+      )}
       <CollapsiblePanel>
-        {error && <div className="px-3 pb-2 text-destructive-foreground text-xs">{error}</div>}
-        {item.result !== undefined && (
+        {error && <div className="border-t px-3 py-2 text-destructive-foreground text-xs wrap-anywhere">{error}</div>}
+        {formattedResult !== null && (
           <pre className="scroll-thin m-0 max-h-60 overflow-auto border-t px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-            {JSON.stringify(item.result, null, 2)}
+            {formattedResult}
           </pre>
         )}
       </CollapsiblePanel>
     </Collapsible>
+  );
+}
+
+function ImageLightbox({ src, title, onClose }: { src: string; title: string; onClose: () => void }) {
+  const [actualSize, setActualSize] = useState(false);
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogPopup className="max-w-[92vw] sm:max-w-[90vw]">
+        <DialogHeader className="flex-row items-center justify-between gap-3 pr-12">
+          <DialogTitle className="truncate font-mono text-sm" title={title}>
+            {title}
+          </DialogTitle>
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => setActualSize((v) => !v)}
+            aria-pressed={actualSize}
+          >
+            {actualSize ? <ZoomOutIcon /> : <ZoomInIcon />}
+            {actualSize ? "Fit to window" : "100% size"}
+          </Button>
+        </DialogHeader>
+        <DialogPanel className="p-3 pt-0">
+          <div className="scroll-thin max-h-[78vh] overflow-auto rounded-lg border bg-white p-2">
+            <img
+              src={src}
+              alt={`What the model saw: ${title}`}
+              className={cn(
+                "mx-auto block",
+                actualSize ? "max-w-none" : "max-h-[74vh] max-w-full object-contain",
+              )}
+            />
+          </div>
+        </DialogPanel>
+      </DialogPopup>
+    </Dialog>
   );
 }
 
@@ -241,6 +345,7 @@ function Composer(props: {
   onSend: (text: string) => void;
   onStop: () => void;
   modelLabel: string;
+  effort?: string;
   onModelClick: () => void;
 }) {
   const [text, setText] = useState("");
@@ -281,6 +386,7 @@ function Composer(props: {
             >
               <CpuIcon />
               <span className="truncate">{props.modelLabel}</span>
+              {props.effort && <span className="shrink-0 opacity-80">· {props.effort}</span>}
               <ChevronDownIcon className="opacity-60" />
             </Button>
           </Tip>

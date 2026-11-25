@@ -17,7 +17,7 @@ from typing import Any, Callable, TextIO
 
 from pydantic import ValidationError
 
-from . import __version__, designs
+from . import __version__, designs, models
 from .agent import Agent
 from .designs import BoxParams
 from .settings import SettingsStore
@@ -29,6 +29,7 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 APP_ERROR = -32000
+EXPORT_EXISTS = -32001  # the UI offers "Replace" for this one
 
 
 class RpcError(Exception):
@@ -48,9 +49,12 @@ class Server:
             "engine.info": self._info,
             "box.create": lambda p: designs.create_box(BoxParams.model_validate(p)),
             "box.export": self._export,
+            "job.open": lambda p: designs.open_job(p.get("record")),
             "settings.get": lambda p: self.settings.public(),
+            "models.list": self._models,
             "settings.update": self._settings_update,
             "chat.send": self._chat_send,
+            "chat.set_design": self._chat_set_design,
             "chat.cancel": lambda p: self.agent.cancel(_str(p, "session_id")) or {"ok": True},
             "chat.reset": lambda p: self.agent.reset(_str(p, "session_id")) or {"ok": True},
         }
@@ -97,6 +101,9 @@ class Server:
         except ValidationError as exc:
             reply = {"jsonrpc": "2.0", "id": req_id,
                      "error": {"code": INVALID_PARAMS, "message": _validation_message(exc)}}
+        except designs.ExportExists as exc:
+            reply = {"jsonrpc": "2.0", "id": req_id,
+                     "error": {"code": EXPORT_EXISTS, "message": str(exc), "data": {"files": exc.names}}}
         except (ValueError, RuntimeError) as exc:  # expected, user-facing failures
             reply = {"jsonrpc": "2.0", "id": req_id, "error": {"code": APP_ERROR, "message": str(exc)}}
         except Exception as exc:
@@ -122,11 +129,28 @@ class Server:
         filename = p.get("filename")
         if filename is not None and not isinstance(filename, str):
             raise RpcError(INVALID_PARAMS, "filename must be a string")
-        return designs.export_cf2(params, self.settings.settings.resolved_output_dir(), filename)
+        overwrite = p.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise RpcError(INVALID_PARAMS, "overwrite must be true or false")
+        formats = p.get("formats") or ["cf2"]
+        if not isinstance(formats, list) or not all(isinstance(f, str) for f in formats):
+            raise RpcError(INVALID_PARAMS, "formats must be a list of 'cf2' and/or 'dxf'")
+        cfg = self.settings.settings
+        return designs.export(params, cfg.resolved_output_dir(), filename, formats, overwrite, cfg.resolved_dxf_dir())
+
+    def _models(self, p: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {"models": models.list_models(bool(p.get("refresh")))}
+        except Exception as exc:  # offline, or OpenRouter down: Settings shows its built-in list
+            raise RuntimeError(f"couldn't load OpenRouter's model list ({type(exc).__name__})") from None
 
     def _settings_update(self, p: dict[str, Any]) -> dict[str, Any]:
         self.settings.update(p)
         return self.settings.public()
+
+    def _chat_set_design(self, p: dict[str, Any]) -> dict[str, Any]:
+        self.agent.set_design(_str(p, "session_id"), BoxParams.model_validate(p.get("params") or {}))
+        return {"ok": True}
 
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))

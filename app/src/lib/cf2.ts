@@ -5,7 +5,8 @@
 
 export type LineKind = "cut" | "crease" | "perforation" | "score" | "other";
 
-// UNCONFIRMED mapping, same as the engine's CF2_LINE_CODES.
+// Same mapping as the engine's CF2_LINE_CODES: cut = 1 and crease = 2 are confirmed by R&L's
+// CF2 import tuning; 3 and 4 are not.
 export const CODE_KINDS: Record<number, LineKind> = { 1: "cut", 2: "crease", 3: "perforation", 4: "score" };
 
 export type Primitive =
