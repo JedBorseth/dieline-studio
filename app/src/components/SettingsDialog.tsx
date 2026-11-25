@@ -35,6 +35,7 @@ export function SettingsDialog({ settings, onClose, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
 
   const save = async (update: SettingsUpdate) => {
+    if (saving) return; // one write at a time: Save and Remove must not race
     setSaving(true);
     setError(null);
     try {
@@ -52,7 +53,8 @@ export function SettingsDialog({ settings, onClose, onSaved }: Props) {
 
   return (
     // Mounted only while open (see App), so the dialog is always open here.
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
+    // While a write is pending the dialog stays open, so its outcome is always shown.
+    <Dialog open onOpenChange={(open) => !open && !saving && onClose()}>
       <DialogPopup className="max-w-md">
         <form
           className="flex min-h-0 flex-col"
@@ -88,6 +90,7 @@ export function SettingsDialog({ settings, onClose, onSaved }: Props) {
                     variant="ghost-destructive"
                     size="xs"
                     className="-mt-0.5 shrink-0"
+                    disabled={saving}
                     onClick={() => void save({ api_key: null })}
                   >
                     <Trash2Icon />
@@ -152,7 +155,7 @@ export function SettingsDialog({ settings, onClose, onSaved }: Props) {
           </DialogPanel>
 
           <DialogFooter>
-            <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
+            <DialogClose render={<Button variant="outline" disabled={saving} />}>Cancel</DialogClose>
             <Button type="submit" disabled={saving}>
               {saving && <Spinner />}
               Save

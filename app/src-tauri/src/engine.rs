@@ -24,6 +24,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
 
+use crate::job::ProcessTree;
+
 const EVENT: &str = "engine-event";
 const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,7 +50,18 @@ type Pending = Arc<Mutex<HashMap<u64, (u64, oneshot::Sender<Reply>)>>>;
 struct Running {
     stdin: ChildStdin,
     child: Child,
+    /// The engine's whole process tree (Windows); None if the job couldn't be made.
+    tree: Option<ProcessTree>,
     generation: u64,
+}
+
+impl Running {
+    fn kill(&mut self) {
+        if let Some(tree) = &self.tree {
+            tree.kill();
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 pub struct Engine {
@@ -97,6 +110,7 @@ impl Engine {
             .spawn()
             .map_err(|e| EngineError::new(format!("could not start engine `{}`: {e}", program.display())))?;
 
+        let tree = ProcessTree::adopt(&child);
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -128,18 +142,17 @@ impl Engine {
             // Holding `running` means no new request can be sent to this
             // generation and no replacement can start until cleanup is done.
             let mut slot = running.lock().await;
-            let mut code = None;
             if slot.as_ref().map(|r| r.generation) == Some(generation) {
-                if let Some(r) = slot.take() {
-                    code = reap(r.child).await;
-                }
+                let r = slot.take().expect("checked above");
+                let code = reap(r).await;
+                fail_generation(&pending, generation, "engine exited").await;
+                let _ = app.emit(EVENT, json!({ "type": "engine.exit", "code": code }));
             }
-            fail_generation(&pending, generation, "engine exited").await;
-            let _ = app.emit(EVENT, json!({ "type": "engine.exit", "code": code }));
+            // Otherwise it was already retired (timeout or shutdown), which reported it.
             drop(slot);
         });
 
-        Ok(Running { stdin, child, generation })
+        Ok(Running { stdin, child, tree, generation })
     }
 
     pub async fn request(&self, app: &AppHandle, method: String, params: Value) -> Reply {
@@ -165,14 +178,19 @@ impl Engine {
             let failure = match timeout(WRITE_TIMEOUT, write).await {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => Some(format!("could not send to engine: {e}")),
-                Err(_) => {
-                    // The engine stopped reading stdin; kill it so the exit path cleans up.
-                    let _ = r.child.start_kill();
-                    Some("engine is not responding".to_string())
-                }
+                Err(_) => Some("engine is not responding; restarting it".to_string()),
             };
             if let Some(message) = failure {
-                self.pending.lock().await.remove(&id);
+                // Retire this engine now rather than waiting for an EOF that a
+                // wedged process tree may never send; the next request starts a new one.
+                let mut r = running.take().expect("engine just used");
+                let generation = r.generation;
+                r.kill();
+                fail_generation(&self.pending, generation, "engine was restarted").await;
+                let _ = app.emit(EVENT, json!({ "type": "engine.exit", "code": null }));
+                tauri::async_runtime::spawn(async move {
+                    reap(r).await;
+                });
                 return Err(EngineError::new(message));
             }
         }
@@ -190,23 +208,29 @@ impl Engine {
     /// Stop the engine when the app exits: close stdin so it finishes cleanly,
     /// then kill it if it hasn't exited after a short grace period.
     pub async fn shutdown(&self) {
-        let taken = self.running.lock().await.take();
-        if let Some(Running { stdin, child, .. }) = taken {
-            drop(stdin);
-            reap(child).await;
+        let mut slot = self.running.lock().await;
+        if let Some(r) = slot.take() {
+            reap(r).await;
         }
     }
 }
 
-/// Wait briefly for the child to exit, killing it if it doesn't.
-async fn reap(mut child: Child) -> Option<i32> {
-    match timeout(EXIT_GRACE, child.wait()).await {
+/// Close the engine's stdin so it can exit cleanly, wait briefly, then kill
+/// the whole process tree. Dropping `Running` also closes the job handle.
+async fn reap(r: Running) -> Option<i32> {
+    let Running { stdin, mut child, tree, .. } = r;
+    drop(stdin);
+    let code = match timeout(EXIT_GRACE, child.wait()).await {
         Ok(status) => status.ok().and_then(|s| s.code()),
         Err(_) => {
             let _ = child.start_kill();
             child.wait().await.ok().and_then(|s| s.code())
         }
+    };
+    if let Some(tree) = &tree {
+        tree.kill(); // grandchildren (Python under the launcher) go too
     }
+    code
 }
 
 async fn fail_generation(pending: &Pending, generation: u64, message: &str) {

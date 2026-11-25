@@ -156,18 +156,25 @@ export function engineBridge(): Plugin {
         if (!allowed(req)) return reject(res, 403, "forbidden");
         if (!(req.headers["content-type"] ?? "").startsWith("application/json"))
           return reject(res, 415, "expected application/json");
-        void readBody(req).then(async (body) => {
-          let parsed: { method?: unknown; params?: unknown };
-          try {
-            parsed = JSON.parse(body) as typeof parsed;
-          } catch {
-            return reject(res, 400, "bad JSON");
-          }
-          if (typeof parsed.method !== "string") return reject(res, 400, "method must be a string");
-          const reply = await call(parsed.method, parsed.params ?? {});
-          res.setHeader("content-type", "application/json");
-          res.end(JSON.stringify({ result: reply.result, error: reply.error }));
-        });
+        readBody(req)
+          .then(async (body) => {
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(body);
+            } catch {
+              return reject(res, 400, "bad JSON");
+            }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+              return reject(res, 400, "expected a JSON object");
+            const { method, params } = parsed as { method?: unknown; params?: unknown };
+            if (typeof method !== "string") return reject(res, 400, "method must be a string");
+            const reply = await call(method, params ?? {});
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ result: reply.result, error: reply.error }));
+          })
+          .catch((err: unknown) => {
+            if (!res.headersSent) reject(res, 500, err instanceof Error ? err.message : String(err));
+          });
       });
       server.middlewares.use("/__engine/events", (req, res) => {
         if (!allowed(req)) return reject(res, 403, "forbidden");

@@ -1,4 +1,5 @@
 mod engine;
+mod job;
 
 use tauri::{Manager, RunEvent};
 

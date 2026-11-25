@@ -245,6 +245,8 @@ const CHECK_ICON: Record<CheckStatus, React.ReactNode> = {
   fail: <CircleXIcon className="size-3.5 shrink-0 text-destructive" />,
 };
 
+const CHECK_LABEL: Record<string, string> = { pass: "Pass", warn: "Warning", fail: "Fail" };
+
 function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind: "design" }>["design"]> }) {
   const failing = design.checks.filter((c) => c.status !== "pass");
   return (
@@ -264,7 +266,10 @@ function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind:
         <ul className="scroll-thin flex max-h-56 flex-col gap-1.5 overflow-y-auto px-3 pt-0.5 pb-3">
           {design.checks.map((c) => (
             <li key={c.id} className="flex items-start gap-2 text-xs leading-snug">
-              <span className="flex h-[1lh] items-center">{CHECK_ICON[c.status]}</span>
+              <span className="flex h-[1lh] items-center" aria-hidden>
+                {CHECK_ICON[c.status]}
+              </span>
+              <span className="sr-only">{CHECK_LABEL[c.status]}: </span>
               <span
                 className={cn(
                   "min-w-0 wrap-anywhere",
@@ -308,8 +313,21 @@ function QuickBox(props: {
     },
   );
   const [busy, setBusy] = useState(false);
-  const num = (k: "length" | "width" | "depth") => (e: React.ChangeEvent<HTMLInputElement>) =>
-    setP({ ...p, [k]: Number(e.target.value) });
+  // Dimensions are edited as text so an empty or partly typed field stays representable.
+  const [dims, setDims] = useState({ length: String(p.length), width: String(p.width), depth: String(p.depth) });
+  const num = (k: keyof typeof dims) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setDims({ ...dims, [k]: e.target.value });
+
+  const parsed = (): BoxParams | string => {
+    const out = { ...p };
+    for (const k of ["length", "width", "depth"] as const) {
+      const v = Number(dims[k]);
+      if (dims[k].trim() === "" || !Number.isFinite(v) || v <= 0 || v > 3000)
+        return `${k[0].toUpperCase()}${k.slice(1)} must be a number above 0 and at most 3000.`;
+      out[k] = v;
+    }
+    return out;
+  };
 
   const styleItems = info.styles.map((s) => ({ value: s.id, label: s.name }));
   const boardItems = info.boards.map((b) => ({ value: b.id, label: `${b.name} (${b.caliper_mm} mm)` }));
@@ -323,8 +341,11 @@ function QuickBox(props: {
       className="grid shrink-0 grid-cols-12 gap-x-2 gap-y-3 border-b bg-background/50 p-3"
       onSubmit={(e) => {
         e.preventDefault();
+        const params = parsed();
+        if (typeof params === "string") return props.onError(params);
+        setP(params);
         setBusy(true);
-        request("box.create", p)
+        request("box.create", params)
           .then(props.onCreated)
           .catch((err: unknown) => props.onError(err instanceof Error ? err.message : String(err)))
           .finally(() => setBusy(false));
@@ -359,13 +380,13 @@ function QuickBox(props: {
         </Select>
       </Field>
       <Field label="Length" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" min={1} step="any" value={p.length} onChange={num("length")} aria-label="Length" />
+        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.length} onChange={num("length")} aria-label="Length" />
       </Field>
       <Field label="Width" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" min={1} step="any" value={p.width} onChange={num("width")} aria-label="Width" />
+        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.width} onChange={num("width")} aria-label="Width" />
       </Field>
       <Field label="Depth" className="col-span-3 @[30rem]:col-span-2">
-        <Input size="sm" type="number" min={1} step="any" value={p.depth} onChange={num("depth")} aria-label="Depth" />
+        <Input size="sm" type="number" step="any" inputMode="decimal" value={dims.depth} onChange={num("depth")} aria-label="Depth" />
       </Field>
       <Field label="Units" className="col-span-3 @[30rem]:col-span-2">
         <Select

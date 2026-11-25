@@ -61,5 +61,6 @@ These are placeholders until checked against our ArtiosCAD (see PLAN.md):
 
 ## Known gaps
 
-- The shell stops the engine by closing its stdin, then kills it after two seconds. The PyInstaller one-file sidecar runs Python as a child process, so a hard kill can leave that child running. Putting the engine in a Windows Job Object with kill-on-close would make cleanup certain.
+- Before distributing installers, generate the full license notices for bundled dependencies (npm, Python packages inside the sidecar, Rust crates) and ship them with `THIRD_PARTY_NOTICES.md`, which currently covers the T3 Code primitives and direct UI dependencies.
 - Arcs aren't yet included in the line-crossing check.
+- Stop ends a turn immediately; a worker stuck in a network read is abandoned and ends by itself (read timeout 120 s) without touching the session.

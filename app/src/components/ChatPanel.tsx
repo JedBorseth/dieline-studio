@@ -288,22 +288,18 @@ function Composer(props: {
             Enter to send · Shift+Enter for a new line
           </span>
           <span className="flex-1 @md:hidden" />
-          {props.busy ? (
-            <Tip label="Stop">
-              <Button
-                variant="destructive"
-                size="icon-sm-pill"
-                onClick={props.onStop}
-                aria-label="Stop"
-              >
-                <SquareIcon className="size-3 fill-current" />
-              </Button>
-            </Tip>
-          ) : (
-            <Button size="icon-sm-pill" onClick={submit} disabled={!text.trim()} aria-label="Send">
-              <ArrowUpIcon />
+          {/* One button that changes role, so keyboard focus survives Send -> Stop -> Send. */}
+          <Tip label={props.busy ? "Stop" : "Send"}>
+            <Button
+              variant={props.busy ? "destructive" : "default"}
+              size="icon-sm-pill"
+              onClick={props.busy ? props.onStop : submit}
+              disabled={!props.busy && !text.trim()}
+              aria-label={props.busy ? "Stop" : "Send"}
+            >
+              {props.busy ? <SquareIcon className="size-3 fill-current" /> : <ArrowUpIcon />}
             </Button>
-          )}
+          </Tip>
         </div>
       </div>
     </div>

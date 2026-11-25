@@ -212,7 +212,7 @@ class _FakeStream:
 
 def _fake_client(responses, calls):
     class Client:
-        def __init__(self, api_key):
+        def __init__(self, api_key, timeout=None):
             self.beta = NS(messages=NS(stream=self.stream))
 
         def __enter__(self):
@@ -245,11 +245,17 @@ def _run(monkeypatch, tmp_path, responses):
     store = SettingsStore(tmp_path / "settings.json")
     monkeypatch.setattr(store, "api_key", lambda: "sk-ant-api-test")
     ag = agent_mod.Agent(store, events.append)
-    s = agent_mod.Session("s1")
-    ag.sessions["s1"] = s
-    s.busy = True
-    ag._run_turn(s, "make a box", "sk-ant-api-test")
+    s, t = _start(ag)
+    ag._run_turn(s, t, "sk-ant-api-test")
     return ag, s, events, calls
+
+
+def _start(ag):
+    s = agent_mod.Session("s1", turns=1)
+    t = agent_mod.Turn("s1", 1, [{"role": "user", "content": "make a box"}], None)
+    s.active = t
+    ag.sessions["s1"] = s
+    return s, t
 
 
 def test_agent_tool_round_trip(monkeypatch, tmp_path):
@@ -309,3 +315,21 @@ def test_cf2_header_units_and_block_scale():
     assert line.end == pytest.approx((50.8, 0.0))
     bad = read_cf2("MAIN,t\nL,2,,0,0,0,1,0,0,0\nEND")
     assert bad.dieline.segments == [] and bad.raw_codes == {} and len(bad.warnings) == 1
+
+
+def test_stopped_turn_is_abandoned(monkeypatch, tmp_path):
+    calls, events = [], []
+    responses = [
+        NS(stop_reason="tool_use", content=[_tool_use("t1", "create_box", BOX)]),
+        NS(stop_reason="end_turn", content=[_text("Done.")]),
+    ]
+    monkeypatch.setattr(agent_mod.anthropic, "Anthropic", _fake_client(responses, calls))
+    ag = agent_mod.Agent(SettingsStore(tmp_path / "settings.json"), events.append)
+    s, t = _start(ag)
+    ag.cancel("s1")
+    assert events == [{"type": "chat.turn_end", "session_id": "s1", "stop_reason": "cancelled"}]
+    assert not s.busy
+    # The worker finishing later (e.g. after a stalled read) changes nothing and says nothing.
+    t.cancel.clear()
+    ag._run_turn(s, t, "sk-ant-api-test")
+    assert len(events) == 1 and s.messages == [] and s.current is None
