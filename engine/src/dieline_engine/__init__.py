@@ -3,4 +3,4 @@
 Agents choose parameters; this package draws all geometry.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
