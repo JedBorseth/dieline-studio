@@ -29,6 +29,8 @@
 
 **Progress (2026-11-25, later):** the engine now replicates R&L's own ServerLib standards (REG-GLIO-NX, HSC_GL, Tube_Glued) in inches with their board codes. It also writes the sample table's DXF format. The formulas reproduce two real R&L blanks to the 1/10,000". Research and evidence: `.local/ARTIOS-WORKFLOW.md` (private). Next: the import test (milestone 3), confirming board values from the board library, then 5PW, die-cut trays and the wing-lock mailers.
 
+**Progress (2026-11-26):** phase 2 of the design system is built: handholes, hand flaps, vents, windows, extra scores, notches, perforations and tear strips on the four standards, placed from named faces and checked, with the agent's `set_features` tool and the features list in the preview. Perforations, reverse creases and cut-scores draw but block CF2 and DXF exports until the import and cut fixture (DESIGN-SYSTEM.md phase 2) verifies their codes.
+
 **Next (2026-11-25):** custom designs: features (handholes, hand flaps, vents, perfs, tear strips, scores, notches), slotted partitions, a panel builder for one-offs, and cut-out artwork. Spec and phases: [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md).
 
 ## Open questions
