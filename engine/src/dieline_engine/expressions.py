@@ -136,6 +136,9 @@ def _tokens(text: str, units: str) -> list[_Tok]:
         elif g == "name":
             # A unit right after a number literal: 2in, 50mm, 1/16in, 1 1/2 in.
             if raw in ("in", "mm") and out and out[-1].kind == "num" and out[-1].unit is None:
+                if ":" in out[-1].text:  # 2:12 is already inches and sixteenths
+                    raise ExpressionError(f"{out[-1].text}{raw}: sixteenths ({out[-1].text}) are inches already "
+                                          "and take no unit")
                 last = out.pop()
                 out.append(_Tok("num", last.text + raw, last.value, raw))
             else:

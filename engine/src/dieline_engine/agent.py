@@ -1253,12 +1253,13 @@ class Agent:
                                    None)
             return self._design_view(payload, None)
         if name == "list_faces":
+            # The face map alone doesn't show a design (its size, features, checks or picture), so it
+            # never rebinds the turn: after an outside edit, view_design must come first.
             cur = self._read(s)
+            self._check_bound(s)
             part = cur.part(_part_arg(args))
-            out = {"part": part.id, "label": part.label, "design_id": cur.id, "revision": cur.revision,
-                   **designs.face_map(part.params)}
-            self._bind_read(s, cur)
-            return out
+            return {"part": part.id, "label": part.label, "design_id": cur.id, "revision": cur.revision,
+                    **designs.face_map(part.params)}
         if name in ("view_design", "get_geometry"):
             region = render.Region.parse(args.get("region"))
             if args.get("path") is not None:

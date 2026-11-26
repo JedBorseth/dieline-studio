@@ -193,10 +193,14 @@ def check_features(d: Dieline) -> list[CheckResult]:
                                 f"{_name(b, c)} is in the band {opp} covers when the box is closed, and {opp} has no "
                                 "matching cut-out", b, _bounds(segs))
     # ---- features too close to each other (near misses)
+    # Edge notches count against holes too (not against each other: one edge's notches are spaced
+    # when they're applied), since a notch beside a hole leaves the same thin web.
+    notches = [(b, c) for b in live if b.kind == "notch" for c in b.copies]
+    near_items = holes + notches
     pairs_seen: set[tuple[int, int]] = set()
-    for i, (b, c) in enumerate(holes):
-        for j, (b2, c2) in enumerate(holes):
-            if j <= i or (i, j) in pairs_seen or c.face != c2.face:
+    for i, (b, c) in enumerate(near_items):
+        for j, (b2, c2) in enumerate(near_items):
+            if j <= i or (i, j) in pairs_seen or c.face != c2.face or (b.kind == "notch" and b2.kind == "notch"):
                 continue
             pairs_seen.add((i, j))
             dist, _ = _distance(c.outline + c.extra.get("outer", []), c2.outline + c2.extra.get("outer", []))
@@ -252,7 +256,8 @@ def check_features(d: Dieline) -> list[CheckResult]:
             f = fm.faces[fid]
             p = f.from_flat(tab)
             for k in f.keepouts:
-                if k.kind == "glue_landing" and k.rect[0] - TOL <= p[0] <= k.rect[2] + TOL:
+                if k.kind == "glue_landing" and k.rect[0] - TOL <= p[0] <= k.rect[2] + TOL \
+                        and k.rect[1] - TOL <= p[1] <= k.rect[3] + TOL:
                     msg = ("the glue lug covers it on the outside, so it can't be reached" if closure == "outside"
                            else "glue lands on it unless the glue pattern stops short of the strip")
                     add(f"feature_{b.id}_tab_glue", "warn", f"{b.name}'s pull tab is in the glue zone on {fid}: {msg}",
@@ -260,7 +265,7 @@ def check_features(d: Dieline) -> list[CheckResult]:
             if fid == "glue_lug" and closure == "inside":
                 add(f"feature_{b.id}_tab_reach", "warn", f"{b.name}'s pull tab is on the glue lug, inside the box "
                     "once it's glued: it can't be reached", b, region)
-        if "P4" in c.faces and "glue_lug" not in c.faces and c.faces[0] == "P1":
+        if {"P1", "P4"} <= set(c.faces) and "glue_lug" not in c.faces:  # a body wrap, either way round
             add(f"feature_{b.id}_joint", "warn", f"{b.name} stops at the glue joint; the lug will block the tear "
                 "there (glue_joint: cross carries it over the lug)", b, region)
         if c.extra["rails"] == "perf" and len(board_flute) == 2:

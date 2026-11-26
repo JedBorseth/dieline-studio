@@ -306,7 +306,10 @@ def _slot(axis: str, j: int, centre: float, mating: str, spec: PartitionSpec, he
     if width < t_m - EPS:
         raise Refused(f"slot width {fmt_in(width)} in is narrower than the mating board's caliper "
                       f"({get_board(mating).id}, {fmt_in(t_m)} in): the pieces can't go together")
-    rnd = width >= 2 * MIN_BEND_RADIUS - EPS
+    # Round only when the slot is wide enough to bend (twice the minimum radius) and deep
+    # enough for its full radius: a semicircle deeper than the slot would draw its walls
+    # back past the piece's edge. Otherwise the bottom is square (piece_checks says so).
+    rnd = width >= 2 * MIN_BEND_RADIUS - EPS and usable + round_loss(width, t_m) >= width / 2 + EPS
     depth = usable + (round_loss(width, t_m) if rnd else 0.0)
     if depth >= height - EPS:
         raise Refused(f"a {axis} piece's slot is {fmt_in(depth)} in deep on a {fmt_in(height)} in piece: it cuts "
@@ -707,8 +710,26 @@ def candidates(args: dict[str, Any], container: Box | None = None, limit: int = 
                           for k in ("length", "width", "depth"))  # type: ignore[assignment]
     elif container is not None:
         limit_box = (container.length, container.width, container.depth)
+    if limit_box[0] is not None and limit_box[1] is not None and limit_box[0] < limit_box[1]:
+        # The set's long axis is its longer one, so the box's longer side bounds it whichever way it's named.
+        limit_box = (limit_box[1], limit_box[0], limit_box[2])
     height = ctx.length(args["height"], "height") if args.get("height") is not None else item_h
     rules = _rules(args, ctx)
+    # Bad board codes are refused here; a list's length only rules out the grids it doesn't fit.
+    codes = [args.get(k) for k in ("board", "board_long", "board_short") if args.get(k) is not None]
+    for key in ("boards_long", "boards_short"):
+        listed = args.get(key)
+        if listed is not None:
+            if not isinstance(listed, list):
+                raise Refused(f"{key} must list one board per piece")
+            codes += listed
+    for c in codes:
+        if not isinstance(c, str):
+            raise Refused("boards are ArtiosCAD board codes like '32 B KR'")
+        try:
+            get_board(c)
+        except ValueError as exc:
+            raise Refused(str(exc)) from None
     out: list[dict[str, Any]] = []
     seen: set[tuple] = set()
     for a in range(1, count + 1):
@@ -724,12 +745,13 @@ def candidates(args: dict[str, Any], container: Box | None = None, limit: int = 
                         cl, cs = [ring, *cl, ring], [ring, *cs, ring]
                     if len(cl) == 1 and len(cs) == 1:
                         continue
-                    bl, bs = _boards(args, len(cs) - 1, len(cl) - 1)
-                    spec_args = dict(long_cells=cl, short_cells=cs, height_long=height, height_short=height,
-                                     depth=limit_box[2], boards_long=bl, boards_short=bs, input_mode="product",
-                                     inputs=_jsonable(args), **{**rules, "degenerate_confirmed": True})
-                    spec = PartitionSpec(**spec_args)
                     try:
+                        # boards_long / boards_short list one board per piece, so they fit only some grids.
+                        bl, bs = _boards(args, len(cs) - 1, len(cl) - 1)
+                        spec_args = dict(long_cells=cl, short_cells=cs, height_long=height, height_short=height,
+                                         depth=limit_box[2], boards_long=bl, boards_short=bs, input_mode="product",
+                                         inputs=_jsonable(args), **{**rules, "degenerate_confirmed": True})
+                        spec = PartitionSpec(**spec_args)
                         plan = plan_set(spec)
                     except Refused:
                         continue
@@ -748,7 +770,9 @@ def candidates(args: dict[str, Any], container: Box | None = None, limit: int = 
                     lo, so, ho = plan.outside
                     out.append({
                         "cells": f"{nl} x {ns}", "cells_long": nl, "cells_short": ns, "spare_cells": n - count,
-                        "degenerate": nl == 1 or ns == 1,
+                        # The set's own grid decides: an air-cell ring turns a 1 x n item layout into slots.
+                        "degenerate": len(cl) == 1 or len(cs) == 1,
+                        **({"grid_cells": f"{len(cl)} x {len(cs)}"} if ring else {}),
                         "item_along_long_in": round(along, 6),
                         "cell_in": {"long": round(along + 2 * cc, 6), "short": round(across + 2 * cc, 6)},
                         "set_outside_in": {"long": round(lo, 6), "short": round(so, 6), "height": round(ho, 6)},
@@ -817,6 +841,12 @@ def piece_checks(plan: SetPlan, piece: Piece) -> list[CheckResult]:
             kind = "square mouths" if spec.mouth == "square" else f"{fmt_in(spec.lead_in)} x 45 deg lead-ins"
             out.append(CheckResult("partition_mouths", "pass", f"{kind}, rims at least {fmt_in(rim)} in" +
                                    (f"; {notes[0]}" if notes else "")))
+        shallow = [k + 1 for k, s in enumerate(piece.slots)
+                   if s.bottom == "square" and s.width >= 2 * MIN_BEND_RADIUS - EPS]
+        if shallow:
+            out.append(CheckResult("partition_slot_bottom", "info",
+                                   f"slot(s) {', '.join(map(str, shallow))} have square bottoms: they're too shallow "
+                                   "for a full-radius round bottom"))
         if not piece.symmetric():
             out.append(CheckResult("partition_orientation", "info", "the slot plan isn't the same from both ends: "
                                                                     "packers can put this piece in backwards. An "

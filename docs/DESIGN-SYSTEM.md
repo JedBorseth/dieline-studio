@@ -358,7 +358,7 @@ Builder dimensions, partition values and placement distances may be expressions.
   - `L * W` (a length times a length) and any expression whose result is a scalar in a length field are refused.
 - **Grammar:**
   - Numbers: decimals and mixed fractions (`1 1/2`), read as single numbers before any arithmetic is parsed.
-  - ArtiosCAD sixteenths (`2:12`) are accepted on inch parts only.
+  - ArtiosCAD sixteenths (`2:12`) are accepted on inch parts only, and take no unit (`2:12mm` is refused).
   - Operators: `+ - * /`, unary minus and parentheses.
   - Functions: `min`, `max`, `abs`, `round(x, quantum)`. The quantum is a length (`1/16in`, `1mm`), so rounding means the same thing in any units.
 - **Names:**
@@ -857,6 +857,7 @@ Every design instance has an id and a revision number.
 - **External edits:** anything outside the chat that changes the design gives it a new revision or a new id. That includes the form, an opened job and the UI's own edits.
   - The design id and revision are compared **at commit**, under the same lock as the write (compare-and-swap). An edit made while a call is regenerating therefore isn't overwritten; the call is refused with "the design changed outside the chat".
   - A successful `view_design` rebinds the turn to the snapshot it returned. The agent must call it before trying again.
+  - `list_faces` never rebinds: the face map doesn't show the changed design, so after an outside edit it's refused with the same "call view_design" error.
 - **No exceptions:** this includes `new_design` and `action: replace_design`, so the agent can't discard the designer's form edit unseen.
 - **Retries:** each mutating call carries the tool call's id. A repeated call with the same id returns the first result and isn't applied twice, so a retried `add` can't double the parts.
 - **Exports:** `export_files` is bound to an exact snapshot (design id + revision). The file list, validation and writing all use that snapshot.
@@ -1067,9 +1068,10 @@ Readings taken where the spec left a choice, each the safer one. Change them her
 **Features**
 
 - Defaults carry their unit (`3 5/8 in`), so they mean the same on a millimetre part.
+- The form's Generate (and its Replace) starts a clean standard part: style, size, units, board and options only. Features, artwork and acknowledgements never carry over from the design it replaces.
 - Hand flaps turn only in 90° steps; the turn is applied to the profile's size and the hinge is then named in the face frame. Obround and circle flaps hinge on a long side only, with a secant hinge inset to the next 1/32 above `r(1 − cos 35°)` (1/8 on the File_Box_1 obround). Distances measure the opening, not the outer crease. A D-shape's default corners leave a straight start at the hinge, so a relief nick continues the cut in line.
 - Routes (scores, perforations, tear strips) are straight, from the first face's edge to the last face's, across faces joined by hinges, or over a slot of up to 1/2 in with `slots: jump`. Starting or stopping inside a face isn't offered yet.
-- Tear strips: rails are perforations (the File_Box_1 rule) or cut-scores. `glue_joint: cross` (the default) carries a P1-to-P4 strip over the glue lug. Edge tabs need the strip to start at a cut edge. Width 3/4 in and tab 1/2 in are provisional.
+- Tear strips: rails are perforations (the File_Box_1 rule) or cut-scores. `glue_joint: cross` (the default) carries a P1-to-P4 strip over the glue lug, and a P4-to-P1 one too (the lug goes first; the reference line is still the route's first listed face). Edge tabs need the strip to start at a cut edge; each tab cut runs in from its own rail's start, so a start on the lug's slanted taper still meets both rails. A thumb hole's tab is checked at the hole's centre. The strip's pointage applies to its tab cuts too. Width 3/4 in and tab 1/2 in are provisional.
 - Notches go on straight cut edges, at least 1/8 in from the ends of the straight cut and from the face's corners, and are part of the outline operation. A half-circle notch is half its width deep.
 - Ellipse windows are four-centre ovals (true arcs, tangent at the joins); the summary gives the largest gap from the ellipse.
 - A feature placed wholly inside another's opening leaves an island: drawn, export blocked, as the contact table says for islands.
@@ -1079,11 +1081,14 @@ Readings taken where the spec left a choice, each the safer one. Change them her
 - The combined ligament is the board between a handhole (or hand flap) and the nearest other cut, perforation or score above it, against the carry-web limit.
 - An overlap band's matching cut-out is any feature on the opposite flap.
 - An extra score in the glue zone warns only when the joint is outside (the lug lands on P1's outside); cuts and perforations there always warn.
+- A tear strip's pull tab is in the glue zone only when it's inside the landing both ways (a flap's landing can be short). A strip that wraps P1 and P4 without the lug warns at the joint whichever end it starts from.
+- Edge notches count in the near-miss check against holes, vents, windows and hand flaps on their face (not against other notches: one edge's notches are spaced when applied). A notch pattern's pitch must be above zero.
 - The slotter's die-cutting isn't confirmed, so a part with a die-cut feature isn't listed for it. An extra score alone doesn't count as die-cut.
 
 **Exports**
 
 - In the expanded sample-table perforation, a tie is centred on every crease the path crosses and on a crease it ends on; a cut piece trimmed shorter than half a tie is dropped. The expansion must pass the topology rules (a cut on a crease is invalid), and the target stays blocked as unverified.
+- The dashed cuts keep the perforation's contacts with named cuts: a tear strip's tab cuts end on the rails' cuts, and the rails' cuts may end on the tabs (never on a crease). A curved perforation (artwork) becomes dashed arcs, stationed on along the operation; a run with no recorded station continues from the one before it.
 - A feature can carry its own pointage; the CF2 writer then writes it per operation, and mixed pointage blocks CF2.
 
 ## Partitions as built
@@ -1092,6 +1097,7 @@ Where this spec left a choice open, phase 3 took the safest reading:
 
 - **Slots belong to the outline.** A slot is a boundary operation, like an edge notch: the piece's outline stays one closed cut that runs round each slot, so its mouth joins the outline by construction. A slot drawn as its own cut ending on an unbroken edge would be a declared contact, but its slug would stay as a separate piece of board (a test shows it).
 - **Round bottoms are compensated.** The slot is drawn deeper by what its round bottom loses, so its *usable* depth (as wide as the mating board) is still H/2 + 1/32. The interlock check uses usable depths.
+- **Shallow slots are square.** A slot gets a round bottom only when it's at least twice the minimum bend radius wide *and* deep enough for the full radius (drawn depth ≥ half its width); otherwise the radius would run its walls back past the piece's edge. Such a slot is square-bottomed, with an info check (`partition_slot_bottom`).
 - **Unequal heights** (pieces mode): slot depths come from the shorter piece's height h. The bottom-slotted piece gets h/2 + 1/32, the top-slotted one H − h/2 + 1/32, so they still overlap by 1/16.
 - **Lead-ins** shrink so neighbouring mouths and the piece ends keep a rim of max(1/4", 2 × CAL), and to at most half the slot's straight wall. If even a square mouth can't keep the rim, it warns.
 - **Facing.** Pieces are drawn from their start end, nearest the box's first wall. Pieces mode says which end its slot positions are measured from (`from: start | end`).
@@ -1099,11 +1105,13 @@ Where this spec left a choice open, phase 3 took the safest reading:
 - **A part's parameters** are the whole set's grid plus its role, so any part rebuilds alone with today's rules. `update_part` can only relabel a piece; the set changes through `create_partition` with `replace_set`.
 - **Plain strips (1 × n)** come from `box_cells` or `cell_sizes` with `confirm_degenerate`. Pieces mode refuses them: strips have no slot positions to place them by.
 - **Height.** When the box's inside depth isn't known, the height check is `unavailable`.
-- **Product mode.** Piece height defaults to the item height. A layout is listed when it has fewer spare cells than one row; `1 × n` layouts come last and need `confirm_degenerate`. Up to six are offered, by spare cells, then estimated sheet usage.
+- **Product mode.** Piece height defaults to the item height. A layout is listed when it has fewer spare cells than one row; `1 × n` layouts come last and need `confirm_degenerate`. Up to six are offered, by spare cells, then estimated sheet usage. "No slots" (`degenerate`) is decided by the set's own grid: an air-cell ring turns a `1 × n` item layout into a slotted grid, which the card shows (`grid_cells`). A `boards_long` / `boards_short` list only rules out the grids it doesn't fit (bad board codes are refused). The maximum box's longer side bounds the set's long axis, whichever way round it's named.
+- **Choosing a layout into a box** takes that box's inside depth for the height check, even when the candidates were offered for another box.
 - **Candidates** are tied to the whole design's id and revision (stricter than the container part's revision), the board values of every board in them, and `partition-rules-1`. Their ids (`c1`, `c2`, …) are never reused in a chat. Each designer message gets an id (`m<turn>`), shown to the model as `[message m3]`. `choose_layout` needs a message sent after the cards that names the candidate's id as a word. A card click commits as the designer's own change (`layout.choose`), and the model is told on its next turn.
 - **Default action.** `create_partition` adds the set when `contained_in` is given and otherwise replaces the design. `replace_set` takes the box size from the set's existing fit link when no `contained_in` is given.
 - **Fit.** A standard's outside is inside + 2 × CAL. A set's outside is its long and short piece lengths and its height. A stack is its widest tier, with the tiers' heights plus pads × pad CAL. Only "taller than the inside depth" warns upwards. A set that doesn't go in warns rather than fails (draw and warn). A container must be a box part. A group as a container, or a link to one piece of a set, is `unavailable`.
-- **Stacks** keep their pads in the group (`extra: {pads, pad_board}`); pads become parts with the panel builder.
+- **Stacks** keep their pads in the group (`extra: {pads, pad_board}`); pads become parts with the panel builder. A stack's height is reported once, by `stack_<id>` (no separate `fit_<link>_depth`). A stack with pads but no known pad board, or one that contains itself, makes its fit `unavailable`; a job file with a group cycle is refused when opened.
+- **Exports.** A partition piece is exported with its set, from the design the engine holds: the RPC refuses one piece's parameters alone (they'd skip the set's crossing, interlock and fit checks).
 - **Check results** take their category from the id's prefix (`partition_` → partition, `fit_` and `stack_` → fit), so the checks panel files them with the actionable checks.
 
 ## Artwork as built

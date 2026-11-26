@@ -374,6 +374,9 @@ function LayoutCards({ result, onChoose }: { result: unknown; onChoose: (candida
                   {c.spare_cells} spare
                 </span>
               )}
+              {c.grid_cells && (
+                <span className="text-muted-foreground">in a {c.grid_cells.replace(" x ", " × ")} grid with air cells</span>
+              )}
               {c.degenerate && <Badge variant="warning">no slots</Badge>}
             </div>
             <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 tabular-nums">

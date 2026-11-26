@@ -207,6 +207,22 @@ def test_agent_is_refused_after_an_outside_edit_until_it_looks_again(tmp_path):
     assert out["parts"][0]["name"].startswith("REG-GLIO-NX 18x8x7")
 
 
+def test_list_faces_doesnt_rebind_the_turn_after_an_outside_edit(tmp_path):
+    """Review finding 15: the face map doesn't show the changed design, so it mustn't unlock changes to it."""
+    ag, t, _ = _agent(tmp_path)
+    ag._dispatch(t, "create_box", BOX, "c1")
+    seen = t.binding
+    ag.set_design("s1", params(length=20, depth=4))  # the designer replaced it in the form
+    with pytest.raises(DesignChanged, match="view_design"):
+        ag._dispatch(t, "list_faces", {}, "c2")
+    assert t.binding == seen
+    with pytest.raises(DesignChanged):
+        ag._dispatch(t, "update_part", {"width": 12}, "c3")
+    ag._dispatch(t, "view_design", {}, "c4")
+    assert ag._dispatch(t, "list_faces", {}, "c5")["faces"]  # once seen, the face map is fine
+    assert ag._dispatch(t, "update_part", {"width": 12}, "c6")["revision"] == 2
+
+
 def test_agent_retry_with_the_same_call_id_adds_one_part(tmp_path):
     ag, t, _ = _agent(tmp_path)
     ag._dispatch(t, "create_box", BOX, "c1")

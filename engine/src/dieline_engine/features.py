@@ -854,10 +854,13 @@ def route(ctx: Ctx, spec: dict[str, Any], what: str, offset: float = 0.0, glue_j
         faces = fm.resolve(spec["faces"])
     except ValueError as exc:
         raise FeatureError(f"{what}: {exc}") from None
-    if glue_joint == "cross" and faces[-1] == "P4" and "glue_lug" not in faces and faces[0] == "P1" \
-            and "glue_lug" in fm.faces:
-        faces = faces + ["glue_lug"]
-    f0 = fm.faces[faces[0]]
+    f0 = fm.faces[faces[0]]  # the route's own first face gives its reference line, even with the lug added
+    if glue_joint == "cross" and "glue_lug" not in faces and "glue_lug" in fm.faces:
+        # A P1-to-P4 wrap carries on over the lug, beyond P4, whichever way the route runs.
+        if faces[0] == "P1" and faces[-1] == "P4":
+            faces = faces + ["glue_lug"]
+        elif faces[0] == "P4" and faces[-1] == "P1":
+            faces = ["glue_lug"] + faces
     axis = "y" if spec["direction"] == "horizontal" else "x"
     c, s, name = pl._ref(f0, spec["at"]["from"], axis, "assembled", what)
     dist = ctx.length(spec["at"]["distance"], f"{what} route.at.distance")
@@ -873,7 +876,7 @@ def route(ctx: Ctx, spec: dict[str, Any], what: str, offset: float = 0.0, glue_j
     for fid in faces:
         iv = _clip(fm.faces[fid].polygon, p0, u)
         if iv is None:
-            raise FeatureError(f"{what}: the route misses {fid} (at {name} + {dist:.4g} in on {faces[0]})")
+            raise FeatureError(f"{what}: the route misses {fid} (at {name} + {dist:.4g} in on {f0.id})")
         spans.append(iv)
     if len(spans) > 1 and spans[1][0] < spans[0][0]:
         u = (-u[0], -u[1])
@@ -1006,37 +1009,46 @@ def _draft_tear(b: Built, ctx: Ctx) -> None:
     # Which side each rail is on (the offsets were in the face frame; the flat frame may mirror them).
     side_a = (rails[0].pieces[0][0][0] - origin[0]) * nx + (rails[0].pieces[0][0][1] - origin[1]) * ny
     oa, ob = (w / 2, -w / 2) if side_a > 0 else (-w / 2, w / 2)
+    # Where each rail starts along the strip, from the centre line's start: not 0 where the strip
+    # starts on a slanted edge (the glue lug's taper), so tabs and rails meet on each rail's own line.
+    lead = [(r.pieces[0][0][0] - origin[0]) * ux + (r.pieces[0][0][1] - origin[1]) * uy for r in rails]
+    starts = [start_cut - x for x in lead]  # in each rail's own stations
+    tab_rule = _rule(b, "cut", ctx)  # the strip's pointage, on its tab cuts too
     tab_ops: list[Operation] = []
+    tab_at = pt(tab_len / 2, 0.0)
     if tab == "edge_tab":
         if centre.ends[0] != "outline":
             raise FeatureError(f"{b.name}: an edge tab needs the strip to start at a cut edge of the blank; it starts "
                                "on a score here. Start it at the free edge or use tab angled_tab or thumb_hole")
-        for key, o in (("tab_a", oa), ("tab_b", ob)):
+        for k, (key, o) in enumerate((("tab_a", oa), ("tab_b", ob))):
             op = Operation(f"{b.id}.{key}", "tab_cut", open_ends="on",
-                           ends_on=("outline", ids["rail_a" if key == "tab_a" else "rail_b"]))
+                           ends_on=("outline", ids["rail_a" if key == "tab_a" else "rail_b"]), rule=tab_rule)
             tab_ops.append(op)
-            segs.append(Line(pt(0.0, o), pt(tab_len, o), LineType.CUT, op.id))
+            segs.append(Line(pt(lead[k], o), pt(lead[k] + tab_len, o), LineType.CUT, op.id))
+            starts[k] = tab_len  # each tab runs tab_len in from its own rail's start
+        tab_at = pt((lead[0] + lead[1]) / 2 + tab_len / 2, 0.0)
     elif tab == "angled_tab":
         apex = tab_len - min(w / 2, max(tab_len - 1 / 8, 0.0))
-        op = Operation(ids["tab"], "tab_cut", open_ends="on", ends_on=(ids["rail_a"], ids["rail_b"]))
+        op = Operation(ids["tab"], "tab_cut", open_ends="on", ends_on=(ids["rail_a"], ids["rail_b"]), rule=tab_rule)
         tab_ops.append(op)
         segs += [Line(pt(tab_len, oa), pt(apex, 0.0), LineType.CUT, op.id),
                  Line(pt(apex, 0.0), pt(tab_len, ob), LineType.CUT, op.id)]
     else:  # thumb hole: a circle on the strip's start; the rails start where they leave it
         R = w / 2 + 1 / 8
         sc = R + CLEARANCE_IN
-        op = Operation(ids["tab"], "hole", closed=True)
+        op = Operation(ids["tab"], "hole", closed=True, rule=tab_rule)
         tab_ops.append(op)
         cc = pt(sc, 0.0)
         segs.append(Arc((cc[0] + R, cc[1]), (cc[0] + R, cc[1]), cc, False, LineType.CUT, True, op.id))
-        start_cut = sc + math.sqrt(R * R - (w / 2) ** 2)
-    for key, rail, o in (("rail_a", rails[0], oa), ("rail_b", rails[1], ob)):
+        starts = [sc + math.sqrt(R * R - (w / 2) ** 2) - x for x in lead]
+        tab_at = cc  # the hole is the tab
+    for k, (key, rail, o) in enumerate((("rail_a", rails[0], oa), ("rail_b", rails[1], ob))):
         ends = tuple(x.id for x in tab_ops)
         op = _rule_op(b, ids[key], "perf" if perf else "score", ctx, rule, ends)
         ops.append(op)
         for a_, e_, st in rail.pieces:
             L = math.dist(a_, e_)
-            lo = max(start_cut - st, 0.0)
+            lo = max(starts[k] - st, 0.0)
             if lo >= L - 1e-9:
                 continue
             ra = (a_[0] + (e_[0] - a_[0]) * lo / L, a_[1] + (e_[1] - a_[1]) * lo / L)
@@ -1051,7 +1063,7 @@ def _draft_tear(b: Built, ctx: Ctx) -> None:
                 raise FeatureError(f"{b.name}'s pull tab is outside {face.id}: {why}")
     b.extra_ops += tab_ops + ops
     b.copies.append(Placed(centre.faces[0], 1, 1, segs, segs, faces=centre.faces, crossings=centre.crossings,
-                           extra={"route": centre, "width": w, "tab": tab, "tab_at": pt(tab_len / 2, 0.0),
+                           extra={"route": centre, "width": w, "tab": tab, "tab_at": tab_at,
                                   "tab_len": tab_len, "rails": spec["rails"], "glue_joint": spec["glue_joint"]}))
     a = spec["route"]["at"]
     b.words = (f"{fmt_in(w)} in tear strip ({'perforated' if perf else 'cut-score'} rails, {tab.replace('_', ' ')} "
@@ -1092,6 +1104,8 @@ def _draft_notch(b: Built, ctx: Ctx) -> None:
     pattern = spec["pattern"]
     n = pattern.get("count", 1)
     pitch = ctx.length(pattern["pitch"], f"{b.name} pattern.pitch") if n > 1 else 0.0
+    if n > 1 and pitch <= 0:
+        raise FeatureError(f"{b.name}: pattern.pitch must be above zero")
     mode, mirrors = pl._pairing(fm, faces, {k: spec[k] for k in ("mirror", "pairs") if k in spec})
     b.notch_plan = []
     for fid in faces:

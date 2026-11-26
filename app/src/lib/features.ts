@@ -3,7 +3,7 @@
 // docs/DESIGN-SYSTEM.md, "UI".
 
 import { type Primitive, toSvgPath } from "./cf2.ts";
-import { type CheckResult, type Design, isPartitionParams, type SceneSegment } from "./protocol.ts";
+import { type BoxParams, type CheckResult, type Design, isPartitionParams, type SceneSegment } from "./protocol.ts";
 
 const MM_PER_IN = 25.4;
 
@@ -102,6 +102,22 @@ export function replaceLoses(design: Design | null | undefined): string | null {
     set ? "its partition set" : "",
   ].filter(Boolean);
   return `Replace the current design? Its features, overrides and extra parts will be lost (${lost.join(", ")}).`;
+}
+
+/** The form's Replace starts a clean standard part: only the plain standard parameters, never the
+ *  design's features, artwork or acknowledgements (nor anything else the form doesn't edit). */
+export function plainStandard(params: BoxParams, boardIds: readonly string[] = []): BoxParams {
+  const normalized = params.board.trim().toUpperCase().replace(/\s+/g, " ");
+  const out: BoxParams = {
+    style: params.style,
+    length: params.length,
+    width: params.width,
+    depth: params.depth,
+    units: params.units,
+    board: boardIds.find((b) => b === normalized) ?? params.board,
+  };
+  if (params.options) out.options = { ...params.options };
+  return out;
 }
 
 // A feature link clicked in the chat asks the preview to show that feature.
