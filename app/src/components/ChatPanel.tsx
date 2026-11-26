@@ -16,9 +16,10 @@ import {
   ZoomOutIcon,
 } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import Markdown from "react-markdown";
+import Markdown, { type Components, defaultUrlTransform } from "react-markdown";
 
 import { formatToolLabel } from "../lib/chat";
+import { focusFeature, keepFeatureLinks, parseFeatureHref } from "../lib/features";
 import type { OverallStatus, Settings } from "../lib/protocol";
 import type { ChatItem, Session } from "../lib/store";
 import { cn } from "../lib/utils";
@@ -198,7 +199,9 @@ const Item = memo(function Item({
           )}
           {item.text && (
             <div className="markdown">
-              <Markdown>{item.text}</Markdown>
+              <Markdown components={MARKDOWN} urlTransform={(url) => keepFeatureLinks(url, defaultUrlTransform)}>
+                {item.text}
+              </Markdown>
             </div>
           )}
         </div>
@@ -411,3 +414,22 @@ function Composer(props: {
     </div>
   );
 }
+
+/** `[handhole 1](feature:p1/f1)` in a reply: a chip that highlights and zooms to that feature in the preview. */
+const MARKDOWN: Components = {
+  a: ({ href, children, node: _node, ...rest }) => {
+    const target = parseFeatureHref(href);
+    if (!target) return <a href={href} {...rest}>{children}</a>;
+    return (
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 rounded-md border border-dashed px-1.5 align-baseline text-[0.92em] hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        title={`Show ${target.featureId} on part ${target.partId} in the preview`}
+        onClick={() => focusFeature(target)}
+      >
+        <DiamondIcon className="size-3" />
+        {children}
+      </button>
+    );
+  },
+};

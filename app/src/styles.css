@@ -94,6 +94,7 @@
   --ln-perforation: #b7791f;
   --ln-score: #7c4dde;
   --ln-other: #9aa1ab;
+  --ln-highlight: #d6249f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -132,6 +133,7 @@
     --ln-perforation: #f0b43c;
     --ln-score: #b48cff;
     --ln-other: #6b7380;
+    --ln-highlight: #ff5cc8;
   }
 }
 
@@ -324,6 +326,19 @@
 }
 .ln-other {
   stroke: var(--ln-other);
+}
+/* A feature in focus (hovered in the features list, a chat link, a check). */
+.ln-highlight {
+  stroke: var(--ln-highlight);
+  stroke-width: 4px;
+  stroke-opacity: 0.75;
+  pointer-events: none;
+}
+/* A stale feature's ghost: where it was; it isn't manufactured. */
+.ln-ghost {
+  stroke: var(--ln-other);
+  stroke-dasharray: 3 3;
+  stroke-opacity: 0.8;
 }
 
 /* Legend swatches mirror the stroke styles above. */

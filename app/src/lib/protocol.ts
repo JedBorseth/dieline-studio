@@ -6,10 +6,77 @@ export type OverallStatus = "pass" | "warn" | "fail";
 /** One check's result. stale counts as fail, unavailable as warn; info and not_applicable never change the overall. */
 export type CheckStatus = OverallStatus | "info" | "not_applicable" | "unavailable" | "stale";
 
+/** What a check is about: actionable (geometry, feature, fold, partition, artwork, fit) or a notice. */
+export type CheckCategory =
+  | "geometry"
+  | "feature"
+  | "fold"
+  | "partition"
+  | "artwork"
+  | "fit"
+  | "machine"
+  | "calibration"
+  | "export";
+
 export interface CheckResult {
   id: string;
   status: CheckStatus;
   message: string;
+  category?: CheckCategory;
+  part_id?: string;
+  /** The feature it's about: the preview highlights it. */
+  feature_id?: string;
+  /** Where to zoom: [x0, y0, x1, y1] in the design's units on the flat blank. */
+  region?: [number, number, number, number];
+}
+
+/** A feature as stored on a part: parameters and a placement, never coordinates (engine features.py). */
+export interface FeatureSpec {
+  id?: string;
+  kind: "handhole" | "hand_flap" | "vent" | "window" | "score" | "perforation" | "tear_strip" | "notch";
+  label?: string;
+  [key: string]: unknown;
+}
+
+/** A feature as the engine resolved it on a part. stale: it no longer fits; it blocks export. */
+export interface FeatureInfo {
+  id: string;
+  kind: FeatureSpec["kind"];
+  label: string;
+  status: "ok" | "stale";
+  reason?: string;
+  faces: string[];
+  copies: number;
+  /** In plain words: faces, size, and whether each distance runs to the edge or the centre. */
+  summary: string;
+  selector: unknown;
+  region?: [number, number, number, number];
+  copy_regions?: [number, number, number, number][];
+}
+
+/** One drawn segment, tagged for highlighting (design units, flat blank, y up). */
+export interface SceneSegment {
+  type: "cut" | "crease" | "perforation" | "score" | "annotation";
+  op: string | null;
+  kind: string | null;
+  provenance: "structure" | "feature";
+  feature_id?: string;
+  face_id?: string;
+  /** A stale feature's ghost: drawn, never manufactured. */
+  stale?: boolean;
+  arc: boolean;
+  start: [number, number];
+  end: [number, number];
+  center?: [number, number];
+  clockwise?: boolean;
+  full_circle?: boolean;
+}
+
+/** Whether an export target can carry the design (an unverified rule blocks it, not the design). */
+export interface TargetReadiness {
+  ready: boolean;
+  blocking: string[];
+  target?: string;
 }
 
 export type OptionValue = string | number;
@@ -24,6 +91,8 @@ export interface BoxParams {
   units: "in" | "mm";
   board: string;
   options?: Record<string, OptionValue>;
+  /** Features on the part, each with a stable engine-made id. The form never sends these. */
+  features?: FeatureSpec[];
 }
 
 /** Facts about a generated design. All lengths in inches. */
@@ -75,6 +144,12 @@ export interface Design {
   parts?: DesignPart[];
   /** Checks of the design as a whole (fit links, groups). */
   design_checks?: CheckResult[];
+  /** Every segment tagged with its operation, provenance, feature and face. */
+  scene?: SceneSegment[];
+  /** The part's features as resolved. */
+  features?: FeatureInfo[];
+  /** Each export target's readiness; a block here isn't in overall. */
+  targets?: Partial<Record<ExportFormat, TargetReadiness>>;
 }
 
 /** One part of a design: a box with its own id, label and quantity. */
@@ -265,6 +340,8 @@ export interface ExportPlan {
   replaces: string[];
   /** The sample-table files would wait for the designer to confirm the pickup. */
   pickup: boolean;
+  /** Each format's own readiness, so a format blocked by an unverified rule can be unticked. */
+  formats?: Partial<Record<ExportFormat, { ready: boolean; blocking: string[] }>>;
 }
 
 export interface SettingsUpdate {
@@ -310,6 +387,8 @@ export interface Methods {
       confirm_pickup?: boolean;
       /** The id of the one abandoned lock the designer agreed to break (from the error's data). */
       break_lock?: string;
+      /** Perforations as dashed cuts in the sample-table DXF (unverified, so blocked for now). */
+      dxf_expand_perfs?: boolean;
     },
     ExportResult,
   ];
@@ -317,7 +396,7 @@ export interface Methods {
     (
       | { session_id: string; design_id: string; revision: number }
       | { params: BoxParams }
-    ) & { filename?: string; formats?: ExportFormat[] },
+    ) & { filename?: string; formats?: ExportFormat[]; dxf_expand_perfs?: boolean },
     ExportPlan,
   ];
   "export.pickup": [
