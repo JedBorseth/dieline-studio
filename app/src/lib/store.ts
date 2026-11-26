@@ -38,7 +38,22 @@ export type PreviewSource =
       /** Differences found when reopening a job (board values, geometry). */
       notes?: string[];
     }
-  | { kind: "file"; name: string; text: string };
+  | {
+      kind: "file";
+      name: string;
+      text: string;
+      /** A job opened as exported: every part's CF2 from its record, shown one at a time. */
+      parts?: { label: string; quantity: number; name: string; text: string }[];
+      /** The record it came from, to regenerate it with current rules. */
+      job?: {
+        record: unknown;
+        stem: string | null;
+        exportedAt?: string | null;
+        /** Whether the files on disk are still that set (complete, pending, incomplete, unverified). */
+        setStatus?: string;
+        setNotes?: string[];
+      };
+    };
 
 export interface State {
   sessions: Session[];
@@ -259,5 +274,7 @@ function applyEvent(state: State, e: EngineEvent): State {
       if (e.session_id && e.session_id !== state.activeId) return withDesign;
       return { ...withDesign, preview };
     }
+    case "export.pending":
+      return state; // the export bar asks the designer (PreviewPane listens for it)
   }
 }

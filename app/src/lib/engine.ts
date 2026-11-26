@@ -15,6 +15,8 @@ export class EngineError extends Error {
   constructor(
     message: string,
     readonly code?: number,
+    /** The engine's error data, when it sends any (e.g. the lock an export found held). */
+    readonly data?: unknown,
   ) {
     super(message);
     this.name = "EngineError";
@@ -34,8 +36,8 @@ function tauriTransport(): Transport {
       } catch (err) {
         // The shell rejects with { code, message } or a plain string.
         if (err && typeof err === "object" && "message" in err) {
-          const e = err as { message: string; code?: number };
-          throw new EngineError(e.message, e.code);
+          const e = err as { message: string; code?: number; data?: unknown };
+          throw new EngineError(e.message, e.code, e.data);
         }
         throw new EngineError(String(err));
       }
@@ -65,8 +67,11 @@ function devBridgeTransport(): Transport {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ method, params }),
       });
-      const body = (await res.json()) as { result?: unknown; error?: { code?: number; message: string } };
-      if (body.error) throw new EngineError(body.error.message, body.error.code);
+      const body = (await res.json()) as {
+        result?: unknown;
+        error?: { code?: number; message: string; data?: unknown };
+      };
+      if (body.error) throw new EngineError(body.error.message, body.error.code, body.error.data);
       return body.result;
     },
     subscribe(listener) {

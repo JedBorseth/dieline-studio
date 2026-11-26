@@ -4,6 +4,8 @@
 import threading
 from dataclasses import replace
 
+import json
+
 import pytest
 
 from dieline_engine import agent as agent_mod, designs
@@ -216,15 +218,21 @@ def test_agent_dry_run_changes_nothing(tmp_path):
     assert out["dry_run"] and ag.store.current("s1").parts[0].params.length == 14 and t.binding[1] == 1
 
 
-def test_agent_exports_its_bound_snapshot_and_refuses_several_parts(tmp_path):
+def test_agent_exports_its_bound_snapshot_with_every_part(tmp_path):
     ag, t, _ = _agent(tmp_path)
     ag.settings.update({"output_dir": str(tmp_path / "out")})
     ag._dispatch(t, "create_box", BOX, "c1")
     res = ag._dispatch(t, "export_files", {"filename": "job"}, "c2")
     assert res["paths"][0].endswith("job.cf2")
     ag._dispatch(t, "create_box", {**LID, "action": "add"}, "c3")
-    with pytest.raises(ValueError, match="several parts"):
-        ag._dispatch(t, "export_files", {"filename": "job2"}, "c4")
+    res = ag._dispatch(t, "export_files", {"filename": "job2"}, "c4")
+    out = tmp_path / "out"
+    assert sorted(p.name for p in out.iterdir()) == ["job.cf2", "job.dieline.json", "job2-p1.cf2", "job2-p2.cf2",
+                                                       "job2.dieline.json"]
+    record = json.loads((out / "job2.dieline.json").read_text())
+    assert record["version"] == 2 and [p["part_id"] for p in record["parts"]] == ["p1", "p2"]
+    assert record["design_id"] == t.binding[0] and record["revision"] == t.binding[1]
+    assert [f["part_id"] for f in res["files"]] == ["p1", "p2"]
 
 
 def test_turn_note_tells_the_model_about_outside_changes(tmp_path):

@@ -246,3 +246,26 @@ test("the designer's own replacement doesn't take over a raw file from its event
   state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("chat", 3), origin: "chat" } });
   assert.equal(state.preview?.kind, "design"); // the chat's new design is shown
 });
+
+test("a job opened as exported keeps its parts and record; a pending pickup changes nothing here", () => {
+  let state = initialState();
+  const s = state.activeId;
+  const source = {
+    kind: "file" as const,
+    name: "job-p1.cf2",
+    text: "a",
+    parts: [
+      { label: "body", quantity: 2, name: "job-p1.cf2", text: "a" },
+      { label: "lid", quantity: 2, name: "job-p2.cf2", text: "b" },
+    ],
+    job: { record: { version: 2 }, stem: "job" },
+  };
+  state = reducer(state, { type: "preview", sessionId: s, source });
+  const before = state;
+  state = reducer(state, {
+    type: "engine",
+    event: { type: "export.pending", job_path: "/x/job.dieline.json", status: "pending", txn: "t" },
+  });
+  assert.equal(state, before);
+  assert.ok(state.preview?.kind === "file" && state.preview.parts?.length === 2 && state.preview.job?.stem === "job");
+});

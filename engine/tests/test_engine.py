@@ -7,7 +7,7 @@ from threading import Barrier
 
 import pytest
 
-from dieline_engine import designs
+from dieline_engine import designs, publish
 from dieline_engine.boards import get_board
 from dieline_engine.cf2 import read_cf2, segments_equal, write_cf2
 from dieline_engine.checks import overall, run_checks
@@ -536,7 +536,7 @@ def test_dxf_matches_sample_table_format(tmp_path):
     assert out["job_path"].endswith("RL26-0999.dieline.json")
     assert job["format"] == "dieline-studio-job" and [f.replace("\\", "/").rsplit("/", 1)[-1] for f in job["files"]] == ["RL26-0999.cf2", "RL26-0999.dxf"]
     # The record rebuilds the same design.
-    again = designs.create_box(BoxParams.model_validate(job["params"]))
+    again = designs.create_box(BoxParams.model_validate(job["parts"][0]["params"]))
     assert again["cf2"] == designs.create_box(BoxParams(style="reg-glio-nx", length=14, width=8, depth=6))["cf2"]
 
 
@@ -617,8 +617,9 @@ def test_dxf_can_go_to_a_separate_sample_folder(tmp_path):
     p = BoxParams(style="reg-glio-nx", length=14, width=8, depth=6)
     out = designs.export(p, tmp_path / "cad", "RL26-0002", ["cf2", "dxf"], dxf_dir=tmp_path / "samples")
     assert (tmp_path / "samples" / "RL26-0002.dxf").exists() and (tmp_path / "cad" / "RL26-0002.cf2").exists()
-    with pytest.raises(designs.ExportExists):  # the sample-folder DXF is part of the set too
-        designs.export(p, tmp_path / "cad2", "RL26-0002", ["dxf"], dxf_dir=tmp_path / "samples")
+    # Another export folder's job of the same name owns the sample-table DXF: never touched, even to replace.
+    with pytest.raises(publish.OwnedByAnother, match=r"RL26-0002 in .*cad"):
+        designs.export(p, tmp_path / "cad2", "RL26-0002", ["dxf"], overwrite=True, dxf_dir=tmp_path / "samples")
 
 
 def test_same_second_replacements_keep_each_revision(tmp_path, monkeypatch):
@@ -627,38 +628,75 @@ def test_same_second_replacements_keep_each_revision(tmp_path, monkeypatch):
         def now(cls, tz=None):
             return cls(2026, 11, 25, tzinfo=tz)
 
-    monkeypatch.setattr(designs, "datetime", FixedClock)
+    monkeypatch.setattr(publish, "datetime", FixedClock)
     cad, samples = tmp_path / "cad", tmp_path / "samples"
     params = BoxParams.model_validate(BOX)
     for length in (14, 16, 18):
         designs.export(params.model_copy(update={"length": length}), cad, "job", ["cf2", "dxf"],
-                       overwrite=True, dxf_dir=samples)
-    jobs = {p.parent.name: json.loads(p.read_text())["params"]["length"]
+                       overwrite=True, dxf_dir=samples, confirm_pickup=True)
+    jobs = {p.parent.name: json.loads(p.read_text())["parts"][0]["params"]["length"]
             for p in (cad / "superseded").glob("*/job.dieline.json")}
     assert sorted(jobs.values()) == [14, 16]
-    assert {p.parent.name for p in (samples / "superseded").glob("*/job.dxf")} == jobs.keys()
+    assert {p.parent.name for p in (publish.pending_dir(samples) / "superseded").glob("*/job.dxf")} == jobs.keys()
 
 
-@pytest.mark.parametrize("failure", ["archive", "publish"])
+@pytest.mark.parametrize("failure", ["archive", "install", "commit"])
 def test_export_rolls_back_when_a_rename_fails(tmp_path, monkeypatch, failure):
+    from _moves import hook_moves
+
     cad, samples = tmp_path / "cad", tmp_path / "samples"
     params = BoxParams.model_validate(BOX)
     designs.export(params, cad, "job", ["cf2", "dxf"], dxf_dir=samples)
-    original = {p: p.read_bytes() for p in (*cad.iterdir(), *samples.iterdir())}
-    rename = designs.os.replace
+    original = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    failed = []
 
-    def fail_rename(source, target):
-        if failure == "archive" and source == samples / "job.dxf":
+    def fail_once(source, target):
+        if failed:  # once: the rollback's own moves go through
+            return
+        if failure == "archive" and source == cad / "job.cf2":
+            failed.append(source)
             raise PermissionError("injected archive failure")
-        if failure == "publish" and source.parent.name.startswith(".dieline-") and target.name.endswith(".json"):
-            raise PermissionError("injected publish failure")
-        rename(source, target)
+        if failure == "install" and target == cad / "job.cf2":
+            failed.append(source)
+            raise PermissionError("injected install failure")
+        if failure == "commit" and target == cad / "job.dieline.json":
+            failed.append(source)
+            raise PermissionError("injected commit failure")
 
-    monkeypatch.setattr(designs.os, "replace", fail_rename)
+    hook_moves(monkeypatch, before=fail_once)
     with pytest.raises(PermissionError, match="injected"):
         designs.export(params.model_copy(update={"length": 16}), cad, "job", ["cf2", "dxf"],
-                       overwrite=True, dxf_dir=samples)
+                       overwrite=True, dxf_dir=samples, confirm_pickup=True)
+    # Nothing changed, and nothing was left behind: no staging, journal, lock or empty archive.
     assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == original
+
+
+def test_a_failed_sample_table_move_waits_for_a_pickup(tmp_path, monkeypatch):
+    from dieline_engine import exports
+
+    cad, samples = tmp_path / "cad", tmp_path / "samples"
+    params = BoxParams.model_validate(BOX)
+    designs.export(params, cad, "job", ["cf2", "dxf"], dxf_dir=samples)
+    old_dxf = (samples / "job.dxf").read_bytes()
+    from _moves import hook_moves
+
+    def fail(source, target):
+        if source == samples / "job.dxf":
+            raise PermissionError("injected archive failure")
+
+    hook_moves(monkeypatch, before=fail)
+    longer = params.model_copy(update={"length": 16})
+    out = designs.export(longer, cad, "job", ["cf2", "dxf"], overwrite=True, dxf_dir=samples, confirm_pickup=True)
+    # The main folder committed; the sample table still has the whole old file.
+    assert json.loads((cad / "job.dieline.json").read_text())["parts"][0]["params"]["length"] == 16
+    assert out["sample_table"]["status"] == "pending" and "injected" in out["sample_table"]["error"]
+    assert (samples / "job.dxf").read_bytes() == old_dxf
+    monkeypatch.undo()
+    done = exports.pickup(Path(out["job_path"]), out["sample_table"]["txn"])
+    assert done["status"] == "published"
+    assert (samples / "job.dxf").read_bytes() == write_dxf(designs.build(longer)).encode("ascii")
+    assert json.loads((cad / "job.dieline.json").read_text())["sample_table"]["status"] == "published"
+    assert {p.name for p in samples.iterdir()} == {"job.dxf"}  # its archive is beside the table, not in it
 
 
 def test_export_refuses_a_redirected_superseded_folder(tmp_path):
@@ -670,7 +708,7 @@ def test_export_refuses_a_redirected_superseded_folder(tmp_path):
         (cad / "superseded").symlink_to(other, target_is_directory=True)
     except OSError:
         pytest.skip("directory symlinks unavailable")
-    with pytest.raises(ValueError, match="archive folder"):
+    with pytest.raises(ValueError, match="not a link"):
         designs.export(params, cad, "job", overwrite=True)
     assert (cad / "job.dieline.json").is_file() and not list(other.iterdir())
 
@@ -703,7 +741,7 @@ def test_ui_and_agent_exports_compete_for_one_name(tmp_path):
     assert ui_won != chat_won
     job = json.loads((cad / "job.dieline.json").read_text())
     expected = BoxParams.model_validate({**BOX, "length": 16 if ui_won else 14})
-    assert job["params"]["length"] == expected.length
+    assert job["parts"][0]["params"]["length"] == expected.length
     assert (samples / "job.dxf").read_bytes() == write_dxf(designs.build(expected)).encode("ascii")
     assert (cad / "job.cf2").exists() == chat_won
 
@@ -716,46 +754,72 @@ def test_stopped_agent_export_cannot_publish_after_staging(tmp_path, monkeypatch
     s, t = _start(ag)
     made = ag.store.mutate("s1", lambda cur: new_design(BoxParams.model_validate(BOX)))
     t.binding = (made["design_id"], made["revision"])
-    write = Path.write_bytes
+
+
+    write = publish.fsync_write
 
     def stop_after_stage(path, data):
-        count = write(path, data)
+        write(path, data)
         ag.cancel(s.id)
-        return count
 
-    monkeypatch.setattr(Path, "write_bytes", stop_after_stage)
+    monkeypatch.setattr(publish, "fsync_write", stop_after_stage)
     with pytest.raises(agent_mod.TurnCancelled):
         ag._dispatch(t, "export_files", {"filename": "job"})
     assert not list(cad.iterdir())
+
+
+def _v1(record):
+    """The version 1 record the same export used to write: one part, at the top level."""
+    part = record["parts"][0]
+    return {"format": "dieline-studio-job", "version": 1, "engine": record["engine"],
+            "exported_at": record["exported_at"], "name": record["name"], "stem": record["stem"],
+            "params": part["params"], "board": part["board"], "summary": part["summary"],
+            "geometry_sha256": part["geometry_sha256"], "checks": part["checks"], "files": record["files"]}
+
+
+def _with_part(record, **fields):
+    return {**record, "parts": [{**record["parts"][0], **fields}, *record["parts"][1:]]}
 
 
 def test_open_job_reports_changes(tmp_path, monkeypatch):
     p = BoxParams(style="reg-glio-nx", length=14, width=8, depth=6, board="32 C KR")
     out = designs.export(p, tmp_path, "RL26-0003", ["cf2"])
     record = json.loads(open(out["job_path"]).read())
-    assert record["stem"] == "RL26-0003" and record["params"]["options"]["top_flaps"] == "regular"
-    same = designs.open_job(record)
-    assert same["changes"] == [] and same["stem"] == "RL26-0003"
-    legacy = dict(record)
+    assert record["stem"] == "RL26-0003" and record["parts"][0]["params"]["options"]["top_flaps"] == "regular"
+    for rec in (record, _v1(record)):
+        same = designs.open_job(rec)
+        assert same["changes"] == [] and same["stem"] == "RL26-0003"
+    legacy = _v1(record)
     legacy.pop("geometry_sha256")
     assert designs.open_job(legacy)["changes"] == []
-    changed_segments = designs.open_job({**record, "geometry_sha256": "0" * 64})
+    assert designs.open_job(legacy)["set_notes"][0].startswith("A version 1 job record")
+    changed_segments = designs.open_job(_with_part(record, geometry_sha256="0" * 64))
     assert changed_segments["changes"] == ["The regenerated cut or rule data differs from the exported geometry."]
     # Board values corrected after the export: reopening says what moved.
     from dieline_engine import boards
 
     corrected = boards.Board("32 C KR", "C", 0.1875, 0.0625, 0.0625, 0.0625, "artioscad")
     monkeypatch.setitem(boards.BOARDS, "32 C KR", corrected)
-    changed = designs.open_job(record)
-    assert any("IL was 1/8 in, now 1/16 in" in c for c in changed["changes"])
-    assert any(c.startswith("body height") for c in changed["changes"])
-    for overrides in ({"version": 99}, {"version": True}, {"version": 0}, {"version": -1},
-                      {"board": [1]}, {"board": {"cal_in": float("inf")}},
-                      {"summary": "blank"}, {"stem": 7}, {"geometry_sha256": "bad"}):
+    for rec in (record, _v1(record)):
+        changed = designs.open_job(rec)
+        assert any("IL was 1/8 in, now 1/16 in" in c for c in changed["changes"])
+        assert any(c.startswith("body height") for c in changed["changes"])
+    bad_parts = ({"board": [1]}, {"board": {"cal_in": float("inf")}}, {"summary": "blank"},
+                 {"geometry_sha256": "bad"}, {"quantity": 0})
+    for overrides in bad_parts:
+        with pytest.raises(ValueError):
+            designs.open_job(_with_part(record, **overrides))
+        if "quantity" not in overrides:
+            with pytest.raises(ValueError):
+                designs.open_job({**_v1(record), **overrides})
+    for overrides in ({"version": 99}, {"version": True}, {"version": 0}, {"version": -1}, {"stem": 7},
+                      {"parts": []}, {"parts": [1]}):
         with pytest.raises(ValueError):
             designs.open_job({**record, **overrides})
     with pytest.raises(ValueError):
         designs.open_job({"format": "other"})
+    with pytest.raises(ValueError, match="version 1"):
+        designs.open_job(_v1(record), "exported")
 
 
 def test_set_design_syncs_chat_with_the_preview(tmp_path):
@@ -852,7 +916,15 @@ def test_replacing_a_set_finds_its_dxf_in_an_earlier_sample_folder(tmp_path):
     with pytest.raises(designs.ExportExists) as exc:
         designs.export(b, tmp_path / "cad", "RL26-0010", ["cf2", "dxf"], dxf_dir=tmp_path / "samples-b")
     assert "RL26-0010.dxf" in exc.value.names
-    designs.export(b, tmp_path / "cad", "RL26-0010", ["cf2", "dxf"], overwrite=True, dxf_dir=tmp_path / "samples-b")
+    out = designs.export(b, tmp_path / "cad", "RL26-0010", ["cf2", "dxf"], overwrite=True,
+                         dxf_dir=tmp_path / "samples-b")
+    # Removing a file from the old sample folder is a replacement: it waits for the designer.
+    assert out["sample_table"]["status"] == "pending"
+    assert (tmp_path / "samples-a" / "RL26-0010.dxf").exists()
+    assert not (tmp_path / "samples-b" / "RL26-0010.dxf").exists()
+    from dieline_engine import exports
+
+    exports.pickup(Path(out["job_path"]), out["sample_table"]["txn"])
     assert not (tmp_path / "samples-a" / "RL26-0010.dxf").exists()
     assert (tmp_path / "samples-b" / "RL26-0010.dxf").exists()
 
@@ -860,8 +932,8 @@ def test_replacing_a_set_finds_its_dxf_in_an_earlier_sample_folder(tmp_path):
 def test_open_job_change_notes_use_fractions(tmp_path):
     p = BoxParams(style="reg-glio-nx", length=14, width=8, depth=6)
     record = json.loads(open(designs.export(p, tmp_path, "RL26-0011")["job_path"]).read())
-    record["summary"]["panels_in"] = [8.0, 14.0, 8.0, 14.0]
-    record["summary"]["blank_in"] = {"width": 45.5, "height": 14.3125}
+    record["parts"][0]["summary"]["panels_in"] = [8.0, 14.0, 8.0, 14.0]
+    record["parts"][0]["summary"]["blank_in"] = {"width": 45.5, "height": 14.3125}
     notes = designs.open_job(record)["changes"]
     assert "panels was 8 / 14 / 8 / 14, now 8 / 14 1/8 / 8 1/8 / 14 1/8" in notes
     assert "blank was 45 1/2 x 14 5/16, now 45 5/8 x 14 5/16" in notes

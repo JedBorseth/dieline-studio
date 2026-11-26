@@ -13,11 +13,12 @@ import logging
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, TextIO
 
 from pydantic import ValidationError
 
-from . import __version__, designs, models
+from . import __version__, designs, exports, models
 from .agent import Agent
 from .designs import BoxParams
 from .designstore import DesignChanged, DesignStore, new_design
@@ -32,6 +33,8 @@ INVALID_PARAMS = -32602
 APP_ERROR = -32000
 EXPORT_EXISTS = -32001  # the UI offers "Replace" for this one
 DESIGN_CHANGED = -32002  # the UI refreshes the design it shows
+EXPORT_LOCKED = -32003  # another export holds a folder: try again
+EXPORT_LOCK_STALE = -32004  # the lock looks abandoned: the UI offers to break exactly data.lock_id
 
 
 class RpcError(Exception):
@@ -54,7 +57,10 @@ class Server:
             "design.replace": self._design_replace,
             "design.get": self._design_get,
             "box.export": self._export,
-            "job.open": lambda p: designs.open_job(p.get("record")),
+            "export.plan": self._export_plan,
+            "export.pickup": self._export_pickup,
+            "export.recover": self._export_recover,
+            "job.open": self._job_open,
             "settings.get": lambda p: self.settings.public(),
             "models.list": self._models,
             "settings.update": self._settings_update,
@@ -114,6 +120,10 @@ class Server:
         except designs.ExportExists as exc:
             reply = {"jsonrpc": "2.0", "id": req_id,
                      "error": {"code": EXPORT_EXISTS, "message": str(exc), "data": {"files": exc.names}}}
+        except exports.LockHeld as exc:
+            reply = {"jsonrpc": "2.0", "id": req_id,
+                     "error": {"code": EXPORT_LOCK_STALE if exc.stale else EXPORT_LOCKED, "message": str(exc),
+                               "data": {"stale": exc.stale, "folder": str(exc.folder), "lock_id": exc.lock_id}}}
         except (ValueError, RuntimeError) as exc:  # expected, user-facing failures
             reply = {"jsonrpc": "2.0", "id": req_id, "error": {"code": APP_ERROR, "message": str(exc)}}
         except Exception as exc:
@@ -136,8 +146,8 @@ class Server:
 
     def _design_replace(self, p: dict[str, Any]) -> dict[str, Any]:
         """The form's Generate and a reopened job: a new design for the session, made from one
-        standard part. The designer's own action, so it doesn't wait on a revision."""
-        params = BoxParams.model_validate(p.get("params") or {})
+        standard part, or from a job record's parts. The designer's own action, so it doesn't
+        wait on a revision."""
         expected: Any = "any"
         if "expected" in p:  # what the form showed when the designer pressed Generate (null: nothing)
             e = p["expected"]
@@ -145,29 +155,77 @@ class Server:
                                       and isinstance(e.get("revision"), int)):
                 raise RpcError(INVALID_PARAMS, "expected must be {design_id, revision} or null")
             expected = None if e is None else (e["design_id"], e["revision"])
+        if p.get("parts") is not None:
+            raw = p["parts"]
+            if not isinstance(raw, list) or not raw or not all(isinstance(x, dict) for x in raw):
+                raise RpcError(INVALID_PARAMS, "parts must be a non-empty list of parts")
+            parts = [{**x, "params": BoxParams.model_validate(x.get("params") or {})} for x in raw]
+            return self.agent.set_parts(_str(p, "session_id"), parts, p.get("groups") or [], p.get("links") or [],
+                                        expected)
+        params = BoxParams.model_validate(p.get("params") or {})
         return self.agent.set_design(_str(p, "session_id"), params, expected)
 
     def _design_get(self, p: dict[str, Any]) -> dict[str, Any] | None:
         cur = self.store.current(_str(p, "session_id"))
         return self.store.payload(cur) if cur else None
 
-    def _export(self, p: dict[str, Any]) -> dict[str, Any]:
+    def _export_target(self, p: dict[str, Any]) -> tuple[list[exports.ExportPart], dict[str, Any]]:
+        """The parts an export (or its plan) is for, and what the manifest records about the design."""
         if "design_id" in p:  # the export bar: exactly the snapshot it showed
             snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), p.get("revision"))
-            params = self.store.export_params(snap)  # the design's own checks block it too
-        else:
-            params = BoxParams.model_validate(p.get("params") or {})
+            checks = self.store.check_exportable(snap)  # the design's own checks block it too
+            payload = self.store.payload(snap)
+            return self.store.export_parts(snap), {
+                "design_id": snap.id, "revision": snap.revision, "design_checks": checks,
+                "structure": {"groups": payload["groups"], "links": payload["links"]}}
+        params = BoxParams.model_validate(p.get("params") or {})
+        return [exports.ExportPart("p1", params.style, params)], {}
+
+    def _export_args(self, p: dict[str, Any]) -> tuple[str | None, list[str]]:
         filename = p.get("filename")
         if filename is not None and not isinstance(filename, str):
             raise RpcError(INVALID_PARAMS, "filename must be a string")
-        overwrite = p.get("overwrite", False)
-        if not isinstance(overwrite, bool):
-            raise RpcError(INVALID_PARAMS, "overwrite must be true or false")
         formats = p.get("formats") or ["cf2"]
         if not isinstance(formats, list) or not all(isinstance(f, str) for f in formats):
             raise RpcError(INVALID_PARAMS, "formats must be a list of 'cf2' and/or 'dxf'")
+        return filename, formats
+
+    def _export(self, p: dict[str, Any]) -> dict[str, Any]:
+        parts, about = self._export_target(p)
+        filename, formats = self._export_args(p)
+        flags = {}
+        for k in ("overwrite", "confirm_pickup"):
+            flags[k] = p.get(k, False)
+            if not isinstance(flags[k], bool):
+                raise RpcError(INVALID_PARAMS, f"{k} must be true or false")
+        flags["break_lock"] = _lock_id(p)
         cfg = self.settings.settings
-        return designs.export(params, cfg.resolved_output_dir(), filename, formats, overwrite, cfg.resolved_dxf_dir())
+        return exports.export_design(parts, cfg.resolved_output_dir(), filename, formats, flags["overwrite"],
+                                     cfg.resolved_dxf_dir(), **about, break_lock=flags["break_lock"],
+                                     confirm_pickup=flags["confirm_pickup"])  # its reply offers the pickup
+
+    def _export_plan(self, p: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parts, _ = self._export_target(p)
+        except designs.DesignCheckFailed as exc:
+            return {"ready": False, "blocking": [str(exc)], "files": [], "job_path": None, "replaces": [],
+                    "pickup": False}
+        filename, formats = self._export_args(p)
+        cfg = self.settings.settings
+        return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir())
+
+    def _export_pickup(self, p: dict[str, Any]) -> dict[str, Any]:
+        return exports.pickup(Path(_str(p, "job_path")), _str(p, "txn"), break_lock=_lock_id(p))
+
+    def _export_recover(self, _: dict[str, Any]) -> dict[str, Any]:
+        cfg = self.settings.settings
+        return {"notes": exports.recover_all(cfg.resolved_output_dir(), cfg.resolved_dxf_dir())}
+
+    def _job_open(self, p: dict[str, Any]) -> dict[str, Any]:
+        mode = p.get("mode", "regenerate")
+        if not isinstance(mode, str):
+            raise RpcError(INVALID_PARAMS, "mode must be 'exported' or 'regenerate'")
+        return exports.open_job(p.get("record"), mode)
 
     def _models(self, p: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -187,6 +245,16 @@ class Server:
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))
         return {"accepted": True}
+
+
+def _lock_id(p: dict[str, Any]) -> str | None:
+    """The one abandoned lock the designer agreed to break (its id from the error), or None."""
+    v = p.get("break_lock")
+    if v is None:
+        return None
+    if not isinstance(v, str) or not v:
+        raise RpcError(INVALID_PARAMS, "break_lock must be the id of the lock to break")
+    return v
 
 
 def _str(p: dict[str, Any], key: str) -> str:

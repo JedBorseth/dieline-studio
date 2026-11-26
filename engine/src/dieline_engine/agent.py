@@ -24,9 +24,10 @@ import httpx
 import openai
 from pydantic import ValidationError
 
-from . import designs, files, models, render, web
+from . import designs, exports, files, models, render, web
 from .designs import BoxParams
-from .designstore import DesignChanged, DesignStore, add_part, new_design, remove_part, update_part
+from .designstore import (DesignChanged, DesignStore, add_part, design_from_parts, new_design, remove_part,
+                          update_part)
 from .settings import Settings, SettingsStore
 from .styles import STYLES
 
@@ -229,7 +230,10 @@ def _tools() -> list[dict[str, Any]]:
             "name": "export_files",
             "description": (
                 "Write the current design to the user's export folder: CF2 for ArtiosCAD and/or DXF for "
-                "the sample table. Refused if the design fails its checks. Returns the file paths."
+                "the sample table, one file per part (several parts are named <name>-<part>), plus the "
+                "job record. Refused if any part or the design fails its checks. Returns the file paths. "
+                "Sample-table files that would replace others, or several at once, wait until the user "
+                "confirms the pickup in the export bar."
             ),
             "input_schema": {
                 "type": "object",
@@ -582,6 +586,17 @@ class Agent:
         with self._lock:
             self.sessions.setdefault(session_id, Session(session_id))
         return self.store.mutate(session_id, lambda _cur: new_design(params), expected=expected, origin="form")
+
+    def _on_export_pending(self, info: dict[str, Any]) -> None:
+        self.emit({"type": "export.pending", **info})
+
+    def set_parts(self, session_id: str, parts: list[dict[str, Any]], groups: Any = (), links: Any = (),
+                  expected: Any = "any") -> dict[str, Any]:
+        """A reopened job of several parts replaces the session's design, keeping the parts' ids."""
+        with self._lock:
+            self.sessions.setdefault(session_id, Session(session_id))
+        state = design_from_parts(parts, groups, links)
+        return self.store.mutate(session_id, lambda _cur: state, expected=expected, origin="form")
 
     def _interrupted(self, s: Session) -> str | None:
         """After a dropped turn: say so only if it changed the design (the change is kept)."""
@@ -1052,7 +1067,9 @@ class Agent:
                     self._check_bound(s)
                 raise ValueError("no design yet; call create_box first")
             snap = self.store.snapshot(s.id, *s.binding)  # exactly the design this turn has seen
-            export_params = self.store.export_params(snap)
+            checks = self.store.check_exportable(snap)
+            parts = self.store.export_parts(snap)
+            payload = self.store.payload(snap)
             filename = args.get("filename")
             if filename is not None and not isinstance(filename, str):
                 raise ValueError("filename must be a string")
@@ -1063,8 +1080,15 @@ class Agent:
             if not isinstance(replace, bool):
                 raise ValueError("replace must be true or false")
             cfg = self.settings.settings
-            return designs.export(export_params, cfg.resolved_output_dir(), filename, formats, replace,
-                                  cfg.resolved_dxf_dir(), check_cancel=lambda: self._check_cancel(s))
+            out = exports.export_design(
+                parts, cfg.resolved_output_dir(), filename, formats, replace, cfg.resolved_dxf_dir(),
+                design_id=snap.id, revision=snap.revision, design_checks=checks,
+                structure={"groups": payload["groups"], "links": payload["links"]},
+                check_cancel=lambda: self._check_cancel(s), on_pending=self._on_export_pending)
+            if out["sample_table"]["status"] == "pending":
+                out["note"] = ("The sample-table files are waiting: tell the user to confirm the pickup in the "
+                               "export bar when the table won't pick up. You can't move them yourself.")
+            return out
         if name in ("web_search", "web_fetch") and s.private:
             raise ValueError("Web tools are off in a chat that has accessed reference files. Start a new chat.")
         if name == "web_search":

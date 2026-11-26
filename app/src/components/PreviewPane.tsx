@@ -19,7 +19,7 @@ import {
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, parseCf2 } from "../lib/cf2";
-import { EngineError, request } from "../lib/engine";
+import { EngineError, request, subscribe } from "../lib/engine";
 import { loadString, saveString } from "../lib/prefs";
 import {
   type BoxParams,
@@ -28,8 +28,13 @@ import {
   type Design,
   DESIGN_CHANGED,
   EXPORT_EXISTS,
+  EXPORT_LOCK_STALE,
   type EngineInfo,
   type ExportFormat,
+  type ExportPlan,
+  type ExportResult,
+  type JobPart,
+  type SampleTable,
   type OptionValue,
   type StyleInfo,
 } from "../lib/protocol";
@@ -68,6 +73,33 @@ interface Status {
 }
 
 const KINDS: LineKind[] = ["cut", "crease", "perforation", "score", "other"];
+
+/** A design to show, plus a reopened job's parts (replacing the design with all of them) and a
+ *  status to show with it. */
+type ShowSource = Extract<PreviewSource, { kind: "design" }> & {
+  job?: { parts: JobPart[]; groups: unknown[]; links: unknown[] };
+  status?: Status;
+};
+
+/** A sample-table set waiting beside the table's folder, for whichever job (the chat's too). */
+interface Pickup {
+  jobPath: string;
+  txn: string;
+  files: string[];
+  reason?: string;
+  error?: string;
+  /** A failed move couldn't be undone: the designer resolves that first, so no pickup is offered. */
+  blocked?: boolean;
+  /** An abandoned lock in the way: the designer may break exactly this one. */
+  lockId?: string;
+  done?: string;
+  busy?: boolean;
+}
+
+function lockId(err: unknown): string | undefined {
+  const data = err instanceof EngineError ? (err.data as { lock_id?: unknown } | undefined) : undefined;
+  return typeof data?.lock_id === "string" && data.lock_id ? data.lock_id : undefined;
+}
 
 interface ShowContext {
   sid: string;
@@ -109,8 +141,6 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
   const fileRef = useRef<HTMLInputElement>(null);
 
   const design = source?.kind === "design" ? source.design : null;
-  const designIdRef = useRef<string | null>(design?.id ?? null);
-  designIdRef.current = design?.id ?? null;
   // A design with several parts shows one at a time, chosen by the tabs.
   type PartView = Design & { part_id?: string; label?: string; quantity?: number };
   const parts: PartView[] = design?.parts?.length ? design.parts : design ? [design] : [];
@@ -118,10 +148,10 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
   const [partId, setPartId] = useState<string | null>(null);
   const shown: PartView | null = parts.find((p) => p.part_id === partId) ?? parts[0] ?? null;
   const several = parts.length > 1;
-  // A second part appearing while the export bar is open: that bar can't export it.
-  useEffect(() => {
-    if (several) setExportOpen(false);
-  }, [several]);
+  // A job opened as exported shows its parts' CF2s one at a time, by index.
+  const fileParts = source?.kind === "file" ? source.parts : undefined;
+  const [filePart, setFilePart] = useState(0);
+  const fileShown = fileParts?.[filePart] ?? fileParts?.[0];
 
   // A status message (and reopen-notes dismissal) belongs to the dieline it was about;
   // a message queued for the incoming dieline is shown with it.
@@ -132,19 +162,27 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     setStatus(pending && pending.sid === sessionIdRef.current ? pending.status : null);
     pendingStatusRef.current = null;
     setNotesDismissed(false);
+    setFilePart(0);
   }, [source]);
 
   const parsed = useMemo((): { doc: Cf2Doc | null; error: string | null } => {
     if (!source) return { doc: null, error: null };
     try {
-      return { doc: parseCf2(source.kind === "design" ? (shown ?? source.design).cf2 : source.text), error: null };
+      return {
+        doc: parseCf2(source.kind === "design" ? (shown ?? source.design).cf2 : (fileShown?.text ?? source.text)),
+        error: null,
+      };
     } catch (err) {
       return { doc: null, error: err instanceof Error ? err.message : String(err) };
     }
-  }, [source, shown]);
+  }, [source, shown, fileShown]);
   const doc = parsed.doc;
 
-  const title = source ? (source.kind === "design" ? (shown ?? source.design).name : source.name) : "Preview";
+  const title = source
+    ? source.kind === "design"
+      ? (shown ?? source.design).name
+      : (fileShown?.name ?? source.name)
+    : "Preview";
   const present = new Set(doc?.primitives.map((p) => p.type));
 
   /** Show a design made outside the chat, and make it the chat's current design too. */
@@ -172,7 +210,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
   const context = (): ShowContext => ({ sid: sessionId, base: sessionDesign ?? null, seq: bump(sessionId) });
 
   const showDesign = async (
-    next: Extract<PreviewSource, { kind: "design" }>,
+    next: ShowSource,
     ctx: ShowContext,
     confirmed = false,
   ): Promise<void> => {
@@ -199,7 +237,13 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     let committed: Design;
     try {
       // The engine holds the session's design; the form and a reopened job replace it there.
-      committed = await request("design.replace", { session_id: sid, params: next.design.params, expected });
+      committed = await request("design.replace", {
+        session_id: sid,
+        ...(next.job
+          ? { parts: next.job.parts, groups: next.job.groups, links: next.job.links }
+          : { params: next.design.params }),
+        expected,
+      });
     } catch (err) {
       if (!latest(sid, seq)) return;
       if (err instanceof EngineError && err.code === DESIGN_CHANGED) {
@@ -211,8 +255,9 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
       return;
     }
     if (!latest(sid, seq)) return; // a newer design was chosen meanwhile, in that session
-    if (here(sid)) pendingStatusRef.current = null;
-    onPreview({ ...next, design: committed }, sid);
+    if (here(sid)) pendingStatusRef.current = next.status ? { sid, status: next.status } : null;
+    const { job: _job, status: _status, ...shownSource } = next;
+    onPreview({ ...shownSource, design: committed }, sid);
   };
 
   const openFile = async (file: File) => {
@@ -226,18 +271,26 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         onPreview({ kind: "file", name: file.name, text }, ctx.sid);
         return;
       }
-      // A job record written next to an export: regenerate it and list what changed since.
-      const res = await request("job.open", { record: JSON.parse(text) as unknown });
-      if (!latest(ctx.sid, seq)) return;
-      await showDesign(
+      // A job record written next to an export. Version 2 opens as exported (its own snapshot);
+      // regenerating with today's rules is the designer's choice. Version 1 can only regenerate.
+      const record = JSON.parse(text) as unknown;
+      const v2 = typeof record === "object" && record !== null && (record as { version?: unknown }).version === 2;
+      if (!v2) {
+        await regenerate(record, ctx);
+        return;
+      }
+      const res = await request("job.open", { record, mode: "exported" });
+      if (!latest(ctx.sid, seq) || res.mode !== "exported") return;
+      const first = res.parts[0];
+      onPreview(
         {
-          kind: "design",
-          design: res.design,
-          origin: "job",
-          stem: res.stem,
-          notes: res.changes.length ? res.changes : undefined,
+          kind: "file",
+          name: first.name,
+          text: first.cf2,
+          parts: res.parts.map((p) => ({ label: p.label, quantity: p.quantity, name: p.name, text: p.cf2 })),
+          job: { record, stem: res.stem, exportedAt: res.exported_at, setStatus: res.set_status, setNotes: res.set_notes },
         },
-        ctx,
+        ctx.sid,
       );
     } catch (err) {
       if (!latest(ctx.sid, seq) || !here(ctx.sid)) return;
@@ -245,38 +298,143 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     }
   };
 
-  const exportFiles = async (filename: string, formats: ExportFormat[], overwrite = false): Promise<void> => {
+  /** Rebuild a job with today's board values and rules: it becomes the session's design, every part kept. */
+  const regenerate = async (record: unknown, ctx: ShowContext): Promise<void> => {
+    try {
+      const res = await request("job.open", { record, mode: "regenerate" });
+      if (!latest(ctx.sid, ctx.seq) || res.mode !== "regenerate") return;
+      const notes = [...res.changes, ...(res.set_status === "complete" ? [] : res.set_notes)];
+      await showDesign(
+        {
+          kind: "design",
+          design: res.design,
+          origin: "job",
+          stem: res.stem,
+          notes: notes.length ? notes : undefined,
+          job: { parts: res.parts, groups: res.groups, links: res.links },
+        },
+        ctx,
+      );
+    } catch (err) {
+      if (!latest(ctx.sid, ctx.seq) || !here(ctx.sid)) return;
+      setStatus({ tone: "error", text: `Couldn't regenerate: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  };
+
+  /** Which session's design an export (or its plan) is for: the snapshot on screen. */
+  const exportTarget = (target: Design, sid: string) =>
+    target.design_id !== undefined && target.revision !== undefined
+      ? { session_id: sid, design_id: target.design_id, revision: target.revision }
+      : { params: target.params };
+
+  /** Why the shown design can't be saved from its parameters alone: the engine restarted and no longer
+   *  holds it, and it has more than one part (or quantity) or design checks those parameters would skip. */
+  const cantSaveFromParams = (target: Design): string | null => {
+    if (target.design_id !== undefined) return null;
+    const parts = target.parts ?? [];
+    if (!target.design_checks?.length && parts.length <= 1 && (parts[0]?.quantity ?? 1) <= 1) return null;
+    return "The engine restarted and no longer holds this design, so saving it from the first part's parameters would lose the rest. Generate it again (or reopen its job) before saving.";
+  };
+
+  const planExport = async (filename: string, formats: ExportFormat[]): Promise<ExportPlan | null> => {
+    if (!design) return null;
+    const refused = cantSaveFromParams(design);
+    if (refused) return { ready: false, blocking: [refused], files: [], job_path: null, replaces: [], pickup: false };
+    return request("export.plan", { ...exportTarget(design, sessionId), filename: filename.trim() || undefined, formats });
+  };
+
+  // Sample-table sets waiting for the designer, by job: they outlive the preview they came from.
+  const [pickups, setPickups] = useState<Pickup[]>([]);
+  const pickupsRef = useRef(pickups);
+  pickupsRef.current = pickups;
+  const addPickup = (jobPath: string, table: SampleTable) => {
+    if (!table.txn) return;
+    const next: Pickup = {
+      jobPath,
+      txn: table.txn,
+      files: table.files ?? [],
+      reason: table.reason,
+      error: table.error,
+      blocked: table.status === "blocked",
+    };
+    // A newer export of the same job replaces its waiting set.
+    setPickups((list) => [...list.filter((p) => p.jobPath !== jobPath), next]);
+  };
+  const updatePickup = (p: Pickup, patch: Partial<Pickup>) =>
+    setPickups((list) => list.map((q) => (q.jobPath === p.jobPath && q.txn === p.txn ? { ...q, ...patch } : q)));
+
+  const pickup = async (p: Pickup, breakLock?: string): Promise<void> => {
+    if (pickupsRef.current.find((q) => q.jobPath === p.jobPath && q.txn === p.txn)?.busy) return;
+    updatePickup(p, { busy: true, error: undefined, lockId: undefined });
+    try {
+      const res = await request("export.pickup", { job_path: p.jobPath, txn: p.txn, break_lock: breakLock });
+      updatePickup(p, { busy: false, done: `Moved into the sample table: ${res.files.map(baseName).join(", ") || "old files removed"}` });
+    } catch (err) {
+      updatePickup(p, {
+        busy: false,
+        error: `Not moved: ${err instanceof Error ? err.message : String(err)}`,
+        lockId: err instanceof EngineError && err.code === EXPORT_LOCK_STALE ? lockId(err) : undefined,
+      });
+    }
+  };
+
+  // A chat export can leave sample-table files waiting too: the designer confirms here, whoever exported.
+  // At start (and after an engine restart), finish or undo exports a crash interrupted.
+  useEffect(() => {
+    const recover = () =>
+      void request("export.recover", {})
+        .then((res) => {
+          if (res.notes.length) setStatus({ tone: "info", text: res.notes.join(" ") });
+        })
+        .catch(() => {});
+    recover();
+    return subscribe((event) => {
+      if (event.type === "export.pending") addPickup(event.job_path, event);
+      if (event.type === "engine.ready") recover();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // A Replace or Break-the-lock offer was about the folders Settings named then: not after they change.
+  const folders = `${info?.settings.output_dir_resolved ?? ""}|${info?.settings.dxf_dir ?? ""}`;
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
+  useEffect(() => {
+    setStatus((s) => (s?.action ? null : s));
+  }, [folders]);
+
+  const exportFiles = async (
+    filename: string,
+    formats: ExportFormat[],
+    overwrite = false,
+    breakLock?: string,
+  ): Promise<void> => {
     const target = design;
     if (!target || exportingRef.current) return;
-    if (target.design_id === undefined && target.design_checks?.length) {
-      // The engine restarted and no longer holds this design, so its own checks (fit links, groups)
-      // can't be run again: saving from the parameters alone would skip them.
-      setStatus({
-        tone: "error",
-        text: "The engine restarted and this design's own checks can't be run again. Generate it again before saving.",
-      });
+    const refused = cantSaveFromParams(target);
+    if (refused) {
+      setStatus({ tone: "error", text: refused });
       return;
     }
     const sid = sessionId; // the session this export is for
-    const seq = bump(sid); // its place in that session's request order
+    // Its place in that session's request order, read, not taken: saving doesn't change what's shown,
+    // so a design reply already on its way still lands.
+    const seq = seqsRef.current.get(sid) ?? bump(sid);
+    const asked = foldersRef.current; // a confirmation offered from this reply is about these folders
     exportingRef.current = true;
     setExporting(true);
+    let res: ExportResult;
     try {
-      const which =
-        target.design_id !== undefined && target.revision !== undefined
-          ? { session_id: sid, design_id: target.design_id, revision: target.revision }
-          : { params: target.params };
-      const res = await request("box.export", {
-        ...which,
+      res = await request("box.export", {
+        ...exportTarget(target, sid),
         filename: filename.trim() || undefined,
         formats,
         overwrite,
+        break_lock: breakLock,
       });
-      if (!here(sid)) return;
-      const moved = res.superseded.length ? ` (earlier files moved to superseded)` : "";
-      setStatus({ tone: "info", text: `Saved ${[...res.paths, res.job_path].join(", ")}${moved}` });
-      setExportOpen(false);
     } catch (err) {
+      exportingRef.current = false;
+      setExporting(false);
       if (err instanceof EngineError && err.code === DESIGN_CHANGED) {
         // Even if the new design's event got here first: say so, and show it.
         if (here(sid)) setExportOpen(false);
@@ -284,19 +442,49 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         return;
       }
       if (!here(sid)) return;
+      if (foldersRef.current !== asked) {
+        setStatus({ tone: "error", text: "The export folders changed in Settings while saving. Nothing was saved; save again." });
+        return;
+      }
       if (err instanceof EngineError && err.code === EXPORT_EXISTS) {
         setStatus({
           tone: "error",
           text: err.message,
-          action: { label: "Replace", run: () => void exportFiles(filename, formats, true) },
+          action: { label: "Replace", run: () => void exportFiles(filename, formats, true, breakLock) },
+        });
+        return;
+      }
+      const id = err instanceof EngineError && err.code === EXPORT_LOCK_STALE ? lockId(err) : undefined;
+      if (id) {
+        setStatus({
+          tone: "error",
+          text: err instanceof Error ? err.message : String(err),
+          action: { label: "Break the lock", run: () => void exportFiles(filename, formats, overwrite, id) },
         });
         return;
       }
       setStatus({ tone: "error", text: err instanceof EngineError ? err.message : String(err) });
-    } finally {
-      exportingRef.current = false;
-      setExporting(false);
+      return;
     }
+    exportingRef.current = false;
+    setExporting(false);
+    if (res.sample_table.status === "pending" || res.sample_table.status === "blocked")
+      addPickup(res.job_path, res.sample_table);
+    // Anything still offered for this job is about a set this export replaced.
+    else setPickups((list) => list.filter((p) => p.jobPath !== res.job_path));
+    if (!here(sid)) return;
+    setExportOpen(false);
+    const main = res.files.filter((f) => f.destination === "main").map((f) => f.path);
+    const recovered = res.recovered.length ? `${res.recovered.join(" ")} ` : "";
+    const moved = res.superseded.length ? " (earlier files moved to superseded)" : "";
+    const table =
+      res.sample_table.status === "published"
+        ? ` Sample table: ${(res.sample_table.files ?? []).join(", ")}.`
+        : res.sample_table.status === "none"
+          ? ""
+          : " The sample-table files are waiting (see below).";
+    const warning = res.sample_table.warning ? ` Note: ${res.sample_table.warning}.` : "";
+    setStatus({ tone: "info", text: `${recovered}Saved ${[...main, res.job_path].join(", ")}${moved}.${table}${warning}` });
   };
 
   return (
@@ -308,7 +496,9 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         {source && (
           <Badge variant="outline" className="ml-1.5 font-normal text-muted-foreground">
             {source.kind === "file"
-              ? "file"
+              ? source.job
+                ? "as exported"
+                : "file"
               : source.origin === "agent"
                 ? "from chat"
                 : source.origin === "job"
@@ -341,7 +531,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
           }
           aria-expanded={exportOpen}
           data-pressed={exportOpen && design ? "" : undefined}
-          disabled={!design || several}
+          disabled={!design}
         />
         <input
           ref={fileRef}
@@ -385,9 +575,50 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
               </button>
             );
           })}
-          <span className="ml-auto self-center px-1 text-[11px] text-muted-foreground">
-            Export of several parts comes next
+        </div>
+      )}
+
+      {fileParts && fileParts.length > 1 && (
+        <div role="tablist" aria-label="Parts" className="flex shrink-0 gap-1 overflow-x-auto border-b px-2 py-1.5">
+          {fileParts.map((p, i) => (
+            <button
+              key={`${i}-${p.name}`}
+              type="button"
+              role="tab"
+              aria-selected={p === fileShown}
+              title={p.name}
+              onClick={() => setFilePart(i)}
+              className={cn(
+                "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                p === fileShown ? "bg-accent font-medium" : "text-muted-foreground hover:bg-accent/50",
+              )}
+            >
+              {p.label}
+              {p.quantity > 1 && <span className="text-muted-foreground">× {p.quantity}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {source?.kind === "file" && source.job && (
+        <div
+          className={cn(
+            "flex shrink-0 items-start gap-2 border-b px-3 py-1.5 text-xs",
+            source.job.setStatus === "complete" ? "text-muted-foreground" : "text-warning-foreground",
+          )}
+        >
+          <span className="min-w-0 flex-1">
+            As exported{source.job.exportedAt ? ` on ${source.job.exportedAt.slice(0, 10)}` : ""}: exactly the files'
+            geometry, not editable. {(source.job.setNotes ?? []).join(" ")}
           </span>
+          <Button
+            size="xs"
+            variant="outline"
+            className="shrink-0"
+            onClick={() => void regenerate((source.job as { record: unknown }).record, context())}
+          >
+            Regenerate with current rules
+          </Button>
         </div>
       )}
 
@@ -396,6 +627,8 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
           key={`export-${design.id}`}
           defaultName={(source?.kind === "design" && source.stem) || design.name}
           busy={exporting}
+          planKey={`${sessionId}|${design.design_id ?? ""}|${design.revision ?? ""}|${design.id}|${folders}`}
+          plan={planExport}
           onExport={(name, formats) => exportFiles(name, formats)}
         />
       )}
@@ -515,6 +748,44 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
           </>
         )}
       </footer>
+      {pickups.map((p) => (
+        <div
+          key={`${p.jobPath}|${p.txn}`}
+          role={p.error ? "alert" : "status"}
+          className={cn(
+            "flex shrink-0 items-start gap-2 border-t px-3 py-1.5 text-xs wrap-anywhere",
+            p.error ? "text-destructive-foreground" : "text-muted-foreground",
+          )}
+        >
+          <span className="min-w-0 flex-1 select-text">
+            {p.done ??
+              `${baseName(p.jobPath)}: the sample-table files (${p.files.map(baseName).join(", ") || "removals"}) are waiting. ${
+                p.error ?? `${p.reason ? `This export ${p.reason}. ` : ""}Confirm the table isn't picking up, then move them in.`
+              }`}
+          </span>
+          {!p.done && !p.blocked && (
+            <Button
+              size="xs"
+              variant="outline"
+              className="shrink-0"
+              disabled={p.busy}
+              onClick={() => void pickup(p, p.lockId)}
+            >
+              {p.busy && <Spinner />}
+              {p.lockId ? "Break the lock and move them in" : "Table is idle: move them in"}
+            </Button>
+          )}
+          <button
+            type="button"
+            className="shrink-0 rounded px-1 hover:bg-accent"
+            aria-label="Dismiss"
+            title={p.done ? "Dismiss" : "Hide (the files keep waiting; export the job again to offer the pickup again)"}
+            onClick={() => setPickups((list) => list.filter((q) => q !== p))}
+          >
+            ×
+          </button>
+        </div>
+      ))}
       {status && (
         // Its own wrapping row, so long paths and errors are never squeezed out by the readouts.
         <div
@@ -546,6 +817,10 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
 }
 
 /** Icon + label; collapses to icon-only (label in a tooltip) when the pane is narrow. `wide` collapses sooner. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
+}
+
 function ToolbarButton({
   label,
   icon,
@@ -571,10 +846,16 @@ function ToolbarButton({
 function ExportBar({
   defaultName,
   busy,
+  planKey,
+  plan,
   onExport,
 }: {
   defaultName: string;
   busy: boolean;
+  /** Everything else the plan depends on: the session, the design snapshot and the folders. */
+  planKey: string;
+  /** What saving would write, and whether it can (null: no plan for this design). */
+  plan: (filename: string, formats: ExportFormat[]) => Promise<ExportPlan | null>;
   onExport: (filename: string, formats: ExportFormat[]) => Promise<void>;
 }) {
   const uid = useId();
@@ -592,33 +873,96 @@ function ExportBar({
     const list = (Object.keys(next) as ExportFormat[]).filter((k) => next[k]);
     if (list.length) saveString("export-formats", list.join(","));
   };
+  // The files this would write, refreshed as the name and formats change (the latest answer wins).
+  const [preview, setPreview] = useState<{ plan: ExportPlan | null; error: string | null } | null>(null);
+  const key = `${planKey}|${name}|${chosen.join(",")}`;
+  useEffect(() => {
+    setPreview(null); // never show a plan for an earlier name, format or design
+    if (!chosen.length) return;
+    let live = true;
+    const t = setTimeout(() => {
+      plan(name, chosen)
+        .then((p) => live && setPreview({ plan: p, error: null }))
+        .catch((err: unknown) => live && setPreview({ plan: null, error: err instanceof Error ? err.message : String(err) }));
+    }, 200);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, busy]);
+  const p = preview?.plan;
+  const blocked = Boolean(p && !p.ready);
   return (
     <form
-      className="flex shrink-0 flex-wrap items-end gap-x-3 gap-y-2 border-b bg-background/50 p-3"
+      className="flex shrink-0 flex-col gap-2 border-b bg-background/50 p-3"
       onSubmit={(e) => {
         e.preventDefault();
-        if (busy || !chosen.length) return;
+        if (busy || !chosen.length || blocked) return;
         void onExport(name, chosen);
       }}
     >
-      <div className="flex min-w-40 flex-1 flex-col gap-1.5">
-        <Label htmlFor={`${uid}-name`} className="font-normal text-muted-foreground text-xs sm:text-xs">
-          File name (e.g. RL26-0771)
+      <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
+        <div className="flex min-w-40 flex-1 flex-col gap-1.5">
+          <Label htmlFor={`${uid}-name`} className="font-normal text-muted-foreground text-xs sm:text-xs">
+            File name (e.g. RL26-0771)
+          </Label>
+          <Input size="sm" id={`${uid}-name`} value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
+        </div>
+        <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
+          <Checkbox checked={formats.cf2} onCheckedChange={toggle("cf2")} />
+          CF2 (ArtiosCAD)
         </Label>
-        <Input size="sm" id={`${uid}-name`} value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
+        <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
+          <Checkbox checked={formats.dxf} onCheckedChange={toggle("dxf")} />
+          DXF (sample table)
+        </Label>
+        <Button type="submit" size="sm" disabled={busy || !chosen.length || blocked}>
+          {busy && <Spinner />}
+          {p?.replaces.length ? "Save and replace…" : "Save"}
+        </Button>
       </div>
-      <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
-        <Checkbox checked={formats.cf2} onCheckedChange={toggle("cf2")} />
-        CF2 (ArtiosCAD)
-      </Label>
-      <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
-        <Checkbox checked={formats.dxf} onCheckedChange={toggle("dxf")} />
-        DXF (sample table)
-      </Label>
-      <Button type="submit" size="sm" disabled={busy || !chosen.length}>
-        {busy && <Spinner />}
-        Save
-      </Button>
+      {preview?.error && <p className="text-destructive-foreground text-xs">{preview.error}</p>}
+      {p && (
+        <div className="flex flex-col gap-1 text-xs" aria-live="polite">
+          {p.blocking.map((b, i) => (
+            <p key={i} className="flex items-start gap-1.5 text-destructive-foreground">
+              <CircleXIcon className="mt-0.5 size-3.5 shrink-0" />
+              {b}
+            </p>
+          ))}
+          {p.files.length > 0 && (
+            <ul className="flex flex-col gap-0.5 text-muted-foreground">
+              {p.files.map((f) => (
+                <li key={f.path} className="flex min-w-0 items-center gap-1.5" title={f.path}>
+                  <span className="min-w-0 truncate text-foreground">{baseName(f.path)}</span>
+                  <span className="shrink-0">
+                    {f.label}
+                    {f.quantity > 1 ? ` × ${f.quantity}` : ""}
+                    {f.destination === "sample_table" ? " · sample table" : ""}
+                  </span>
+                </li>
+              ))}
+              {p.job_path && (
+                <li className="flex min-w-0 items-center gap-1.5" title={p.job_path}>
+                  <span className="min-w-0 truncate text-foreground">{baseName(p.job_path)}</span>
+                  <span className="shrink-0">job record</span>
+                </li>
+              )}
+            </ul>
+          )}
+          {p.replaces.length > 0 && (
+            <p className="text-warning-foreground">
+              Replaces {p.replaces.join(", ")} (moved to superseded; you'll be asked first).
+            </p>
+          )}
+          {p.pickup && (
+            <p className="text-muted-foreground">
+              The sample-table files will wait beside its folder until you confirm the table isn't picking up.
+            </p>
+          )}
+        </div>
+      )}
     </form>
   );
 }

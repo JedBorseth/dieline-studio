@@ -171,25 +171,100 @@ export type ExportFormat = "cf2" | "dxf";
 export const EXPORT_EXISTS = -32001;
 /** The design changed since the UI showed it; the UI fetches the current one. */
 export const DESIGN_CHANGED = -32002;
+/** Another export holds a destination folder; try again in a moment. */
+export const EXPORT_LOCKED = -32003;
+/** A destination's lock looks abandoned: the designer may break it. */
+export const EXPORT_LOCK_STALE = -32004;
 
-export interface JobOpenResult {
-  design: Design;
-  /** What differs from the export: board values corrected since, regenerated sizes. */
+/** A part as a job record keeps it: enough to rebuild it with its id. */
+export interface JobPart {
+  part_id: string;
+  label: string;
+  quantity: number;
+  piece_no: string | null;
+  params: BoxParams;
+  /** What regenerating with today's rules changed for this part. */
   changes: string[];
+}
+
+/** Whether the files a record lists are still the set it exported. */
+export type SetStatus = "complete" | "pending" | "incomplete" | "unverified";
+
+interface JobOpenCommon {
   stem: string | null;
   exported_at?: string | null;
   engine?: string | null;
+  version: 1 | 2;
+  set_status: SetStatus;
+  set_notes: string[];
+}
+
+export type JobOpenResult =
+  | (JobOpenCommon & {
+      mode: "regenerate";
+      /** The first part, rebuilt with today's rules (the others are in parts). */
+      design: Design;
+      /** What differs from the export: board values corrected since, regenerated sizes. */
+      changes: string[];
+      parts: JobPart[];
+      /** The design's groups and fit links, as exported, so a reopened design keeps its fit checks. */
+      groups: unknown[];
+      links: unknown[];
+    })
+  | (JobOpenCommon & {
+      mode: "exported";
+      /** Exactly what was exported, from the record's own snapshot. */
+      parts: { part_id: string; label: string; quantity: number; name: string; cf2: string }[];
+    });
+
+export interface ExportFile {
+  part_id: string;
+  label: string;
+  quantity: number;
+  format: ExportFormat;
+  path: string;
+  destination: "main" | "sample_table";
+}
+
+export interface SampleTable {
+  /** published: in the folder; pending: waiting beside it for the designer to confirm the pickup;
+   *  blocked: a failed move couldn't be undone (its journal is kept for the designer). */
+  status: "none" | "published" | "pending" | "blocked";
+  folder?: string;
+  txn?: string;
+  files?: string[];
+  replaces?: string[];
+  reason?: string;
+  error?: string;
+  warning?: string;
 }
 
 export interface ExportResult {
   path: string;
   paths: string[];
-  /** The .dieline.json job record written next to the files; open it to regenerate the design. */
+  /** The .dieline.json job record written next to the files; open it to reopen the design. */
   job_path: string;
   /** Files of an earlier export under this name, moved to the superseded folder. */
   superseded: string[];
   overall: OverallStatus;
   name: string;
+  files: ExportFile[];
+  sample_table: SampleTable;
+  /** Interrupted exports of this name that were finished or undone first. */
+  recovered: string[];
+}
+
+/** What an export would write, before the designer saves. */
+export interface ExportPlan {
+  ready: boolean;
+  blocking: string[];
+  files: ExportFile[];
+  job_path: string | null;
+  stem?: string;
+  /** Existing files of this name that saving would move to superseded. */
+  replaces: string[];
+  /** The sample-table files would wait for the designer to confirm the pickup. */
+  pickup: boolean;
 }
 
 export interface SettingsUpdate {
@@ -213,7 +288,11 @@ export interface Methods {
   "design.replace": [
     {
       session_id: string;
-      params: BoxParams;
+      /** The parts of a reopened job, in place of params. */
+      parts?: Pick<JobPart, "part_id" | "label" | "quantity" | "piece_no" | "params">[];
+      groups?: unknown[];
+      links?: unknown[];
+      params?: BoxParams;
       /** The design the designer was looking at when they asked (null: none). Refused if it changed. */
       expected?: { design_id: string; revision: number } | null;
     },
@@ -224,10 +303,30 @@ export interface Methods {
     (
       | { session_id: string; design_id: string; revision: number }
       | { params: BoxParams }
-    ) & { filename?: string; formats?: ExportFormat[]; overwrite?: boolean },
+    ) & {
+      filename?: string;
+      formats?: ExportFormat[];
+      overwrite?: boolean;
+      confirm_pickup?: boolean;
+      /** The id of the one abandoned lock the designer agreed to break (from the error's data). */
+      break_lock?: string;
+    },
     ExportResult,
   ];
-  "job.open": [{ record: unknown }, JobOpenResult];
+  "export.plan": [
+    (
+      | { session_id: string; design_id: string; revision: number }
+      | { params: BoxParams }
+    ) & { filename?: string; formats?: ExportFormat[] },
+    ExportPlan,
+  ];
+  "export.pickup": [
+    { job_path: string; txn: string; break_lock?: string },
+    { status: "published"; files: string[]; superseded: string[] },
+  ];
+  /** At start: finish or undo exports a crash interrupted. */
+  "export.recover": [Record<string, never>, { notes: string[] }];
+  "job.open": [{ record: unknown; mode?: "exported" | "regenerate" }, JobOpenResult];
   "chat.set_design": [{ session_id: string; params: BoxParams }, { ok: true }];
   "settings.get": [Record<string, never>, Settings];
   "models.list": [{ refresh?: boolean }, { models: OpenRouterModel[] }];
@@ -261,4 +360,6 @@ export type EngineEvent =
   | { type: "chat.turn_end"; session_id: string; stop_reason: string }
   | { type: "chat.error"; session_id: string; message: string }
   /** origin: "chat" for the agent's changes; "form" for the designer's own, whose replies the UI shows. */
-  | { type: "design"; session_id: string | null; design: Design; origin?: "chat" | "form" };
+  | { type: "design"; session_id: string | null; design: Design; origin?: "chat" | "form" }
+  /** Sample-table files waiting for the designer to confirm the pickup (whoever exported them). */
+  | ({ type: "export.pending"; job_path: string } & SampleTable);

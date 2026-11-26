@@ -945,15 +945,16 @@ Chat only for now.
 
 - Every output path, new or old (including old paths that the new set won't reuse), is normalised: case-folded, with Windows reserved names and length rules applied.
 - The export **reserves every one of those paths** before checking ownership.
-  - Reservations live in a lock registry in each destination root, updated under a root-level lock file.
-  - A lock file records its owner, workstation and time.
-  - Reservations are by path, not by stem, so a multi-part `A-b.cf2` and another job's one-part `A-b` can't race.
+  - The reservation is the root-level lock file of each destination root, held for the whole check and publish (roots locked in path order). That reserves every path in the root at once, so a multi-part `A-b.cf2` and another job's one-part `A-b` can't race. A per-path registry would let exports to one folder overlap; they take a second or so, so it isn't worth its stale-entry handling.
+  - A lock file records its owner, workstation, process and time.
+  - Every root's lock lives in the hidden `.<folder>.dieline-pending/` beside it, whatever role the root plays, so one physical folder has one lock. Roots are locked once each, in one order (by resolved, case-folded path).
+  - A stale lock is broken only by naming it: the designer's confirmation carries that lock's id. Breakers take turns through a guard file; a lock still being written is judged by its file's age.
 - With the reservations held:
   - **Owned by another job:** a path whose manifest belongs to another job blocks the export, naming that job.
   - **Unowned:** an existing file that no manifest owns blocks unless the designer confirms replacing it.
   - **Changed:** an old file whose hash differs from the previous manifest blocks the replacement if the new set needs its path, or if it would otherwise stay behind as a stale file in the set. The export names the file.
   - **Version 1 files:** v1 records only have a geometry digest for the CF2, so a v1 file without a hash is treated as changed unless the designer confirms it.
-- **Stale locks:** a reservation or lock older than 10 minutes, whose owner isn't running on this workstation, can be broken only by the designer, after a prompt.
+- **Stale locks:** a lock whose process isn't running on this workstation, or one from another workstation older than 10 minutes, can be broken only by the designer, after a prompt.
 
 **Publishing the main destination** (CF2, DXF and the manifest):
 
@@ -980,11 +981,20 @@ Chat only for now.
   - New files installed at their destinations are removed. That includes paths that had no old file.
   - Archived old files are moved back.
 
-Replay is idempotent, so a crash during recovery is recovered the same way. The designer is told what happened.
+Replay is idempotent, so a crash during recovery is recovered the same way: the journal is deleted before the staging folder, so a replay never sees a half-removed staging. The designer is told what happened.
+
+**Finished first:** recovery first asks whether the transaction committed (the live manifest carries its id, or for a sample table, says that set is published); then only the journal and staging folder go. Otherwise a sample-table transaction whose every file has moved (judged by the files) is rolled forward, and anything else is undone.
+
+**Nothing in a journal or manifest is trusted.** Every move must be one this transaction could make: from its own staging folder to this job's file names in this folder, or from this job's files in a locked root to its archive folder, each with a hash. A file that is neither where the move started nor where it ended (with that hash) is reported, not guessed at. No folder on the way to a file recovery touches may be a link or junction, and a main journal's waiting sample set is removed only when that table is locked. Either way the journal is kept and that name is blocked until the designer has checked the folder. Staging folders no journal names are swept only while every journal there can be read.
 
 **The sample-table folder** is a second destination whose reader ignores manifests. It's published only after the main destination commits, as its own transaction with the same journal rules:
 
-- Files wait in a hidden pending folder **beside** the sample-table folder, never inside it.
+- Files wait in a hidden pending folder **beside** the sample-table folder, never inside it (so a drive root can't be the sample-table folder). They're staged there before the main destination commits, so a committed pending set always has its files. Replaced sample-table files are archived there too, not in a `superseded/` inside the table's folder.
+- **Ownership at a shared table:** the pending folder keeps an index of which job's manifest claims each file, so a job from another export folder can't take it. Claims are written before the main destination commits, so there's no moment when a committed set's names belong to nobody; a claim counts only while the claiming manifest lists the file. An index that can't be read (or has an entry this app doesn't write) blocks exports to that table. The index is consulted whatever role another export gives that folder (its own export folder included), and a claim whose job record can't be read right now still stands.
+- **A waiting set names its owner:** each staged sample-table set holds a small `.owner.json` (its job record and main transaction). Cleanup after an undone export, dropping a superseded waiting set, and a pickup all check it, so no job's waiting files can be removed or moved in for another.
+- **A record can't make a folder a sample table:** a sample-table folder (and the files a record says are there) is used only if that table's index records the job. A version 1 record's DXF counts only in today's sample-table folder.
+- **What's at the table:** while a set waits, the manifest records the old files still at the table (with their hashes); a newer export replaces those.
+- The manifest records the pending set (its transaction, waiting files and the old files it replaces) and is updated when the files move in. A newer export of the job drops a set still waiting.
 - **One file, no old set:** a single rename, so the reader sees it complete or not at all.
 - **Several files, or a replacement:** these need a **coordinated pickup**. The export bar asks the designer to confirm the table won't pick up during the handoff, and nothing moves until they do. The main destination is already committed, so the export reports the sample-table set as pending until then.
 

@@ -122,6 +122,44 @@ def add_part(d: DesignState, params: BoxParams, label: str | None = None, quanti
     return replace(d, parts=(*d.parts, Part(pid, name, params, quantity)), next_part=d.next_part + 1)
 
 
+def design_from_parts(parts: list[dict[str, Any]], groups: Any = (), links: Any = ()) -> DesignState:
+    """A new design rebuilt from a job record's parts, keeping their ids, labels and quantities
+    (so fit links and groups still point at the same parts)."""
+    built: list[Part] = []
+    for raw in parts:
+        pid = raw.get("part_id")
+        if not isinstance(pid, str) or not (len(pid) > 1 and pid[0] == "p" and pid[1:].isdigit()):
+            raise ValueError(f"job file part id {pid!r} isn't a part id")
+        if any(p.id == pid for p in built):
+            raise ValueError(f"job file lists part {pid} twice")
+        label = raw.get("label") or _label(raw["params"])
+        if any(p.label == label for p in built):
+            label = f"{label} ({pid})"
+        q = raw.get("quantity", 1)
+        if type(q) is not int or q < 1:
+            raise ValueError("job file part quantity must be a whole number of at least 1")
+        piece = raw.get("piece_no")
+        built.append(Part(pid, label, raw["params"], q, piece if isinstance(piece, str) else None))
+    if not built:
+        raise ValueError("job file has no parts")
+    gs = []
+    for g in groups if isinstance(groups, list) else []:
+        if isinstance(g, dict) and isinstance(g.get("id"), str) and isinstance(g.get("members"), list):
+            members = []
+            for m in g["members"]:
+                q = m.get("quantity", 1) if isinstance(m, dict) else None
+                if not isinstance(m, dict) or not isinstance(m.get("ref"), str) or type(q) is not int or q < 1:
+                    raise ValueError(f"job file group {g['id']} has a member this app doesn't write")
+                members.append(Member(m["ref"], str(m.get("role", "")), q))
+            members = tuple(members)
+            gs.append(Group(g["id"], str(g.get("kind", "assembly")), members))
+    lks = [FitLink(str(lk["id"]), str(lk["container"]), str(lk["contained"]))
+           for lk in (links if isinstance(links, list) else [])
+           if isinstance(lk, dict) and all(isinstance(lk.get(k), str) for k in ("id", "container", "contained"))]
+    top = max(int(p.id[1:]) for p in built)
+    return DesignState(uuid.uuid4().hex[:12], 1, tuple(built), tuple(gs), tuple(lks), next_part=top + 1)
+
+
 def _check_label(label: str | None, d: DesignState | None = None) -> None:
     """A label may not look like a part id (p1, p2, ...) or repeat another part's label."""
     if label is None:
@@ -207,16 +245,21 @@ class DesignStore:
     def dieline(self, state: DesignState, ref: str | None = None) -> Dieline:
         return copy.deepcopy(self._build(state.part(ref).params).dieline)
 
-    def export_params(self, state: DesignState) -> BoxParams:
-        """The one part to export, after the design's own checks: a stale or failed design
+    def export_parts(self, state: DesignState) -> list[Any]:
+        """Every part to export, after the design's own checks: a stale or failed design
         check (a fit link to a removed part) blocks the export like a failed part check."""
-        payload = self.payload(state)
-        blocking = [c for c in payload["design_checks"] if c["status"] in ("fail", "stale")]
+        from .exports import ExportPart
+
+        self.check_exportable(state)
+        return [ExportPart(p.id, p.label, p.params, p.quantity, p.piece_no) for p in state.parts]
+
+    def check_exportable(self, state: DesignState) -> list[dict[str, Any]]:
+        """The design's own checks, refusing if any blocks; returned for the manifest."""
+        checks = [c.to_dict() for c in self._design_checks(state)]
+        blocking = [c for c in checks if c["status"] in ("fail", "stale")]
         if blocking:
             raise _designs.DesignCheckFailed("not exported: " + "; ".join(c["message"] for c in blocking))
-        if len(state.parts) > 1:
-            raise ValueError("exporting a design with several parts comes with the export manifest")
-        return state.parts[0].params
+        return checks
 
     def replay(self, session: str, request_id: str) -> dict[str, Any] | None:
         """The result of a request already committed, for a retry."""

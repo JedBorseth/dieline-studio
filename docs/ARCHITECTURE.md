@@ -35,8 +35,11 @@ Line-delimited JSON-RPC 2.0. TypeScript types are in `app/src/lib/protocol.ts`, 
 | `box.create` | Parameters → design (CF2 text, checks, summary), without storing it |
 | `design.replace` | The form's Generate and a reopened job: a new design for the session (`designstore.py`), with an id and revision 1 |
 | `design.get` | The session's current design, or null |
-| `box.export` | Write `.cf2` and/or `.dxf` (`formats`) plus a `.dieline.json` job record, from the session's design at an exact `design_id` and `revision` (refused if it has changed since), or from `params`. Refuses an existing name with error `-32001` unless `overwrite`. |
-| `job.open` | Regenerate a design from a job record, listing what differs from the export |
+| `box.export` | Write every part's `.cf2` and/or `.dxf` (`formats`) plus the `.dieline.json` manifest, from the session's design at an exact `design_id` and `revision` (refused if it has changed since), or from `params`. Refuses an existing name with error `-32001` unless `overwrite`; a held folder lock is `-32003`, an abandoned one `-32004` (retry with `break_lock`). The result says whether the sample-table files are `published` or `pending`. |
+| `export.plan` | What an export would write (files per part, replaced files, whether the sample table needs a pickup) and whether it can, without writing |
+| `export.pickup` | The designer confirmed the sample table is idle: move a pending set in (`job_path`, `txn`) |
+| `export.recover` | At start: finish or undo exports a crash interrupted |
+| `job.open` | Reopen a job record: `mode: "exported"` shows the record's own snapshot (v2), `"regenerate"` rebuilds every part with today's rules and lists what changed; both say whether the files on disk are still that set |
 | `settings.get` / `settings.update` | Model, effort, export folder, API key (write-only) |
 | `chat.send` / `chat.cancel` / `chat.reset` | Start, stop or clear a chat turn; progress arrives as events |
 | `chat.set_design` | Older name for `design.replace` |
@@ -45,7 +48,7 @@ Notifications use method `event` with a `type`: `engine.ready`, `chat.text`, `ch
 
 ## Designs, revisions and parts
 
-The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, for highlighting later. Exporting a design with several parts arrives with the export manifest.
+The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, for highlighting later. A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
 
 ## Styles, boards and units
 
@@ -54,9 +57,11 @@ The styles replicate R&L's ArtiosCAD ServerLib standards and are named after the
 Exports:
 
 - CF2 for ArtiosCAD.
-- A `<name>.dieline.json` job record next to every export: parameters, board values snapshot, sizes and checks. The UI's Open… regenerates the design from it and lists anything that changed since, such as corrected board values.
+- A `<name>.dieline.json` manifest next to every export (`exports.py`): every part with its quantity, units, files and their hashes, the inputs with defaults resolved, the board values, the design id and revision, and each part's as-exported CF2. One part keeps `<name>.cf2`; several are `<name>-<piece no. or part id>.cf2`. Open… shows a v2 record as exported and offers to regenerate it with current rules; a v1 record can only regenerate.
 
-A name is one file set (CF2, DXF, job). An export never mixes sets. If any file of the name exists, it asks. Replace moves the whole old set to `superseded/<name> <time>/` first, and each new file is written to a temporary name and then renamed. DXF can go to a separate sample-table folder (Settings).
+Publishing (`publish.py`) changes each destination whole or not at all. Every root an export touches is locked: one `.dieline.lock` per root, always in the hidden `.<folder>.dieline-pending/` beside it, so a folder used as the export folder by one designer and the sample table by another still has one lock. The lock names its workstation and process; an abandoned one is broken only for the exact lock the designer confirmed. With the locks held: a path another job's manifest lists (or, at a sample table, another export folder's job claims in the table's ownership index) is refused; an existing file no manifest owns needs the designer's say-so; and an old file whose hash differs from its manifest blocks the replacement. A previous manifest is validated in full before any path in it is used. New files are staged in `.dieline-staging/<txn>/`, a journal records every move, old files move to `superseded/<name> <time>/`, and replacing the manifest (which carries the transaction id) is the commit point. A crash leaves the journal: the next export of that name, or app start, finishes a committed transaction or moves every file back. A journal that doesn't fit what its transaction could have done, or a file that isn't where the journal says, is never guessed at: the journal is kept and that name is blocked until the designer checks it.
+
+The sample-table folder (Settings) is a second transaction after the main one commits. Its files are staged before the main commit, in `.<folder>.dieline-pending/` beside it, with its journal, its archive (`superseded/`) and its ownership index: nothing but finished DXFs ever lands in the folder. One new file moves in at once; several, or a replacement, wait until the designer confirms the table isn't picking up (`export.pickup`, offered in a row of its own under the preview, also for the chat's exports). The manifest records what is physically at the table, so a newer export over a set still waiting replaces the right files.
 - DXF R12 in the format the shop sends to the AOLCUT sample table (`dxf.py`): inches, layer `Design`, colour 1 cut, 2 crease. Entities are in cutting order: creases, interior cuts, then the outer perimeter. CF2 writes full circles as two half arcs.
 
 Faces: every standard carries a face map (`faces.py`), built from the same blank as the drawing: named faces with outside-view frames, assembled and material centres, reference lines, keep-out zones, and the hinge graph (directed axes, IL/OG bend offsets). HSC_GL has a `use` option (tray or lid) that changes which way is up, never the drawing.
@@ -85,7 +90,7 @@ The model's tools:
 | `list_options` | Styles (with options) and boards |
 | `create_box(style, L, W, D, units, board, options, action?, label?, quantity?, dry_run?)` | Generate, check and show in the preview. `action: add` adds another part instead of replacing the design. The result includes a picture of the part, so every design is looked at. |
 | `update_part(part?, ...)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values |
-| `export_files(filename?, formats?, replace?)` | Write CF2 and/or DXF plus the job record |
+| `export_files(filename?, formats?, replace?)` | Write every part's CF2 and/or DXF plus the manifest; sample-table files that need a pickup wait for the designer |
 | `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, optional zoom window (`render.py`) |
 | `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |
 | `get_geometry(line_type?, region?, path?)` | Exact segments and score positions, read-only (`render.py`) |
@@ -141,5 +146,7 @@ Still to check against our ArtiosCAD (see PLAN.md):
 - Before distributing installers, generate the full license notices for bundled dependencies (npm, Python packages inside the sidecar, Rust crates) and ship them with `THIRD_PARTY_NOTICES.md`, which currently covers the T3 Code primitives and direct UI dependencies.
 - Opening a raw CF2 shows it but doesn't change the chat's current design (a CF2 has no parameters), so "export this" in the chat still means the chat's last design.
 - A design made in the form while a chat turn is running isn't handed to the chat (the UI warns).
-- Exports are serialised within one app instance only. Two designers replacing the same name in a shared server folder at the same moment aren't coordinated, and a share dropping mid-replace can leave the set partly moved. The superseded copies stay, and nothing is deleted.
+- Export locks are whole-folder, not per path: two exports to one folder take turns (each takes a second or so). A lock is judged abandoned on this workstation when its process isn't running; from another workstation only after ten minutes. A reused process id can make an abandoned local lock look live until that process ends.
+- Every file move that must not overwrite (archiving, installing, putting a file back) is one atomic no-replace rename: Windows' rename, Linux `renameat2(RENAME_NOREPLACE)` or macOS `renamex_np(RENAME_EXCL)`. A system or file system without one refuses the export rather than moving in two steps.
+- The sample table's ownership index is a cross-check kept beside the table; a claim counts only while the claiming manifest still lists the file.
 - Stop ends a turn immediately; a worker stuck in a network read is abandoned and ends by itself (read timeout 120 s) without touching the session.

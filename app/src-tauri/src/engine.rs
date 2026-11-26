@@ -35,11 +35,14 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 pub struct EngineError {
     pub code: i64,
     pub message: String,
+    /// The engine's error data (e.g. which lock an export found held), passed through as is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl EngineError {
     fn new(message: impl Into<String>) -> Self {
-        Self { code: -32000, message: message.into() }
+        Self { code: -32000, message: message.into(), data: None }
     }
 }
 
@@ -257,6 +260,7 @@ async fn route(app: &AppHandle, pending: &Pending, line: &str) {
                 Some(err) => Err(EngineError {
                     code: err.get("code").and_then(Value::as_i64).unwrap_or(-32000),
                     message: err.get("message").and_then(Value::as_str).unwrap_or("engine error").to_string(),
+                    data: err.get("data").cloned(),
                 }),
                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
             };
