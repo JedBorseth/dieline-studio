@@ -66,7 +66,8 @@ isn't given; don't silently swap boards.
 - Styles are named after the shop standard they replicate: reg-glio-nx \
 (RSC family: regular, full overlap, CSSC, gap/lap flaps; joint inside or \
 outside), reg-gli-ext (the same with an extended, square-ended glue lug), \
-hsc-gl (half slotted, open bottom), tube-glued (sleeve). If the \
+hsc-gl (half slotted: one flap row and one open edge; its use option says \
+whether it's a tray, flaps at the bottom, or a lid), tube-glued (sleeve). If the \
 user asks for a construction no style covers (mailers, trays with locks, \
 partitions, inserts, die-cut specials), say so plainly and suggest building \
 it in ArtiosCAD; don't approximate it with another style.
@@ -97,6 +98,16 @@ never write them. If something looks wrong, say so plainly; don't paper over \
 it. Before saying a design is done, state what you checked: the inside \
 L x W x D and options against the request, the checks, and the measured \
 value of any size the user specified.
+
+## Naming panels and positions
+Describe positions by face, never by blank coordinates: list_faces gives the \
+faces of the current design (P1-P4 with their end/side roles, flaps, glue \
+lug) and their reference lines. Faces are seen from OUTSIDE the folded box; \
+each face's orientation says which way is up and what is on its left and \
+right. Don't work those out from the flat drawing: it's inside up, and an \
+HSC tray's panels read upside down relative to it. When the user gives a \
+distance ("2 in down from the top score"), make sure you know whether it \
+runs to the feature's edge or its centre; ask if they didn't say.
 
 ## Reference files and precedent
 search_files and read_file give read-only access to R&L's own files (old \
@@ -153,7 +164,7 @@ def _tools() -> list[dict[str, Any]]:
                                        "standard's defaults. reg-glio-nx: order (eses|sese), closure "
                                        "(inside|outside), top_flaps/bottom_flaps (regular|full_overlap|"
                                        "gap_lap|cssc), top_lap/bottom_lap (inches). reg-gli-ext: order, top_flaps, "
-                                       "bottom_flaps, top_lap, bottom_lap. hsc-gl: order, closure. "
+                                       "bottom_flaps, top_lap, bottom_lap. hsc-gl: order, closure, use (tray|lid). "
                                        "tube-glued: order.",
                     },
                 },
@@ -195,6 +206,19 @@ PATH = {"type": "string", "description": "Optional: a CF2 or DXF reference file 
                                          "search_files) to inspect instead of the current design"}
 
 INSPECT_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "list_faces",
+        "description": (
+            "List the named faces of the current design: body panels P1-P4 with their roles (end or side, from "
+            "the panel order), flaps, the glue lug, lug extensions. Each face has a frame seen from OUTSIDE the "
+            "folded box (+y up on the box, toward the free edge on a flap; +x to the right), its size, its "
+            "reference lines (top/bottom/left/right, physical names like top_score, free_edge, glue_score, and "
+            "centre_x/centre_y), keep-out zones (where the glue lug lands, flap overlap bands) and its hinge. "
+            "Also the selectors that apply (end_panels, side_panels, top_flaps, top_outer_flaps, ...). Use these "
+            "names to describe positions; never use blank coordinates."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
     {
         "name": "view_design",
         "description": (
@@ -723,6 +747,10 @@ class Agent:
             view = designs.agent_view(design)
             png, info = render.render_png(designs.build(params))
             return {**view, "view": info, "_image": png}
+        if name == "list_faces":
+            if s.current is None:
+                raise ValueError("no design yet; call create_box first")
+            return designs.face_map(s.current)
         if name in ("view_design", "get_geometry"):
             region = render.Region.parse(args.get("region"))
             if args.get("path") is not None:

@@ -120,6 +120,8 @@ class Dieline:
     # Free-form facts about how the dieline was made (style, dims, board, ...).
     meta: dict[str, object] = field(default_factory=dict)
     ops: dict[str, Operation] = field(default_factory=dict)
+    # Named faces, frames, reference lines and hinges (faces.FaceMap), when the engine drew it.
+    faces: object | None = None
 
     def add_op(self, op: Operation) -> str:
         if op.id in self.ops:

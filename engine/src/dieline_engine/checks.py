@@ -255,6 +255,8 @@ def check_standard(d: Dieline) -> list[CheckResult]:
 
 def fmt_in(x: float) -> str:
     """Inches as a mixed fraction to the nearest 1/32 when exact, else decimals."""
+    if x < 0:
+        return "-" + fmt_in(-x)
     n = round(x * 32)
     if abs(x * 32 - n) > 1e-6:
         return f"{x:.4f}".rstrip("0").rstrip(".")

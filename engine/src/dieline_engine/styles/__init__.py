@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..boards import Board
+from ..faces import attach_edges, slotted_faces
 from ..geometry import Dieline, LineType
 from . import slotted
 
@@ -79,9 +80,19 @@ class Style:
 
     def make(self, dims: Dims, board: Board, options: dict[str, Any]) -> Dieline:
         opts = self.resolve_options(options)
-        blank, extra = self.build(dims.length, dims.width, dims.depth, board, **opts)
+        build_opts = {k: v for k, v in opts.items() if k != "use"}  # use changes the faces, not the drawing
+        blank, extra = self.build(dims.length, dims.width, dims.depth, board, **build_opts)
         name = f"{self.standard} {_f(dims.length)}x{_f(dims.width)}x{_f(dims.depth)} {board.id}"
         d = slotted.draw(name, blank)
+        d.faces = slotted_faces(
+            blank, slotted.raw_panels(dims.length, dims.width, opts.get("order", "eses")), board,
+            order=opts.get("order", "eses"), closure=opts.get("closure", "inside"),
+            top_style=opts.get("top_flaps", "regular" if blank.top else None),
+            bottom_style=opts.get("bottom_flaps", "regular" if blank.bottom else None),
+            use=opts.get("use"), half_slot=slotted.HALF_SLOT, glue_taper=slotted.GLUE_TAPER,
+            lap=(opts.get("top_lap", 0.0) if opts.get("top_flaps") == "gap_lap" else 0.0,
+                 opts.get("bottom_lap", 0.0) if opts.get("bottom_flaps") == "gap_lap" else 0.0))
+        attach_edges(d.faces, d)
         d.meta = {
             "style": self.id,
             "standard": self.standard,
@@ -175,10 +186,13 @@ STYLES: dict[str, Style] = {
             "hsc-gl",
             "Half slotted container, glued (HSC_GL)",
             "HSC_GL",
-            "R&L's HSC standard: an RSC with top flaps only and an open bottom edge (lids, trays, gaylord lids). "
-            "FEFCO 0200.",
+            "R&L's HSC standard: an RSC with one flap row and one open edge. Used as a tray (the flaps form the "
+            "bottom; the default) or a lid (the flaps form the top); the use option says which. FEFCO 0200.",
             slotted.hsc_gl,
-            [ORDER, CLOSURE],
+            [ORDER, CLOSURE, StyleOption(
+                "use", "Use", "Tray: the flap row is the bottom of the folded box (the default). Lid: the flap row "
+                "is its top. Changes which way is up for placements, never the drawing.",
+                "tray", {"tray": "Tray (flaps down)", "lid": "Lid (flaps up)"})],
         ),
         Style(
             "tube-glued",

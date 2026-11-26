@@ -236,10 +236,12 @@ The face map is published with exact geometry, so phases 2–5 build on it rathe
   - `+x` is right when the flap is viewed from outside with its free edge up.
 
   This is the flat-hinged frame. The folded orientation isn't used, so a flap's frame never depends on how it closes.
-- A builder base, and any face that is horizontal when folded:
+- **Standard flaps** (and lug extensions) always use the flat-hinged frame above, with generic `left` and `right`, whichever way they lie when closed. Opposite flaps point opposite ways when closed, so they can't share a box-fixed frame.
+- **A builder base**, and any other face that stays horizontal and fixed in the folded box (not a flap):
   - It's measured with the **box-side names** `front_edge`, `back_edge`, `left_edge` and `right_edge`, where front, back, left and right are the box's sides as seen standing at its front.
   - Generic `left` and `right` references are refused on these faces, because they flip with viewing side.
   - `x` runs toward `right_edge` and `y` toward `back_edge`.
+- **Datum, not corner:** each frame's origin sits on the flat score or open-edge line. On the folded box the physical outside corner is OG beyond a score, so a placement measured "from the corner" will need its own reference when it's added.
 
 **Assembled centres**
 
@@ -265,7 +267,7 @@ The face map is published with exact geometry, so phases 2–5 build on it rathe
   - So the inside corner of a fold lies IL inward from the score line along each panel, and the outside corner lies OG outward.
   - Example: on the RSC, P2 = P2A + CAL score to score, and with IL = CAL/2 its inside is P2A.
 - **Transforms:** the fold model places each child from these corners, not as a pure rotation about the score line. Score-to-score sizes stay the flat dimensions, the same reference as the standards' formulas.
-- **Assembled datum:** placements are measured on the face's **outside surface** in the folded box. The origin is where the face's non-joint hinge reference line meets its bottom reference line: the bottom score on body panels, and the hinge on flaps. `y` is measured up from there. The rigid face map carries this origin and the axes to the flat blank.
+- **Assembled datum:** placements are measured on the face's **outside surface** in the folded box. Each face's origin is its bottom-left corner as seen from outside: the bottom score (or open edge) on body panels, and the hinge on flaps, at the face's left side. `x` runs right and `y` up from there. The rigid face map carries this origin and the axes to the flat blank. Assembled centres are still measured from the non-joint score, as in the table above.
 - **Material datum:** with `δ = 0` for an inside joint and `δ = IL` for an outside one, and `A1 = P1A + CAL`, `A4 = P4A + CAL`, measured from the scores in the table above:
   - P1: `(A1 − 1/8 − δ) / 2`
   - P4: `(A4 + δ) / 2`

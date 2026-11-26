@@ -492,7 +492,10 @@ function Summary({ design }: { design: Design }) {
     ["Glue lug", fmtIn(s.glue_lug_in)],
     ["Body", fmtIn(s.body_height_in)],
   ];
-  if (s.top_flaps_in) rows.push(["Top flaps", s.top_flaps_in.map(fmtIn).join(" / ")]);
+  // An HSC tray's one flap row is the bottom of the folded box (the drawing has it at the top).
+  const tray = s.options?.use === "tray";
+  if (s.options?.use !== undefined) rows.push(["Use", tray ? "Tray (flaps down)" : "Lid (flaps up)"]);
+  if (s.top_flaps_in) rows.push([tray ? "Bottom flaps" : "Top flaps", s.top_flaps_in.map(fmtIn).join(" / ")]);
   if (s.bottom_flaps_in) rows.push(["Bottom flaps", s.bottom_flaps_in.map(fmtIn).join(" / ")]);
   rows.push(["Blank", `${fmtIn(s.blank_in.width)} × ${fmtIn(s.blank_in.height)}`]);
   if (s.blank_area_sqft !== undefined) rows.push(["Area", `${s.blank_area_sqft.toFixed(2)} sq ft`]);

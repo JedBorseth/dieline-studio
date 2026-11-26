@@ -73,6 +73,8 @@ export function formatToolLabel(
       const paths = (result as { paths?: string[] } | undefined)?.paths;
       return paths?.length ? `export_files → ${paths.join(", ")}` : "export_files";
     }
+    case "list_faces":
+      return "list_faces · panels, flaps and their edges";
     case "view_design": {
       const f = file(args.path);
       return `view_design${f ? ` · ${f}` : ""}${region}`;

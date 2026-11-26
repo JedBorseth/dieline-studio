@@ -53,6 +53,8 @@ Exports:
 A name is one file set (CF2, DXF, job). An export never mixes sets. If any file of the name exists, it asks. Replace moves the whole old set to `superseded/<name> <time>/` first, and each new file is written to a temporary name and then renamed. DXF can go to a separate sample-table folder (Settings).
 - DXF R12 in the format the shop sends to the AOLCUT sample table (`dxf.py`): inches, layer `Design`, colour 1 cut, 2 crease. Entities are in cutting order: creases, interior cuts, then the outer perimeter. CF2 writes full circles as two half arcs.
 
+Faces: every standard carries a face map (`faces.py`), built from the same blank as the drawing: named faces with outside-view frames, assembled and material centres, reference lines, keep-out zones, and the hinge graph (directed axes, IL/OG bend offsets). HSC_GL has a `use` option (tray or lid) that changes which way is up, never the drawing.
+
 Checks:
 
 - topology (`topology.py`): every segment belongs to an operation (outline, hinge, hole…) that declares its deliberate contacts. Undeclared crossings, overlaps, tangencies, open cut ends and broken arcs refuse the design before it exists. Loose board (an island, or a cut dividing the blank) is drawn but blocks export. Near misses warn. Each output file is read back and checked again after rounding, and a target that fails is blocked. Faces are traced exactly through lines and arcs, with no tessellation.
@@ -78,6 +80,7 @@ The model's tools:
 | `create_box(style, L, W, D, units, board, options)` | Generate, check and show in the preview. The result includes a picture of the dieline, so every design is looked at. |
 | `export_files(filename?, formats?, replace?)` | Write CF2 and/or DXF plus the job record |
 | `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, optional zoom window (`render.py`) |
+| `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |
 | `get_geometry(line_type?, region?, path?)` | Exact segments and score positions, read-only (`render.py`) |
 | `search_files(query, extensions?)` | Read-only search of the reference folders (default: the work OneDrive folder synced on the PC). It matches words in paths, and inside ArtiosCAD descriptions for files already on the PC (`files.py`). |
 | `read_file(path, page?)` | ARD text facts (description, board, standard, blank size), CF2/DXF picture and scores, PDF/Excel/Word/text by page, images. Confined to the reference folders. |

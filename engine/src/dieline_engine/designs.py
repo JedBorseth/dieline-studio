@@ -126,6 +126,15 @@ def create_box(params: BoxParams) -> dict:
     }
 
 
+def face_map(params: BoxParams, full: bool = False) -> dict:
+    """The named faces of a design: the compact view a model uses to name positions,
+    or (full) every frame, reference line, edge span, keep-out and hinge."""
+    d = build(params)
+    if d.faces is None:
+        raise ValueError("this design has no face map")
+    return d.faces.to_dict() if full else d.faces.agent_view()  # type: ignore[attr-defined]
+
+
 def agent_view(design: dict) -> dict:
     """What the model sees about a design: facts and checks, never geometry."""
     return {

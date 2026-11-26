@@ -1057,3 +1057,19 @@ def test_dxf_reader_reports_what_it_skips():
     d, warnings = read_dxf(text)
     assert len(d.segments) == 1
     assert any("1 LWPOLYLINE" in w and "1 TEXT" in w for w in warnings)
+
+
+def test_list_faces_tool(monkeypatch, tmp_path):
+    responses = [
+        NS(stop_reason="tool_use", content=[_tool_use("t1", "create_box", BOX)]),
+        NS(stop_reason="tool_use", content=[_tool_use("t2", "list_faces", {})]),
+        NS(stop_reason="end_turn", content=[_text("Listed.")]),
+    ]
+    _, s, _, _ = _run(monkeypatch, tmp_path, responses)
+    tool = next(m for m in s.messages if m.get("role") == "tool" and "viewing" in m.get("content", ""))
+    data = json.loads(tool["content"])
+    assert "OUTSIDE" in data["viewing"] and data["units"] == "in" and "folding" in data
+    assert len(tool["content"]) < 12000  # compact: no flat coordinates, no operation ids
+    ids = {f["id"] for f in data["faces"]}
+    assert {"P1", "P2", "P3", "P4", "glue_lug", "top_flap_P1", "bottom_flap_P4"} <= ids
+    assert data["selectors"]["end_panels"] and "body_panels" in data["selectors"]
