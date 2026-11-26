@@ -63,11 +63,15 @@ def write_cf2(dieline: Dieline, pointage: float = DEFAULT_POINTAGE) -> str:
         f"UR,{_num(xmax)},{_num(ymax)}",
         "SCALE,1,1",
     ]
-    pt = _num(pointage)
+    default_pt = _num(pointage)
     for seg in dieline.segments:
         code = CF2_LINE_CODES.get(seg.type)
         if code is None:  # annotations are not manufactured; leave them out
             continue
+        # An operation's own rule spec may give its pointage (rules.RuleSpec); mixed pointage
+        # is blocked for CF2 until verified, so this only matters once it is.
+        rule = getattr(dieline.ops.get(seg.op), "rule", None) if seg.op else None
+        pt = _num(rule.pointage) if rule is not None and getattr(rule, "pointage", None) else default_pt
         if isinstance(seg, Line):
             (x1, y1), (x2, y2) = seg.start, seg.end
             out.append(f"L,{pt},{code},0,{_num(x1)},{_num(y1)},{_num(x2)},{_num(y2)},0,0")

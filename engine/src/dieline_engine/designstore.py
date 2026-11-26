@@ -208,6 +208,39 @@ def _label(params: BoxParams) -> str:
     return params.style
 
 
+def with_features(params: BoxParams, items: list[Any] | None, remove: list[Any] | None = None
+                  ) -> tuple[BoxParams, list[str]]:
+    """A part's parameters with features upserted by id (docs/DESIGN-SYSTEM.md, "Same pattern everywhere"):
+    new items get engine-made ids, changed items keep theirs, `remove` deletes. Returns the ids touched."""
+    from . import features  # noqa: PLC0415
+
+    feats, touched = features.upsert(params.features, items, remove)
+    base = params.model_dump()
+    base.pop("features", None)
+    fm = _designs.build(BoxParams.model_validate(base)).faces if feats else None
+    feats = features.bind(feats, fm, touched)
+    return BoxParams.model_validate({**base, "features": feats}), touched
+
+
+def set_features(d: DesignState, ref: str | None, items: list[Any] | None, remove: list[Any] | None = None
+                 ) -> tuple[DesignState, str, list[str]]:
+    """Upsert and remove one part's features. Returns the new state, the part id and the ids touched."""
+    old = d.part(ref)
+    params, touched = with_features(old.params, items, remove)
+    return update_part(d, old.id, params), old.id, touched
+
+
+def refuse_stale(payload: dict[str, Any], part_id: str, ids: list[str]) -> None:
+    """A call that adds or changes a feature is refused if that feature can't be placed: the
+    previous revision stays. (Only a resize or a style change may leave a feature stale.)"""
+    part = next((p for p in payload.get("parts", []) if p.get("part_id") == part_id), None)
+    if part is None:
+        return
+    bad = [f for f in part.get("features", []) if f["id"] in ids and f["status"] == "stale"]
+    if bad:
+        raise ValueError("; ".join(f"{f['label']} {f['id']} can't be placed: {f.get('reason')}" for f in bad))
+
+
 # ------------------------------------------------------------------ the store
 
 
@@ -333,13 +366,16 @@ class DesignStore:
     def mutate(self, session: str, change: Callable[[DesignState | None], DesignState], *,
                expected: tuple[str, int] | None | str = "any", request_id: str | None = None,
                dry_run: bool = False, guard: Callable[[], None] | None = None,
-               focus: str | None = None, origin: str = "chat") -> dict[str, Any]:
+               focus: str | None = None, origin: str = "chat",
+               accept: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         """Build `change(current)` and commit it if the design is still `current`.
 
         expected: "any" (the designer's own form and job open) or the (design id, revision)
         the caller is working from; None means it expects no design yet.
         guard: called just before committing, under the lock; raising stops the commit
         (a chat turn that was stopped while its change was being built).
+        accept: called with the built payload (also on a dry run); raising refuses the change
+        (a feature the call added that can't be placed).
         """
         with self._lock:
             if request_id is not None and (session, request_id) in self._done:
@@ -354,6 +390,8 @@ class DesignStore:
         payload = self.payload(proposed)  # builds and checks every part: raises before anything changes
         if focus is not None:
             payload["focus"] = focus  # the part the change was about, for a retry's answer
+        if accept is not None:
+            accept(payload)
         if dry_run:
             return {**payload, "seq": seq, "dry_run": True}
         with self._lock:
@@ -405,13 +443,22 @@ def _changed_msg() -> str:
 
 
 def scene(d: Dieline) -> list[dict[str, Any]]:
-    """Every segment tagged with its operation, for the preview to highlight and
-    label (the CF2 stays clean for ArtiosCAD)."""
+    """Every segment tagged with its operation, provenance (structure or
+    feature), feature_id and face_id, for the preview to highlight and label
+    (the CF2 stays clean for ArtiosCAD). A stale feature's ghost is tagged stale.
+    A structure hinge's face is the face it hinges."""
+    tags: dict[Any, dict[str, Any]] = d.extras.get("tags") or {}  # type: ignore[assignment]
+    hinges = getattr(d.faces, "hinges", {}) or {}
     out = []
     for s in d.segments:
         op = d.ops.get(s.op) if s.op else None
+        tag = tags.get(s)
         item: dict[str, Any] = {"type": s.type.value, "op": s.op, "kind": op.kind if op else None,
-                                "provenance": "structure"}
+                                "provenance": "feature" if tag else "structure"}
+        if tag:
+            item.update(tag)
+        elif s.op in hinges:
+            item["face_id"] = hinges[s.op].child
         if isinstance(s, Arc):
             item.update(arc=True, start=list(s.start), end=list(s.end), center=list(s.center),
                         clockwise=s.clockwise, full_circle=s.full_circle)

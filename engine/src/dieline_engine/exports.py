@@ -29,6 +29,7 @@ from . import __version__, publish
 from . import designs as _d
 from .boards import get_board
 from .cf2 import read_cf2, write_cf2
+from .rules import rules_used
 from .checks import fmt_in, overall
 from .geometry import Dieline
 from .publish import (ChangedOnDisk, ExportExists, LockHeld, OwnedByAnother, PublishError, Unresolved, canon,
@@ -78,7 +79,7 @@ def _formats(requested: list[Any] | None) -> list[str]:
     return list(dict.fromkeys(requested))
 
 
-def _build(parts: list[ExportPart], formats: list[str]) -> list[_Built]:
+def _build(parts: list[ExportPart], formats: list[str], expand_perfs: bool = False) -> list[_Built]:
     if not parts:
         raise ValueError("nothing to export: the design has no parts")
     several = len(parts) > 1
@@ -90,9 +91,10 @@ def _build(parts: list[ExportPart], formats: list[str]) -> list[_Built]:
             failed = "; ".join(r.message for r in results if r.status in ("fail", "stale"))
             raise _d.DesignCheckFailed(f"not exported: {name} fails its checks ({failed})")
         try:
-            _d.check_rules(dieline, formats)
-            texts = {f: (_d.write_cf2(dieline) if f == "cf2" else _d.write_dxf(dieline)) for f in formats}
-            _d.check_outputs(dieline, texts)
+            _d.check_rules(dieline, formats, expand_perfs)
+            texts = {f: (_d.write_cf2(dieline) if f == "cf2" else _d.write_dxf(dieline, expand_perfs))
+                     for f in formats}
+            _d.check_outputs(dieline, texts, expand_perfs)
         except _d.TargetBlocked as exc:
             raise _d.TargetBlocked(f"{name}: {exc}" if several else str(exc)) from exc
         out.append(_Built(p, part_slug(p), dieline, results, texts))
@@ -525,6 +527,7 @@ def _part_record(b: _Built, files: list[dict[str, Any]]) -> dict[str, Any]:
                   "crrv_in": board.crrv, "source": board.source},
         "summary": b.dieline.meta,
         "checks": [r.to_dict() for r in b.results],
+        "rules": [r.to_dict() for r in rules_used(b.dieline)],
         "geometry_sha256": _geometry_digest(cf2),
         "cf2": cf2,  # as exported: "open as exported" shows exactly this
         "files": files,
@@ -564,6 +567,7 @@ def export_design(
     break_lock: str | None = None,
     confirm_pickup: bool = False,
     on_pending: Callable[[dict[str, Any]], None] | None = None,
+    dxf_expand_perfs: bool = False,
 ) -> dict:
     """Write every part's files and the manifest.
 
@@ -575,7 +579,7 @@ def export_design(
     designer agreed to break.
     """
     fmts = _formats(formats)
-    built = _build(parts, fmts)
+    built = _build(parts, fmts, dxf_expand_perfs)
     w = _where(output_dir, dxf_dir, _d.safe_stem(filename or built[0].dieline.name), fmts)
     if w.sample is not None and "dxf" in fmts and _is_drive_root(w.sample):
         publish.pending_dir(w.sample)  # raises: a drive root can't be a sample-table folder
@@ -953,17 +957,27 @@ def _recover_locked(main: Path, roots: set[Path], notes: list[str]) -> None:
 
 
 def plan(parts: list[ExportPart], output_dir: Path, filename: str | None, formats: list[Any] | None,
-         dxf_dir: Path | None) -> dict:
+         dxf_dir: Path | None, dxf_expand_perfs: bool = False) -> dict:
     """What an export would write, and whether it can: for the export bar, before the designer commits.
-    The same checks as the export itself, without locking or writing."""
+    The same checks as the export itself, without locking or writing. `formats` in the reply says each
+    format's own readiness (a format blocked by an unverified rule), so the designer can untick it."""
     fmts = _formats(formats)
+    readiness: dict[str, dict[str, Any]] = {}
+    for f in ["cf2", "dxf"]:
+        try:
+            _build(parts, [f], dxf_expand_perfs)
+            readiness[f] = {"ready": True, "blocking": []}
+        except _d.TargetBlocked as exc:
+            readiness[f] = {"ready": False, "blocking": [str(exc)]}
+        except (_d.DesignCheckFailed, _d.GeometryRefused) as exc:
+            readiness[f] = {"ready": False, "blocking": [str(exc)]}
 
     def refused(msg: str, files: list | None = None, w: _Where | None = None) -> dict:
         return {"ready": False, "blocking": [msg], "files": files or [], "job_path": str(w.job) if w else None,
-                "replaces": [], "pickup": False}
+                "replaces": [], "pickup": False, "formats": readiness}
 
     try:
-        built = _build(parts, fmts)
+        built = _build(parts, fmts, dxf_expand_perfs)
     except (_d.DesignCheckFailed, _d.GeometryRefused) as exc:
         return refused(str(exc))
     w = _where(output_dir, dxf_dir, _d.safe_stem(filename or built[0].dieline.name), fmts)
@@ -984,7 +998,7 @@ def plan(parts: list[ExportPart], output_dir: Path, filename: str | None, format
     replaces = sorted({p.name for p in [*main_old, *sample_old]} | ({manifest.name} if manifest else set()))
     sample_new = [f for f in files if f["destination"] == "sample_table"]
     return {"ready": True, "blocking": [], "files": files, "job_path": str(w.job), "stem": w.stem,
-            "replaces": replaces, "pickup": len(sample_new) > 1 or bool(sample_old)}
+            "replaces": replaces, "pickup": len(sample_new) > 1 or bool(sample_old), "formats": readiness}
 
 
 # ------------------------------------------------------------------ reopening

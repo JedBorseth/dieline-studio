@@ -21,14 +21,36 @@ from .topology import Issue, Report, validate
 STATUSES = ("pass", "info", "warn", "fail", "not_applicable", "unavailable", "stale")
 
 
+CATEGORIES = ("geometry", "feature", "fold", "partition", "artwork", "fit", "machine", "calibration", "export")
+# What each of the engine's own checks is about, for the checks panel: actionable ones
+# (geometry, feature, fold, partition, artwork, fit) are kept apart from notices.
+CATEGORY_OF = {
+    "line_types": "geometry", "zero_length": "geometry", "closed_outline": "geometry", "overlaps": "geometry",
+    "crossings": "geometry", "material": "geometry", "clearance": "geometry", "length_width": "geometry",
+    "machines": "machine", "preflight_panels": "machine", "preflight_pointage": "machine",
+    "board": "calibration", "rounding": "calibration", "calibration": "calibration",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     id: str
     status: str
     message: str
+    category: str | None = None
+    part_id: str | None = None
+    feature_id: str | None = None
+    region: tuple[float, float, float, float] | None = None  # in the design's units, flat
 
-    def to_dict(self) -> dict[str, str]:
-        return asdict(self)
+    def to_dict(self) -> dict[str, object]:
+        out = asdict(self)
+        if out.get("category") is None:
+            cat = CATEGORY_OF.get(self.id) or ("geometry" if self.id.startswith("link_") else None)
+            if cat:
+                out["category"] = cat
+        if out.get("region") is not None:
+            out["region"] = [round(v, 4) for v in out["region"]]  # type: ignore[union-attr]
+        return {k: v for k, v in out.items() if v is not None}
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +67,14 @@ class Machine:
     min_size: tuple[float, float] | None = None
     feed: bool = False
     skip_feed_along: float | None = None  # longer feed length allowed in skip-feed mode
+    # What it can make, separate from what sheet it takes (docs/DESIGN-SYSTEM.md, "Feature checks"):
+    # its process (slotting, rotary_die, flatbed_die); whether it can die-cut (None: not confirmed);
+    # the rotations a blank may take (0 = as drawn); and its flute and feed axis, when known.
+    process: str = "flatbed_die"
+    die_cut: bool | None = True
+    rotations: tuple[int, ...] = (0, 90)
+    flute_axis: str | None = None  # the blank axis the flutes must run along, when the machine needs one
+    feed_axis: str | None = None  # the blank axis that runs with the feed
 
 
 # The slotter's rated sheet limits: feeding 1625 x 4600 mm, skip feeding 2200 x 4600 mm, minimum
@@ -53,8 +83,11 @@ class Machine:
 # (the panels) across the machine. The die presses use the sheet min/max fields
 # of their ArtiosCAD die press definitions in ServerLib, not their names.
 MACHINES: list[Machine] = [
+    # Whether the slotter has a rotary die station isn't confirmed (its name says die-cutter), so a part
+    # with die-cut features isn't listed for it until the shop says so.
     Machine("Printing slotter die-cutter", (1625 / 25.4, 4600 / 25.4), (450 / 25.4, 650 / 25.4),
-            feed=True, skip_feed_along=2200 / 25.4),
+            feed=True, skip_feed_along=2200 / 25.4, process="slotting", die_cut=None, rotations=(0,),
+            feed_axis="y"),
     Machine("Flatbed 60 x 46", (46.0, 60.0), (10.0, 15.0)),
     Machine("Bausse 44 x 33", (33.0, 44.0), (16.0, 20.0)),
     Machine("Pioneer 120 x 100", (120.0, 100.0), (20.4375, 23.625)),
@@ -153,8 +186,18 @@ def check_machines(d: Dieline, machines: list[Machine] = MACHINES) -> CheckResul
     """
     k = d.mm_per_unit / 25.4
     w, h = (v * k for v in d.size())
+    die_cut = int(d.meta.get("die_cut_features", 0) or 0)  # type: ignore[call-overload]
+    unconfirmed: list[str] = []
+    if die_cut:
+        # A part with any die-cut feature can't run as a plain slotted job: only machines that can die-cut.
+        unconfirmed = [m.name for m in machines if m.die_cut is None]
+        machines = [m for m in machines if m.die_cut]
     fits = {m.name: _fit(w, h, m) for m in machines}
     size = f"blank {fmt_in(w)} x {fmt_in(h)} in"
+    if die_cut:
+        size = (f"{size} with {die_cut} die-cut feature{'s' if die_cut > 1 else ''} (die-cutting machines only"
+                + (f"; {', '.join(unconfirmed)} not listed until its die-cutting is confirmed" if unconfirmed else "")
+                + ")")
     ok = [n for n, f in fits.items() if f == "fits"]
     skip = [n for n, f in fits.items() if f == "skip"]
     small = [n for n, f in fits.items() if f == "small"]
@@ -273,6 +316,10 @@ def run_checks(d: Dieline, report: Report | None = None) -> list[CheckResult]:
     results = [check_line_types(d), *check_topology(d, report), check_machines(d)]
     results += check_standard(d)
     results += check_preflight(d)
+    if d.extras.get("features"):
+        from .feature_checks import check_features  # noqa: PLC0415
+
+        results += check_features(d)
     return results
 
 

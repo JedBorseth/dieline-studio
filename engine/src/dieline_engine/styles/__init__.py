@@ -80,7 +80,8 @@ class Style:
 
     def make(self, dims: Dims, board: Board, options: dict[str, Any]) -> Dieline:
         opts = self.resolve_options(options)
-        build_opts = {k: v for k, v in opts.items() if k != "use"}  # use changes the faces, not the drawing
+        # use and flute change the faces and the checks, not the drawing
+        build_opts = {k: v for k, v in opts.items() if k not in ("use", "flute")}
         blank, extra = self.build(dims.length, dims.width, dims.depth, board, **build_opts)
         name = f"{self.standard} {_f(dims.length)}x{_f(dims.width)}x{_f(dims.depth)} {board.id}"
         d = slotted.draw(name, blank)
@@ -140,6 +141,14 @@ CLOSURE = StyleOption(
 )
 
 
+FLUTE = StyleOption(
+    "flute", "Flute direction",
+    "Which way the flutes run on the assembled box: vertical (up the panels, the usual way and the default) or "
+    "horizontal. Used by the feature checks (handhole carry web, tear strips); it doesn't change the drawing.",
+    "vertical", {"vertical": "Vertical", "horizontal": "Horizontal"},
+)
+
+
 LAPS = [
     StyleOption(f"{end}_lap", f"{end.title()} gap/lap",
                 f"{end.title()} Gap/Lap (the standard's {var}): how far the outer {end} flaps overlap, in inches; "
@@ -170,7 +179,7 @@ STYLES: dict[str, Style] = {
             "(FEFCO 0201), full overlap (0203), CSSC (0204-style) and gap/lap flaps, joint inside or outside.",
             slotted.reg_glio_nx,
             [ORDER, CLOSURE, _flaps("top_flaps", "Top flaps"), _flaps("bottom_flaps", "Bottom flaps"),
-             *LAPS],
+             *LAPS, FLUTE],
         ),
         Style(
             "reg-gli-ext",
@@ -180,7 +189,7 @@ STYLES: dict[str, Style] = {
             "and is creased across at the scores. Inside joint only. Same flap styles as REG-GLIO-NX.",
             slotted.reg_gli_ext,
             [ORDER, _flaps("top_flaps", "Top flaps"), _flaps("bottom_flaps", "Bottom flaps"),
-             *LAPS],
+             *LAPS, FLUTE],
         ),
         Style(
             "hsc-gl",
@@ -192,7 +201,7 @@ STYLES: dict[str, Style] = {
             [ORDER, CLOSURE, StyleOption(
                 "use", "Use", "Tray: the flap row is the bottom of the folded box (the default). Lid: the flap row "
                 "is its top. Changes which way is up for placements, never the drawing.",
-                "tray", {"tray": "Tray (flaps down)", "lid": "Lid (flaps up)"})],
+                "tray", {"tray": "Tray (flaps down)", "lid": "Lid (flaps up)"}), FLUTE],
         ),
         Style(
             "tube-glued",
@@ -201,7 +210,7 @@ STYLES: dict[str, Style] = {
             "R&L's tube standard: four panels and a glue lug, no flaps; open at both ends. Depth is the "
             "sleeve height.",
             slotted.tube_glued,
-            [ORDER],
+            [ORDER, FLUTE],
         ),
     ]
 }
