@@ -266,14 +266,18 @@ def _fit(draw, text: str, font, width: float) -> str:
     return text + "..."
 
 
-def _score_positions(d: Dieline, vertical: bool, tol: float, region: Region | None = None) -> list[float]:
+def _score_positions(d: Dieline, vertical: bool, tol: float, region: Region | None = None,
+                     structure_only: bool = False) -> list[float]:
     """Score positions, tolerant of the tiny jitter in real CAD exports, with
-    positions closer than the tolerance merged."""
+    positions closer than the tolerance merged. structure_only: only the
+    standard's own hinges (from the face map), for the panel labels."""
     i = 0 if vertical else 1
+    hinges = set(getattr(d.faces, "hinges", {}) or {}) if structure_only else set()
     vals = sorted(
         (seg.start[i] + seg.end[i]) / 2
         for seg in d.of_type(LineType.CREASE)
-        if isinstance(seg, Line) and abs(seg.start[i] - seg.end[i]) <= tol
+        if (not hinges or seg.op in hinges)
+        and isinstance(seg, Line) and abs(seg.start[i] - seg.end[i]) <= tol
         and seg.length > 4 * tol and (region is None or touches(seg, region))
     )
     out: list[float] = []
@@ -290,8 +294,8 @@ def _labels(draw, d: Dieline, px, small, normal) -> None:
     xmin, ymin, xmax, ymax = d.bounds()
     tol = 0.001 * (25.4 if d.units == "mm" else 1.0)  # 1/1000 in
     min_span = 1 / 32 * (25.4 if d.units == "mm" else 1.0)
-    xs = _score_positions(d, vertical=True, tol=tol)
-    ys = _score_positions(d, vertical=False, tol=tol)
+    xs = _score_positions(d, vertical=True, tol=tol, structure_only=True)
+    ys = _score_positions(d, vertical=False, tol=tol, structure_only=True)
     scale = px((1, 0))[0] - px((0, 0))[0]
 
     def pill(cx: float, cy: float, text: str, room_px: float) -> None:
@@ -301,8 +305,11 @@ def _labels(draw, d: Dieline, px, small, normal) -> None:
         draw.rectangle([cx - tw / 2 - 3, cy - 11, cx + tw / 2 + 3, cy + 11], fill=(255, 255, 230))
         draw.text((cx - tw / 2, cy - 9), text, fill=(150, 60, 0), font=normal)
 
-    # The body is where the vertical (panel) scores run; flaps lie beyond it.
-    vertical = [c for c in d.of_type(LineType.CREASE)
+    # The body is where the vertical (panel) scores run; flaps lie beyond it. With a face map, only the
+    # standard's own hinges count: a feature's crease (a vertical hand-flap hinge, an extra score) isn't a panel.
+    hinges = set(getattr(d.faces, "hinges", {}) or {})
+    structural = [c for c in d.of_type(LineType.CREASE) if not hinges or c.op in hinges]
+    vertical = [c for c in structural
                 if isinstance(c, Line) and abs(c.start[0] - c.end[0]) <= tol and c.length > 4 * tol]
     if vertical:
         body = (min(min(c.start[1], c.end[1]) for c in vertical), max(max(c.start[1], c.end[1]) for c in vertical))
@@ -352,6 +359,9 @@ def _labels(draw, d: Dieline, px, small, normal) -> None:
                 x, y = px((mx, (tip + score) / 2))
                 pill(x, y, _fmt(depth, d.units), (b - a) * scale)
 
+    _face_labels(draw, d, px, small)
+    _callouts(draw, d, px, small)
+
     # Overall size under the blank.
     x, y = px(((xmin + xmax) / 2, ymin))
     text = f"blank {_fmt(xmax - xmin, d.units)} x {_fmt(ymax - ymin, d.units)} {d.units}"
@@ -398,3 +408,62 @@ def geometry(d: Dieline, line_type: str | None = None, region: Region | None = N
         "segments": out[:limit],
         "truncated": len(out) > limit,
     }
+
+
+FACE_SHORT = {"glue_lug": "GL", "glue_lug_ext_top": "GL ext", "glue_lug_ext_bottom": "GL ext"}
+
+
+def _face_labels(draw, d: Dieline, px, font) -> None:
+    """Each body panel and the glue lug named at its centre (GL, P4 ... P1), from the face map,
+    so a feature's crease can never be mistaken for a panel."""
+    fm = d.faces
+    faces = getattr(fm, "faces", None)
+    if not faces:
+        return
+    for f in faces.values():
+        if f.kind not in ("body", "lug"):
+            continue
+        cx = sum(p[0] for p in f.polygon) / len(f.polygon)
+        top = max(p[1] for p in f.polygon)
+        x, y = px((cx, top))
+        text = FACE_SHORT.get(f.id, f.id) + (f" ({f.role})" if f.role in ("end", "side") else "")
+        tw = draw.textlength(text, font=font)
+        draw.text((x - tw / 2, y + 4), text, fill=(90, 90, 90), font=font)
+
+
+def _callouts(draw, d: Dieline, px, font) -> None:
+    """Each feature's measured offsets (first copy on each face): a dimension line from its
+    reference to the edge or centre it was measured to, labelled with the distance as given."""
+    feats = d.extras.get("features") or []
+    fm = d.faces
+    if not feats or fm is None:
+        return
+    colour = (170, 0, 140)
+    for b in feats:  # type: ignore[union-attr]
+        for c in b.copies:
+            if not c.callouts:
+                continue
+            f = fm.faces.get(c.face)  # type: ignore[attr-defined]
+            if f is None:
+                continue
+            segs = c.outline or c.segs
+            if not segs:
+                continue
+            xs = [p[0] for s in segs for p in (s.start, s.end)]
+            ys = [p[1] for s in segs for p in (s.start, s.end)]
+            mid_flat = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+            mid = f.from_flat(mid_flat)
+            for co in c.callouts:
+                if co.axis == "y":
+                    a, b2 = f.to_flat((mid[0], co.at)), f.to_flat((mid[0], co.to_coord))
+                else:
+                    a, b2 = f.to_flat((co.at, mid[1])), f.to_flat((co.to_coord, mid[1]))
+                pa, pb = px(a), px(b2)
+                if math.dist(pa, pb) < 6:
+                    continue
+                draw.line([pa, pb], fill=colour, width=1)
+                for q in (pa, pb):
+                    draw.ellipse([q[0] - 2, q[1] - 2, q[0] + 2, q[1] + 2], fill=colour)
+                mark = {"near_edge": "edge", "far_edge": "far edge", "centre": "centre"}[co.to]
+                text = f"{b.id} {co.text} ({mark})"
+                draw.text(((pa[0] + pb[0]) / 2 + 4, (pa[1] + pb[1]) / 2 - 7), text, fill=colour, font=font)

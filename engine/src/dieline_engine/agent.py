@@ -26,9 +26,10 @@ from pydantic import ValidationError
 
 from . import designs, exports, files, models, render, web
 from .designs import BoxParams
-from .designstore import (DesignChanged, DesignStore, add_part, design_from_parts, new_design, remove_part,
-                          update_part)
+from .designstore import (DesignChanged, DesignStore, add_part, design_from_parts, new_design, refuse_stale,
+                          remove_part, set_features, update_part, with_features)
 from .settings import Settings, SettingsStore
+from .features import KINDS as _FEATURE_KINDS
 from .styles import STYLES
 
 log = logging.getLogger(__name__)
@@ -120,6 +121,16 @@ HSC tray's panels read upside down relative to it. When the user gives a \
 distance ("2 in down from the top score"), make sure you know whether it \
 runs to the feature's edge or its centre; ask if they didn't say.
 
+## Features (handholes, hand flaps, vents, windows, scores, notches, perforations, tear strips)
+Features are parameters and placements; the engine draws them. Add or change them with set_features (or features on create_box / update_part): items without an id are new, items with an id change that feature (fields left out keep their values), remove deletes by id. Try a change with dry_run first when unsure.
+- Placements are always as seen from OUTSIDE the folded box, on named faces or selectors (P2, end_panels, side_panels, top_flaps, ...), measured from a named reference line on that face (top_score, bottom_score, free_edge, glue_score, hinge, left, right, centre_x, centre_y; see list_faces). x needs a vertical reference, y a horizontal one. Never use blank coordinates, and never copy numbers from get_geometry into a placement to rebuild structure.
+- Every distance says whether it runs to the feature's near_edge, far_edge or centre. If the user didn't say ("2 inches down from the top"), ask which before placing it. "centred" means the assembled face centre, so opposite panels match.
+- Opposite faces (P1 and P3, P2 and P4) are mirrored left for right by default (mirror: position_only), so "2 in from the corner with P2" stays by P2 on both. Other multi-face selections need mirror: none or explicit pairs.
+- Defaults: the handhole is the shop's File_Box_1 obround, 3 5/8 x 1 3/8 with full-radius ends, long side horizontal; the perforation is its 3/16 cut / 3/16 tie rule. Every other default and every feature limit is provisional.
+- Check levels: geometry that can't exist (a feature touching or crossing another or a score, or outside its face) is refused with the reason; rule breaks are warnings (clearance, carry web, side web, glue zone, ...); notes are info. A feature that stops fitting after a resize becomes stale, isn't drawn and blocks export until it's placed again or removed.
+- Perforations, reverse creases and cut-scores aren't verified for CF2 or the sample table yet: those formats are blocked for such a design (the result's export_targets says why); the design itself is fine to show.
+- Read-back: after any feature change, restate each feature in plain words before moving on: its faces, its size, and whether each distance runs to the edge or the centre (the tool result's summary has these). Mention features in your reply as links, e.g. [handhole f1](feature:p1/f1), scoped to their part.
+
 ## Reference files and precedent
 search_files and read_file give read-only access to R&L's own files (old \
 ArtiosCAD designs, CF2/DXF exports, spec sheets, logs) in the synced OneDrive \
@@ -151,6 +162,114 @@ OPTIONS_SCHEMA = {
                    "bottom_flaps, top_lap, bottom_lap. hsc-gl: order, closure, use (tray|lid). tube-glued: order.",
 }
 PART_ARG = {"type": "string", "description": "Part id (p1, p2, ...) or label; needed when the design has several parts"}
+
+DIST = {"type": ["number", "string"],
+        "description": "A length in the part's units: a number, a fraction ('2 3/4'), sixteenths on inch parts "
+                       "('2:12') or an expression ('W/2 - 1/4', '2*CAL', 'D/3')"}
+AXIS = {
+    "description": "\"centred\" (the assembled face centre unless datum says otherwise), or {from, to, distance}: "
+                   "from a reference line on the face (x: a vertical line such as left, right, centre_x, a side "
+                   "score; y: a horizontal one such as top_score, bottom_score, free_edge, hinge, centre_y) to the "
+                   "feature's near_edge, far_edge or centre. From an edge the distance runs inward; from a "
+                   "centreline it's signed (+ right or up).",
+    "anyOf": [{"type": "string", "enum": ["centred"]},
+              {"type": "object", "properties": {"from": {"type": "string"},
+                                                "to": {"type": "string", "enum": ["near_edge", "far_edge", "centre"]},
+                                                "distance": DIST},
+               "required": ["from", "to", "distance"], "additionalProperties": False}],
+}
+PLACEMENT = {
+    "type": "object",
+    "description": "Where a feature goes, seen from OUTSIDE the folded box. No blank coordinates.",
+    "properties": {
+        "on": {"type": ["string", "array"], "items": {"type": "string"},
+               "description": "A face (P2, top_flap_P1, glue_lug) or selector (end_panels, side_panels, body_panels, "
+                              "top_flaps, top_outer_flaps, ...), or a list"},
+        "datum": {"type": "string", "enum": ["assembled", "material", "usable"],
+                  "description": "What centred means: the assembled face centre (default), the material centre, or "
+                                 "the centre of the face less its glue zone"},
+        "x": AXIS, "y": AXIS,
+        "pattern": {"type": "object", "description": "single (default); row/column {count, pitch} (centre to "
+                                                     "centre); grid {cols, rows, pitch_x, pitch_y}; spread {axis, "
+                                                     "count, inset}: count copies with equal gaps between insets "
+                                                     "from the face's usable edges (leave that axis's x or y out)",
+                    "properties": {"kind": {"type": "string", "enum": ["single", "row", "column", "grid", "spread"]},
+                                   "count": {"type": "integer", "minimum": 1}, "pitch": DIST,
+                                   "cols": {"type": "integer", "minimum": 1}, "rows": {"type": "integer", "minimum": 1},
+                                   "pitch_x": DIST, "pitch_y": DIST, "axis": {"type": "string", "enum": ["x", "y"]},
+                                   "inset": DIST},
+                    "required": ["kind"], "additionalProperties": False},
+        "rotation_deg": {"type": "number", "description": "Turn the shape about its centre (hand flaps: 0/90/180/270)"},
+        "mirror": {"type": "string", "enum": ["none", "position_only", "position_and_shape"],
+                   "description": "Opposite faces default to position_only (mirrored left for right). none: the same "
+                                  "placement on every face"},
+        "pairs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2,
+                                             "maxItems": 2},
+                  "description": "Explicit mirror pairs, only when they aren't opposite faces"},
+    },
+    "required": ["on"],
+    "additionalProperties": False,
+}
+ROUTE = {
+    "type": "object",
+    "description": "A straight line across adjacent faces joined by hinges, edge to edge. For scores, perforations "
+                   "and tear strips.",
+    "properties": {
+        "faces": {"type": ["string", "array"], "items": {"type": "string"},
+                  "description": "The faces crossed, in order, e.g. [\"P1\", \"P2\"] or \"body_panels\""},
+        "direction": {"type": "string", "enum": ["horizontal", "vertical"],
+                      "description": "In the first face's frame, seen from outside"},
+        "at": {"type": "object", "description": "On the first face: the reference (y for horizontal, x for "
+                                               "vertical) and the distance from it to the line",
+               "properties": {"from": {"type": "string"}, "distance": DIST},
+               "required": ["from", "distance"], "additionalProperties": False},
+        "slots": {"type": "string", "enum": ["stop", "jump"],
+                  "description": "jump: carry on across a slot between flaps (stationing continues)"},
+    },
+    "required": ["faces", "direction", "at"],
+    "additionalProperties": False,
+}
+FEATURE_ITEM = {
+    "type": "object",
+    "description": (
+        "One feature. id: leave out for a new one; give it to change that feature. kind and its fields: "
+        "handhole {shape obround|rect|d_shape|circle, width, height, diameter, corner_radius, flat, placement} "
+        "(default the File_Box_1 obround 3 5/8 x 1 3/8, long side horizontal); "
+        "hand_flap {profile obround|d_shape|rect|circle|angled, width, height, diameter, hinge top|bottom|left|right "
+        "(face frame), double_crease, relief_nicks, taper_deg, corner_radius, placement}; "
+        "vent {shape circle|obround|rect, diameter (default 1/2), width, height, placement (usually a pattern)}; "
+        "window {shape rect|rounded_rect|circle|ellipse, width, height, diameter, corner_radius, placement}; "
+        "score {route, side normal|reverse}; perforation {route, cut, tie, phase, crossing tie_at_creases|continuous}; "
+        "tear_strip {route (its centreline), width, start start|end, tab edge_tab|angled_tab|thumb_hole, tab_length, "
+        "rails perf|cut_score, glue_joint cross|stop}; "
+        "notch {on, edge (top, free_edge, ...), shape half_circle|v|rounded_rect, width, depth, corner_radius, "
+        "along (\"centred\" or {from, to, distance} along the edge), pattern (single or row)}."
+    ),
+    "properties": {
+        "id": {"type": "string"}, "kind": {"type": "string", "enum": list(_FEATURE_KINDS)},
+        "label": {"type": "string"},
+        "shape": {"type": "string"}, "profile": {"type": "string"},
+        "width": DIST, "height": DIST, "diameter": DIST, "depth": DIST, "corner_radius": DIST,
+        "flat": {"type": "string", "enum": ["top", "bottom", "left", "right"]},
+        "hinge": {"type": "string", "enum": ["top", "bottom", "left", "right"]},
+        "double_crease": {"type": "boolean"}, "relief_nicks": {"type": "boolean"}, "taper_deg": {"type": "number"},
+        "placement": PLACEMENT, "route": ROUTE,
+        "side": {"type": "string", "enum": ["normal", "reverse"]},
+        "cut": DIST, "tie": DIST, "phase": DIST,
+        "crossing": {"type": "string", "enum": ["tie_at_creases", "continuous"]},
+        "start": {"type": "string", "enum": ["start", "end"]},
+        "tab": {"type": "string", "enum": ["edge_tab", "angled_tab", "thumb_hole"]}, "tab_length": DIST,
+        "rails": {"type": "string", "enum": ["perf", "cut_score"]},
+        "glue_joint": {"type": "string", "enum": ["cross", "stop"]},
+        "on": {"type": ["string", "array"], "items": {"type": "string"}}, "edge": {"type": "string"},
+        "along": AXIS, "pattern": {"type": "object"},
+        "mirror": {"type": "string", "enum": ["none", "position_only", "position_and_shape"]},
+        "pairs": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+        "pointage": {"type": "number", "description": "Rule thickness in points, only if not the part's 2 pt"},
+    },
+    "additionalProperties": False,
+}
+FEATURE_LIST = {"type": "array", "items": FEATURE_ITEM, "maxItems": 40}
 
 
 def _tools() -> list[dict[str, Any]]:
@@ -186,6 +305,7 @@ def _tools() -> list[dict[str, Any]]:
                                               "add it as another part (a lid for a base, a second piece)."},
                     "label": {"type": "string", "description": "A short name for the part, e.g. 'base' or 'lid'"},
                     "quantity": {"type": "integer", "minimum": 1, "description": "How many per design (default 1)"},
+                    "features": {**FEATURE_LIST, "description": "Features to add with it (see set_features)"},
                     "dry_run": {"type": "boolean", "description": "Build and check it without changing the design"},
                 },
                 "required": ["style", "length", "width", "depth", "units", "board"],
@@ -210,7 +330,34 @@ def _tools() -> list[dict[str, Any]]:
                     "options": OPTIONS_SCHEMA,
                     "label": {"type": "string"},
                     "quantity": {"type": "integer", "minimum": 1},
+                    "features": {"type": "object", "description": "Feature changes in the same call (see set_features)",
+                                 "properties": {"items": FEATURE_LIST,
+                                                "remove": {"type": "array", "items": {"type": "string"}}},
+                                 "additionalProperties": False},
                     "dry_run": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "set_features",
+            "description": (
+                "Add, change or remove features on one part: handholes, hand flaps, vents, windows, extra scores, "
+                "notches, perforations, tear strips. Batch upsert by id: items without an id are new (the engine "
+                "gives each an id), items with an id change that feature (fields left out keep their values), "
+                "remove lists ids to delete. Placements are seen from OUTSIDE the folded box, from named "
+                "reference lines, and every distance says near_edge, far_edge or centre; ask the user when they "
+                "didn't say. A feature that can't be placed (outside its face, touching a score or another "
+                "feature) is refused with the reason. Returns each feature's faces and plain-words summary, the "
+                "checks and a picture with the measured offsets."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "part": PART_ARG,
+                    "items": FEATURE_LIST,
+                    "remove": {"type": "array", "items": {"type": "string"}, "description": "Feature ids to remove"},
+                    "dry_run": {"type": "boolean", "description": "Resolve and check without changing the design"},
                 },
                 "additionalProperties": False,
             },
@@ -246,6 +393,9 @@ def _tools() -> list[dict[str, Any]]:
                     "replace": {"type": "boolean",
                                 "description": "Replace an existing export of the same name (old files move to "
                                                "a 'superseded' folder). Only when the user has confirmed it."},
+                    "dxf_expand_perfs": {"type": "boolean",
+                                         "description": "Write perforations to the sample-table DXF as dashed cuts. "
+                                                        "Not verified on the table yet, so it stays blocked."},
                 },
                 "additionalProperties": False,
             },
@@ -408,11 +558,28 @@ INTERRUPTED = "[The previous turn was interrupted; any design change it made is 
 
 TOOL_KEYS = {
     "create_box": {"style", "length", "width", "depth", "units", "board", "options", "action", "label", "quantity",
-                   "dry_run"},
+                   "features", "dry_run"},
     "update_part": {"part", "style", "length", "width", "depth", "units", "board", "options", "label", "quantity",
-                    "dry_run"},
+                    "features", "dry_run"},
     "remove_part": {"part", "dry_run"},
+    "set_features": {"part", "items", "remove", "dry_run"},
 }
+
+
+def _feature_args(v: Any, what: str) -> tuple[list[Any] | None, list[Any] | None]:
+    """(items, remove) from a tool's features argument."""
+    if v is None:
+        return None, None
+    if isinstance(v, list):
+        return v, None
+    if not isinstance(v, dict) or set(v) - {"items", "remove"}:
+        raise ValueError(f"{what} must be {{items, remove}}")
+    items, remove = v.get("items"), v.get("remove")
+    if items is not None and not isinstance(items, list):
+        raise ValueError(f"{what}.items must be a list of features")
+    if remove is not None and (not isinstance(remove, list) or not all(isinstance(r, str) for r in remove)):
+        raise ValueError(f"{what}.remove must be a list of feature ids")
+    return items, remove
 
 
 def _bool_arg(args: dict[str, Any], key: str) -> bool:
@@ -883,7 +1050,8 @@ class Agent:
             raise DesignChanged("the design changed outside the chat (the user edited or replaced it); call "
                                 "view_design to see it, then try again")
 
-    def _mutate(self, s: Turn, change, call_id: str | None, dry_run: bool, focus: str | None = None) -> dict[str, Any]:
+    def _mutate(self, s: Turn, change, call_id: str | None, dry_run: bool, focus: str | None = None,
+                accept=None) -> dict[str, Any]:
         """Apply a change to the session's design from the turn's binding; on success the
         binding moves on. A stopped turn never commits."""
         self._check_cancel(s)
@@ -898,7 +1066,7 @@ class Agent:
                 raise TurnCancelled()
 
         payload = self.store.mutate(s.id, change, expected=s.binding, request_id=self._request_id(s, call_id),
-                                    dry_run=dry_run, guard=guard, focus=focus, origin="chat")
+                                    dry_run=dry_run, guard=guard, focus=focus, origin="chat", accept=accept)
         if not dry_run:
             self._advance(s, payload)
         return payload
@@ -921,7 +1089,8 @@ class Agent:
             out["design_checks"] = payload["design_checks"]
         if payload.get("dry_run"):
             out["dry_run"] = "nothing was changed"
-        png, info = render.render_png(designs.build(BoxParams.model_validate(chosen["params"])))
+        title = f"{chosen['label']} ({chosen['part_id']}) x{chosen['quantity']}: {chosen['name']}"
+        png, info = render.render_png(designs.build(BoxParams.model_validate(chosen["params"])), title=title)
         out["view"], out["_image"] = info, png
         return out
 
@@ -940,7 +1109,7 @@ class Agent:
     def _dispatch(self, s: Turn, name: str, args: dict[str, Any], call_id: str | None = None) -> dict[str, Any]:
         if name == "list_options":
             return designs.catalog()
-        if name in ("create_box", "update_part", "remove_part"):
+        if name in ("create_box", "update_part", "remove_part", "set_features"):
             replay = self.store.replay(s.id, self._request_id(s, call_id) or "")
             if replay is not None:  # a retry of a call already applied: its result, nothing done twice
                 self._advance(s, replay)
@@ -954,8 +1123,13 @@ class Agent:
             if name != "create_box":
                 self._check_bound(s)
         if name == "create_box":
-            fields = {k: v for k, v in args.items() if k not in ("action", "label", "quantity", "dry_run")}
+            fields = {k: v for k, v in args.items() if k not in ("action", "label", "quantity", "dry_run", "features")}
             params = BoxParams.model_validate(fields)
+            touched: list[str] = []
+            if args.get("features") is not None:
+                if not isinstance(args["features"], list):
+                    raise ValueError("features must be a list of features")
+                params, touched = with_features(params, args["features"], None)
             action = args.get("action", "replace_design")
             label, quantity, dry = _label_arg(args), _quantity_arg(args, 1), _bool_arg(args, "dry_run")
             cur = self.store.current(s.id)
@@ -968,7 +1142,8 @@ class Agent:
                 focus = "p1"
             else:
                 raise ValueError("action must be replace_design or add")
-            payload = self._mutate(s, change, call_id, dry, focus)
+            accept = (lambda p: refuse_stale(p, focus, touched)) if touched else None  # noqa: E731
+            payload = self._mutate(s, change, call_id, dry, focus, accept)
             return self._design_view(payload, focus)
         if name == "update_part":
             cur = self._read(s)
@@ -981,12 +1156,30 @@ class Agent:
                 options = {**base.get("options", {}), **(args.get("options") or {})}
             changed = bool(fields) or "options" in args
             params = BoxParams.model_validate({**base, **fields, "options": options}) if changed else None
+            items, remove = _feature_args(args.get("features"), "features")
+            touched = []
+            if items or remove:
+                params, touched = with_features(params or part.params, items, remove)
             label = _label_arg(args)
             quantity = _quantity_arg(args, None)
             if params is None and label is None and quantity is None:
                 raise ValueError("update_part needs at least one field to change")
+            # A resize keeps every feature and re-resolves it: one that no longer fits becomes stale
+            # (and blocks export). Only the features this call adds or changes must fit.
+            accept = (lambda p: refuse_stale(p, part.id, touched)) if touched else None  # noqa: E731
             payload = self._mutate(s, lambda d: update_part(d, part.id, params, label, quantity), call_id,
-                                   _bool_arg(args, "dry_run"), part.id)
+                                   _bool_arg(args, "dry_run"), part.id, accept)
+            return self._design_view(payload, part.id)
+        if name == "set_features":
+            cur = self._read(s)
+            part = cur.part(_part_arg(args))
+            items, remove = _feature_args({k: args[k] for k in ("items", "remove") if k in args}, "set_features")
+            if not items and not remove:
+                raise ValueError("set_features needs items to add or change, or ids to remove")
+            _, _, touched = set_features(cur, part.id, items, remove)  # validates before anything runs
+            accept = (lambda p: refuse_stale(p, part.id, touched)) if touched else None  # noqa: E731
+            payload = self._mutate(s, lambda d: set_features(d, part.id, items, remove)[0], call_id,
+                                   _bool_arg(args, "dry_run"), part.id, accept)
             return self._design_view(payload, part.id)
         if name == "remove_part":
             cur = self._read(s)
@@ -1079,12 +1272,14 @@ class Agent:
             replace = args.get("replace", False)
             if not isinstance(replace, bool):
                 raise ValueError("replace must be true or false")
+            expand = _bool_arg(args, "dxf_expand_perfs")
             cfg = self.settings.settings
             out = exports.export_design(
                 parts, cfg.resolved_output_dir(), filename, formats, replace, cfg.resolved_dxf_dir(),
                 design_id=snap.id, revision=snap.revision, design_checks=checks,
                 structure={"groups": payload["groups"], "links": payload["links"]},
-                check_cancel=lambda: self._check_cancel(s), on_pending=self._on_export_pending)
+                check_cancel=lambda: self._check_cancel(s), on_pending=self._on_export_pending,
+                dxf_expand_perfs=expand)
             if out["sample_table"]["status"] == "pending":
                 out["note"] = ("The sample-table files are waiting: tell the user to confirm the pickup in the "
                                "export bar when the table won't pick up. You can't move them yourself.")
