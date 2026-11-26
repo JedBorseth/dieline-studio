@@ -20,6 +20,14 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, parseCf2 } from "../lib/cf2";
 import { EngineError, request, subscribe } from "../lib/engine";
+import {
+  featurePaths,
+  isActionable,
+  type MmBox,
+  onFocusFeature,
+  regionToMm,
+  replaceLoses,
+} from "../lib/features";
 import { loadString, saveString } from "../lib/prefs";
 import {
   type BoxParams,
@@ -33,6 +41,7 @@ import {
   type ExportFormat,
   type ExportPlan,
   type ExportResult,
+  type FeatureInfo,
   type JobPart,
   type SampleTable,
   type OptionValue,
@@ -153,6 +162,46 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
   const [filePart, setFilePart] = useState(0);
   const fileShown = fileParts?.[filePart] ?? fileParts?.[0];
 
+  // Features: hovering one in the list (or a chat link, or a check) highlights it; clicking zooms to it.
+  const [hoverFeature, setHoverFeature] = useState<string | null>(null);
+  const [pickedFeature, setPickedFeature] = useState<string | null>(null);
+  const [focus, setFocus] = useState<{ box: MmBox; token: number } | null>(null);
+  const zoomTo = (region: readonly number[] | undefined) => {
+    const box = regionToMm(region, shown?.summary.units);
+    if (box) setFocus((f) => ({ box, token: (f?.token ?? 0) + 1 }));
+  };
+  const lit = hoverFeature ?? pickedFeature;
+  const highlight = useMemo(
+    () => (shown && lit ? featurePaths(shown.scene, { featureId: lit }, shown.summary.units) : []),
+    [shown, lit],
+  );
+  const ghosts = useMemo(
+    () => (shown ? featurePaths(shown.scene, { stale: true }, shown.summary.units) : []),
+    [shown],
+  );
+  // A feature link in the chat: switch to its part, highlight it and zoom to it.
+  const partsRef = useRef(parts);
+  partsRef.current = parts;
+  useEffect(
+    () =>
+      onFocusFeature(({ partId: pid, featureId }) => {
+        const part = partsRef.current.find((p) => p.part_id === pid) ?? (partsRef.current.length === 1 ? partsRef.current[0] : undefined);
+        if (!part) return;
+        setPartId(part.part_id ?? null);
+        setPickedFeature(featureId);
+        const f = part.features?.find((x) => x.id === featureId);
+        const box = regionToMm(f?.region, part.summary.units);
+        if (box) setFocus((old) => ({ box, token: (old?.token ?? 0) + 1 }));
+      }),
+    [],
+  );
+  const selectCheck = (c: CheckResult) => {
+    if (c.part_id && c.part_id !== shown?.part_id) setPartId(c.part_id);
+    if (c.feature_id) setPickedFeature(c.feature_id);
+    const f = c.feature_id ? shown?.features?.find((x) => x.id === c.feature_id) : undefined;
+    zoomTo(c.region ?? f?.region);
+  };
+
   // A status message (and reopen-notes dismissal) belongs to the dieline it was about;
   // a message queued for the incoming dieline is shown with it.
   // A message queued for the next dieline shown in its own session (never another's).
@@ -163,6 +212,8 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     pendingStatusRef.current = null;
     setNotesDismissed(false);
     setFilePart(0);
+    setHoverFeature(null);
+    setPickedFeature(null);
   }, [source]);
 
   const parsed = useMemo((): { doc: Cf2Doc | null; error: string | null } => {
@@ -214,15 +265,16 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     ctx: ShowContext,
     confirmed = false,
   ): Promise<void> => {
-    const baseParts = ctx.base?.parts?.length ?? (ctx.base ? 1 : 0);
-    // Replacing a design with several parts loses the others: ask first, and only in the session it
-    // started in. If the designer has moved to another chat meanwhile, the replacement is dropped.
+    // Replacing anything but one plain standard part (other parts, features) loses work: ask first, and
+    // only in the session it started in. If the designer has moved to another chat meanwhile, the
+    // replacement is dropped.
     if (!latest(ctx.sid, ctx.seq)) return; // the designer did something newer in that session
-    if (!confirmed && baseParts > 1 && next.origin === "form") {
+    const loses = replaceLoses(ctx.base);
+    if (!confirmed && loses && next.origin === "form") {
       if (ctx.sid !== sessionIdRef.current) return;
       setStatus({
         tone: "error",
-        text: `Replace the current design? Its ${baseParts - 1} other part${baseParts > 2 ? "s" : ""} will be lost.`,
+        text: loses,
         action: { label: "Replace", run: () => void showDesign(next, { ...ctx, seq: bump(ctx.sid) }, true) },
       });
       return;
@@ -645,7 +697,16 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
 
       <div className="relative min-h-0 flex-1 overflow-hidden bg-canvas">
         {doc ? (
-          <DielineCanvas doc={doc} visible={visible} fitToken={fitToken} onCursor={setCursor} onZoom={setZoom} />
+          <DielineCanvas
+            doc={doc}
+            visible={visible}
+            fitToken={fitToken}
+            onCursor={setCursor}
+            onZoom={setZoom}
+            highlight={source?.kind === "design" ? highlight : undefined}
+            ghosts={source?.kind === "design" ? ghosts : undefined}
+            focus={source?.kind === "design" ? focus : null}
+          />
         ) : (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">
             {parsed.error ? (
@@ -720,7 +781,18 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         </Alert>
       )}
       {shown && <Summary design={shown} />}
-      {shown && <Checks design={shown} designChecks={design?.design_checks ?? []} />}
+      {shown?.features?.length ? (
+        <FeatureList
+          features={shown.features}
+          lit={lit}
+          onHover={setHoverFeature}
+          onPick={(f) => {
+            setPickedFeature(f.id);
+            zoomTo(f.region);
+          }}
+        />
+      ) : null}
+      {shown && <Checks design={shown} designChecks={design?.design_checks ?? []} onSelect={selectCheck} />}
 
       <footer className="flex h-7 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t px-3 text-[11px] text-muted-foreground tabular-nums">
         {doc && (
@@ -909,14 +981,16 @@ function ExportBar({
           </Label>
           <Input size="sm" id={`${uid}-name`} value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
         </div>
-        <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
-          <Checkbox checked={formats.cf2} onCheckedChange={toggle("cf2")} />
-          CF2 (ArtiosCAD)
-        </Label>
-        <Label className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs">
-          <Checkbox checked={formats.dxf} onCheckedChange={toggle("dxf")} />
-          DXF (sample table)
-        </Label>
+        {(["cf2", "dxf"] as const).map((f) => {
+          const r = p?.formats?.[f];
+          return (
+            <Label key={f} className="h-8 cursor-pointer gap-1.5 font-normal text-xs sm:text-xs" title={r?.blocking.join("\n")}>
+              <Checkbox checked={formats[f]} onCheckedChange={toggle(f)} />
+              {f === "cf2" ? "CF2 (ArtiosCAD)" : "DXF (sample table)"}
+              {r && !r.ready && <CircleXIcon className="size-3.5 text-destructive" aria-label="blocked" />}
+            </Label>
+          );
+        })}
         <Button type="submit" size="sm" disabled={busy || !chosen.length || blocked}>
           {busy && <Spinner />}
           {p?.replaces.length ? "Save and replace…" : "Save"}
@@ -931,6 +1005,13 @@ function ExportBar({
               {b}
             </p>
           ))}
+          {(["cf2", "dxf"] as const)
+            .filter((f) => !formats[f] && p.formats?.[f] && !p.formats[f]!.ready)
+            .map((f) => (
+              <p key={f} className="text-muted-foreground">
+                {f.toUpperCase()} isn't available for this design: {p.formats![f]!.blocking.join("; ")}
+              </p>
+            ))}
           {p.files.length > 0 && (
             <ul className="flex flex-col gap-0.5 text-muted-foreground">
               {p.files.map((f) => (
@@ -1020,6 +1101,63 @@ function Summary({ design }: { design: Design }) {
   );
 }
 
+function FeatureList({
+  features,
+  lit,
+  onHover,
+  onPick,
+}: {
+  features: FeatureInfo[];
+  lit: string | null;
+  onHover: (id: string | null) => void;
+  onPick: (f: FeatureInfo) => void;
+}) {
+  const stale = features.filter((f) => f.status === "stale").length;
+  return (
+    <Collapsible className="shrink-0 border-t" defaultOpen>
+      <CollapsibleTrigger className="group flex h-9 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+        <span className="font-medium">Features</span>
+        <span className="text-muted-foreground">{features.length}</span>
+        {stale > 0 && <span className="text-destructive-foreground">· {stale} stale (blocks export)</span>}
+        <span className="flex-1" />
+        <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsiblePanel>
+        <ul className="scroll-thin flex max-h-40 flex-col gap-0.5 overflow-y-auto px-1.5 pb-2" onMouseLeave={() => onHover(null)}>
+          {features.map((f) => (
+            <li key={f.id}>
+              <button
+                type="button"
+                className={cn(
+                  "flex w-full items-start gap-2 rounded-md px-1.5 py-1 text-left text-xs outline-none hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                  lit === f.id && "bg-accent",
+                )}
+                onMouseEnter={() => onHover(f.id)}
+                onFocus={() => onHover(f.id)}
+                onBlur={() => onHover(null)}
+                onClick={() => onPick(f)}
+                title={f.status === "stale" ? f.reason : "Click to zoom to it"}
+              >
+                <span className="flex h-[1lh] items-center" aria-hidden>
+                  {f.status === "stale" ? CHECK_ICON.stale : <CrosshairIcon className="size-3.5 shrink-0 text-muted-foreground" />}
+                </span>
+                <span className="min-w-0 wrap-anywhere">
+                  <span className="font-medium">
+                    {f.label} {f.id}
+                  </span>{" "}
+                  <span className="text-muted-foreground">
+                    {f.status === "stale" ? `stale: ${f.reason ?? ""}` : f.summary}
+                  </span>
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </CollapsiblePanel>
+    </Collapsible>
+  );
+}
+
 const CHECK_ICON: Record<CheckStatus, React.ReactNode> = {
   pass: <CircleCheckIcon className="size-3.5 shrink-0 text-success" />,
   warn: <TriangleAlertIcon className="size-3.5 shrink-0 text-warning" />,
@@ -1046,16 +1184,29 @@ const SHOWN_LABEL: ReadonlySet<CheckStatus> = new Set(["stale", "unavailable", "
 /** Statuses that need no attention: they don't count against "n/m pass". */
 const QUIET: ReadonlySet<CheckStatus> = new Set(["pass", "info", "not_applicable"]);
 
-function Checks({ design, designChecks }: { design: Design; designChecks: CheckResult[] }) {
-  // The part's checks, then the design's own (fit links, groups), which block export too.
-  const checks = [...designChecks, ...design.checks];
+function Checks({
+  design,
+  designChecks,
+  onSelect,
+}: {
+  design: Design;
+  designChecks: CheckResult[];
+  /** A check about a feature or a region: switch to it, highlight it and zoom. */
+  onSelect?: (c: CheckResult) => void;
+}) {
+  // The part's checks, then the design's own (fit links, groups), which block export too. Actionable ones
+  // (geometry, features, ...) come first, apart from calibration, board and machine notices.
+  const all = [...designChecks, ...design.checks];
+  const actionable = all.filter(isActionable);
+  const checks = [...actionable, ...all.filter((c) => !isActionable(c))];
   const overall: Design["overall"] = designChecks.some((c) => c.status === "fail" || c.status === "stale")
     ? "fail"
     : design.overall;
-  const [open, setOpen] = useState(overall === "fail");
+  const [open, setOpen] = useState(overall === "fail" || actionable.length > 0);
   useEffect(() => {
-    if (overall === "fail") setOpen(true);
-  }, [design.id, overall]);
+    if (overall === "fail" || actionable.length > 0) setOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [design.id, overall, actionable.length]);
   // info and not_applicable don't take part; everything else either passed or needs a look.
   const counted = checks.filter((c) => c.status !== "info" && c.status !== "not_applicable");
   const passed = counted.filter((c) => c.status === "pass").length;
@@ -1069,13 +1220,27 @@ function Checks({ design, designChecks }: { design: Design; designChecks: CheckR
         <span className="text-muted-foreground">
           {passed}/{counted.length} pass
         </span>
+        {actionable.length > 0 && (
+          <span className="text-warning-foreground">
+            · {actionable.length} need{actionable.length === 1 ? "s" : ""} a look
+          </span>
+        )}
         <span className="flex-1" />
         <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
       </CollapsibleTrigger>
       <CollapsiblePanel>
         <ul className="scroll-thin flex max-h-56 flex-col gap-1.5 overflow-y-auto px-3 pt-0.5 pb-3">
-          {checks.map((c) => (
-            <li key={c.id} className="flex items-start gap-2 text-xs leading-snug">
+          {checks.map((c, i) => (
+            <li
+              key={c.id}
+              className={cn(
+                "flex items-start gap-2 text-xs leading-snug",
+                i === actionable.length && actionable.length > 0 && "mt-1 border-t pt-2",
+                onSelect && (c.feature_id || c.region) && "cursor-pointer rounded hover:bg-accent/40",
+              )}
+              title={c.feature_id || c.region ? "Show it on the dieline" : undefined}
+              onClick={onSelect && (c.feature_id || c.region) ? () => onSelect(c) : undefined}
+            >
               <span className="flex h-[1lh] items-center" aria-hidden>
                 {CHECK_ICON[c.status]}
               </span>

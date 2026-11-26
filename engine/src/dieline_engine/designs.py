@@ -10,7 +10,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 from .boards import BOARDS, DEFAULT_BOARD, get_board
 from .cf2 import read_cf2, write_cf2
@@ -68,6 +68,42 @@ class BoxParams(BaseModel):
     units: Literal["in", "mm"] = "in"
     board: str = Field(default=DEFAULT_BOARD, description="ArtiosCAD board code, e.g. '32 C KR'")
     options: dict[str, Any] = Field(default_factory=dict, description="Style options (see list_options)")
+    # Features on the part (features.py): parameters and placements, each with a stable engine-made id.
+    features: list[dict[str, Any]] = Field(default_factory=list, description="Features (see set_features)")
+
+    @field_validator("features", mode="before")
+    @classmethod
+    def _features(cls, v: Any) -> list[dict[str, Any]]:
+        from .features import MAX_FEATURES, normalize  # noqa: PLC0415
+
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            raise ValueError("features must be a list")
+        if len(v) > MAX_FEATURES:
+            raise ValueError(f"a part can have at most {MAX_FEATURES} features")
+        out, seen, n = [], set(), 0
+        for item in v:
+            fid = item.get("id") if isinstance(item, dict) else None
+            if fid is None:  # given without ids (a hand-written record): number them
+                n += 1
+                while f"f{n}" in seen or any(isinstance(x, dict) and x.get("id") == f"f{n}" for x in v):
+                    n += 1
+                fid = f"f{n}"
+            if not isinstance(fid, str) or not (len(fid) > 1 and fid[0] == "f" and fid[1:].isdigit()):
+                raise ValueError(f"feature id {fid!r} isn't a feature id (f1, f2, ...)")
+            if fid in seen:
+                raise ValueError(f"feature {fid} is listed twice")
+            seen.add(fid)
+            out.append(normalize(item, fid))
+        return out
+
+    @model_serializer(mode="wrap")
+    def _dump(self, handler: Any) -> dict[str, Any]:
+        out = handler(self)
+        if not out.get("features"):
+            out.pop("features", None)  # a part without features reads exactly as before
+        return out
 
     @field_validator("length", "width", "depth", mode="before")
     @classmethod
@@ -88,7 +124,29 @@ class BoxParams(BaseModel):
 def build(params: BoxParams) -> Dieline:
     style = get_style(params.style)
     board = get_board(params.board)
-    return style.make(params.dims_in(), board, params.options)
+    d = style.make(params.dims_in(), board, params.options)
+    if params.features:
+        from . import features  # noqa: PLC0415
+
+        features.apply(d, params.features, params, board)
+        _feature_meta(d)
+    return d
+
+
+def _feature_meta(d: Dieline) -> None:
+    """Summary values recomputed from the finished drawing, never carried over from the standard's."""
+    from .features import Built  # noqa: PLC0415
+
+    built: list[Built] = d.extras.get("features") or []  # type: ignore[assignment]
+    w, h = d.size()
+    d.meta["blank_in"] = {"width": round(w, 6), "height": round(h, 6)}
+    d.meta["blank_area_sqft"] = round(w * h / 144, 3)
+    lengths = {t.value: round(sum(x.length for x in d.of_type(t)), 4)
+               for t in (LineType.CUT, LineType.CREASE, LineType.PERFORATION, LineType.SCORE)}
+    d.meta["rule_length_in"] = {k: v for k, v in lengths.items() if v or k in ("cut", "crease")}
+    # Anything that needs a die: holes, hand flaps, notches, perforations, tear strips (an extra score doesn't).
+    d.meta["die_cut_features"] = sum(1 for b in built if b.status == "ok" and b.kind != "score")
+    d.meta["features"] = [{"id": b.id, "kind": b.kind, "status": b.status} for b in built]
 
 
 class GeometryRefused(ValueError):
@@ -98,7 +156,7 @@ class GeometryRefused(ValueError):
 
 def _validated(params: BoxParams) -> tuple[Dieline, list]:
     dieline = build(params)
-    report = validate(dieline)
+    report = dieline.extras.get("report") or validate(dieline)
     if not report.ok:
         issues = "; ".join(i.message for i in report.invalid[:3])
         raise GeometryRefused(f"these parameters give geometry that can't be made: {issues}")
@@ -107,7 +165,9 @@ def _validated(params: BoxParams) -> tuple[Dieline, list]:
 
 def create_box(params: BoxParams) -> dict:
     dieline, results = _validated(params)
-    return {
+    from .rules import readiness  # noqa: PLC0415
+
+    out = {
         "id": uuid.uuid4().hex[:12],
         "name": dieline.name,
         "params": params.model_dump(),
@@ -115,7 +175,12 @@ def create_box(params: BoxParams) -> dict:
         "checks": [r.to_dict() for r in results],
         "overall": overall(results),
         "summary": dieline.meta,
+        # Each export target's readiness: a target-specific block (an unverified rule) isn't in overall.
+        "targets": readiness(dieline),
     }
+    if params.features:
+        out["features"] = [b.to_dict() for b in dieline.extras.get("features", [])]  # type: ignore[union-attr]
+    return out
 
 
 def face_map(params: BoxParams, full: bool = False) -> dict:
@@ -129,13 +194,23 @@ def face_map(params: BoxParams, full: bool = False) -> dict:
 
 def agent_view(design: dict) -> dict:
     """What the model sees about a design: facts and checks, never geometry."""
-    return {
+    out = {
         "name": design["name"],
         "params": design["params"],
         "summary": design["summary"],
         "overall": design["overall"],
         "checks": design["checks"],
     }
+    if design.get("features"):
+        # Compact: what the read-back needs, no coordinates.
+        out["features"] = [{k: f[k] for k in ("id", "kind", "label", "status", "faces", "copies", "summary",
+                                              "reason") if k in f} for f in design["features"]]
+    targets = design.get("targets") or {}
+    blocked = {fmt: t["blocking"] for fmt, t in targets.items() if not t["ready"]}
+    if blocked:
+        out["export_targets"] = {"blocked": blocked, "note": "the design is fine to show; only these formats can't "
+                                                             "be exported until the rule is verified"}
+    return out
 
 
 _SAFE = re.compile(r"[^A-Za-z0-9._ -]+")
@@ -175,24 +250,37 @@ class TargetBlocked(DesignCheckFailed):
 
 # Rule types each target can carry today. Only cut and crease are verified on
 # ArtiosCAD import and the sample table (docs/DESIGN-SYSTEM.md, "Rule types
-# and export capability"); everything else is blocked until it is.
+# and export capability"); everything else is blocked until it is. The full
+# table, with pointage, crease side and perforation parameters, is rules.py's.
 VERIFIED_RULES = {"cf2": {LineType.CUT, LineType.CREASE}, "dxf": {LineType.CUT, LineType.CREASE}}
 
 
-def check_rules(dieline: Dieline, formats: list[str]) -> None:
-    used = {s.type for s in dieline.segments if s.type != LineType.ANNOTATION}
+def check_rules(dieline: Dieline, formats: list[str], expand_perfs: bool = False) -> None:
+    from .rules import blocks  # noqa: PLC0415
+
     for fmt in formats:
-        blocked = sorted(t.value for t in used - VERIFIED_RULES[fmt])
-        if blocked:
-            raise TargetBlocked(f"{fmt.upper()} not exported: {', '.join(blocked)} isn't verified for "
-                                f"{'ArtiosCAD import' if fmt == 'cf2' else 'the sample table'} yet")
+        why = blocks(dieline, fmt, expand_perfs=expand_perfs)
+        if why:
+            raise TargetBlocked(f"{fmt.upper()} not exported: {'; '.join(why)}")
 
 
-def check_outputs(dieline: Dieline, texts: dict[str, str]) -> None:
+def check_outputs(dieline: Dieline, texts: dict[str, str], expand_perfs: bool = False) -> None:
     """Validate each output as reconstructed from its own rounded geometry
-    (docs/DESIGN-SYSTEM.md, "Contact and disposition rules")."""
+    (docs/DESIGN-SYSTEM.md, "Contact and disposition rules"). An expanded
+    perforation DXF is compared with the design's expanded representation, and
+    that representation must pass the topology rules too."""
     design_islands = len(validate(dieline).islands)
+    original = dieline
     for fmt, text in texts.items():
+        dieline = original
+        if fmt == "dxf" and expand_perfs:
+            from .rules import expand_perforations  # noqa: PLC0415
+
+            dieline = expand_perforations(original)
+            rep = validate(dieline)
+            if not rep.ok:
+                raise TargetBlocked(f"DXF not exported: the perforations as dashed cuts break the rules: "
+                                    f"{rep.invalid[0].message}")
         try:
             # write_dxf always writes inches; read it back as such, with no unit guessing.
             back = read_cf2(text).dieline if fmt == "cf2" else read_dxf(text, "in", strict=True)[0]
@@ -236,7 +324,14 @@ def open_job(record: Any, mode: str = "regenerate") -> dict:
 
 
 def catalog() -> dict:
+    from .features import HANDHOLE, KINDS, PROVISIONAL  # noqa: PLC0415
+    from .rules import table  # noqa: PLC0415
+
     return {
+        "features": {"kinds": list(KINDS), "handhole_default": {**HANDHOLE, "source": "File_Box_1 (shop file)"},
+                     "perforation_default": {"cut": "3/16", "tie": "3/16", "source": "File_Box_1 (shop file)"},
+                     "provisional": PROVISIONAL},
+        "export_capability": table(),
         "styles": [s.to_dict() for s in STYLES.values()],
         "boards": [
             {

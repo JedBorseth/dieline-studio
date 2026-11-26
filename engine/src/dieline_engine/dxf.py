@@ -33,8 +33,14 @@ def _num(v: float) -> str:
     return "0" if s in ("-0", "") else s
 
 
-def write_dxf(dieline: Dieline) -> str:
-    """The dieline as DXF R12 text, in inches."""
+def write_dxf(dieline: Dieline, expand_perfs: bool = False) -> str:
+    """The dieline as DXF R12 text, in inches. `expand_perfs` writes each
+    perforation as its dashed cut pieces (rules.expand_perforations), a
+    representation of its own that isn't verified on the sample table yet."""
+    if expand_perfs:
+        from .rules import expand_perforations  # noqa: PLC0415
+
+        dieline = expand_perforations(dieline)
     k = 1.0 if dieline.units == "in" else 1 / 25.4
     manufactured = cutting_order(dieline)
     unsupported = sorted({s.type.value for s in manufactured if s.type not in DXF_COLOURS})

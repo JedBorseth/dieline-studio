@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, toSvgPath } from "../lib/cf2";
+import type { MmBox } from "../lib/features";
 
 export const KIND_LABELS: Record<LineKind, string> = {
   cut: "Cut",
@@ -23,6 +24,12 @@ interface Props {
   fitToken: number; // bump to re-fit
   onCursor: (pt: { x: number; y: number } | null) => void;
   onZoom: (pxPerMm: number) => void;
+  /** SVG paths (mm, y negated) drawn over the dieline in the accent colour: the feature in focus. */
+  highlight?: string[];
+  /** Stale features' ghosts: where they were, drawn faint and dashed (never manufactured). */
+  ghosts?: string[];
+  /** Zoom to this box (mm, y up) whenever token changes. */
+  focus?: { box: MmBox; token: number } | null;
 }
 
 function fitBox(doc: Cf2Doc): ViewBox {
@@ -34,7 +41,14 @@ function fitBox(doc: Cf2Doc): ViewBox {
   return { x: xmin - pad, y: -ymax - pad, w: w + 2 * pad, h: h + 2 * pad };
 }
 
-export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Props) {
+function boxView(b: MmBox): ViewBox {
+  const w = Math.max(b.xmax - b.xmin, 1);
+  const h = Math.max(b.ymax - b.ymin, 1);
+  const pad = Math.max(w, h) * 0.6 + 10; // some context around it
+  return { x: b.xmin - pad, y: -b.ymax - pad, w: w + 2 * pad, h: h + 2 * pad };
+}
+
+export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom, highlight, ghosts, focus }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [view, setView] = useState<ViewBox>(() => fitBox(doc));
   const drag = useRef<{ x: number; y: number } | null>(null);
@@ -43,6 +57,10 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
   const endDrag = () => (drag.current = null);
 
   useEffect(() => setView(fitBox(doc)), [doc, fitToken]);
+  useEffect(() => {
+    if (focus) setView(boxView(focus.box));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus?.token]);
 
   const paths = useMemo(
     () => doc.primitives.map((p, i) => ({ key: i, type: p.type, d: toSvgPath(p) })),
@@ -131,6 +149,8 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom }: Prop
       {paths.map(
         (p) => visible[p.type] && <path key={p.key} d={p.d} className={`ln ln-${p.type}`} />,
       )}
+      {ghosts?.map((d, i) => <path key={`g${i}`} d={d} className="ln ln-ghost" />)}
+      {highlight?.map((d, i) => <path key={`h${i}`} d={d} className="ln ln-highlight" />)}
     </svg>
   );
 }

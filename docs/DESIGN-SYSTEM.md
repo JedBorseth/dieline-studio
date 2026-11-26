@@ -1,6 +1,6 @@
 # Design system: features, partitions, the panel builder and artwork
 
-Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Not built yet. For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
+Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Phases 1 (foundations) and 2 (features on standards) are built; see [Phase 2 as built](#phase-2-as-built) for the readings taken where this spec left a choice. For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Today the app draws four R&L standards and nothing else. Designers also need handholes, vents, extra scores, partitions, pads, inserts, trays, wraps and one-off changes to a standard. About half of this year's R&L designs were drawn by hand rather than from a standard, so this is most of the work.
 
@@ -1032,10 +1032,10 @@ If regenerating fails, the as-exported snapshot is still viewable.
    - manifest exports: path ownership, stem locks, the transaction journal with roll-forward and roll-back, and the sample-table pickup
    - the selector test matrix: both panel orders, both joints, L = W, HSC_GL tray and lid, tube with no flaps, extended lug, mixed flap styles
    - CF2 full circles as two arcs, and DXF cutting order
-2. **Features on standards**
+2. **Features on standards** (built, 2026-11-26; the import and cut fixture is still to do)
    - handholes, hand flaps, vents, windows, extra scores, notches
    - perforations and tear strips, with rule specs and the capability table
-   - **before** perf, reverse score or partial cut can export: an import and cut fixture covering obround and circular arcs, mirrored arcs, perf, reverse score and mixed pointage, checked in ArtiosCAD and on the sample table
+   - **before** perf, reverse score or partial cut can export: an import and cut fixture covering obround and circular arcs, mirrored arcs, perf, reverse score and mixed pointage, checked in ArtiosCAD and on the sample table. Until then those targets are blocked.
    - feature checks, machine capability fields, and the agent tools
 3. **Partitions**
    - the crossing model, all four input modes and `choose_layout`
@@ -1052,6 +1052,39 @@ If regenerating fails, the as-exported snapshot is still viewable.
 6. **Calibration:** compare partitions and each builder pattern with real R&L designs, and replace the provisional values.
 
 Each phase gets the two-reviewer review (Sol 6.2 and Gemini Neon) before it's committed.
+
+## Phase 2 as built
+
+Readings taken where the spec left a choice, each the safer one. Change them here first if the shop decides otherwise.
+
+**Placement**
+
+- `datum: usable` is the face less its glue landing zone. A spread's insets run from that usable edge, so vents on P1 stay out of the glue zone.
+- A pattern's `centre` is the pattern box's centre; a single copy's is the shape's own datum.
+- Mirroring: the placement as given applies to the first face of each pair in the selector's order, and the second face gets it mirrored left for right. A multi-face selection that can't be paired completely (P1 and P2, or anything with the glue lug) is refused unless it says `mirror: none` or gives `pairs`.
+- A face named by id (`P1`) records its role when the feature is set; if a later order swap changes that role, the feature is stale. A role selector (`end_panels`) follows the role.
+
+**Features**
+
+- Defaults carry their unit (`3 5/8 in`), so they mean the same on a millimetre part.
+- Hand flaps turn only in 90° steps; the turn is applied to the profile's size and the hinge is then named in the face frame. Obround and circle flaps hinge on a long side only, with a secant hinge inset to the next 1/32 above `r(1 − cos 35°)` (1/8 on the File_Box_1 obround). Distances measure the opening, not the outer crease. A D-shape's default corners leave a straight start at the hinge, so a relief nick continues the cut in line.
+- Routes (scores, perforations, tear strips) are straight, from the first face's edge to the last face's, across faces joined by hinges, or over a slot of up to 1/2 in with `slots: jump`. Starting or stopping inside a face isn't offered yet.
+- Tear strips: rails are perforations (the File_Box_1 rule) or cut-scores. `glue_joint: cross` (the default) carries a P1-to-P4 strip over the glue lug. Edge tabs need the strip to start at a cut edge. Width 3/4 in and tab 1/2 in are provisional.
+- Notches go on straight cut edges, at least 1/8 in from the ends of the straight cut and from the face's corners, and are part of the outline operation. A half-circle notch is half its width deep.
+- Ellipse windows are four-centre ovals (true arcs, tangent at the joins); the summary gives the largest gap from the ellipse.
+- A feature placed wholly inside another's opening leaves an island: drawn, export blocked, as the contact table says for islands.
+
+**Checks**
+
+- The combined ligament is the board between a handhole (or hand flap) and the nearest other cut, perforation or score above it, against the carry-web limit.
+- An overlap band's matching cut-out is any feature on the opposite flap.
+- An extra score in the glue zone warns only when the joint is outside (the lug lands on P1's outside); cuts and perforations there always warn.
+- The slotter's die-cutting isn't confirmed, so a part with a die-cut feature isn't listed for it. An extra score alone doesn't count as die-cut.
+
+**Exports**
+
+- In the expanded sample-table perforation, a tie is centred on every crease the path crosses and on a crease it ends on; a cut piece trimmed shorter than half a tie is dropped. The expansion must pass the topology rules (a cut on a crease is invalid), and the target stays blocked as unverified.
+- A feature can carry its own pointage; the CF2 writer then writes it per operation, and mixed pointage blocks CF2.
 
 ## Open questions
 

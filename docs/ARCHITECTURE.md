@@ -16,7 +16,7 @@ How the app is put together. For the reasons behind it see [CONTEXT.md](CONTEXT.
 │  Tauri shell (app/src-tauri/src/engine.rs)                                  │
 │                           │ JSON-RPC lines on stdin/stdout                  │
 │  Python sidecar: dieline-engine (engine/)                                   │
-│    rpc.py ─ designs.py ─ styles/ ─ geometry.py ─ cf2.py/dxf.py ─ checks.py  │
+│    rpc.py ─ designs.py ─ styles/ ─ features.py ─ cf2.py/dxf.py ─ checks.py  │
 │       └─ agent.py ── HTTPS ──► OpenRouter (user's API key) ──► model provider│
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -31,12 +31,12 @@ Line-delimited JSON-RPC 2.0. TypeScript types are in `app/src/lib/protocol.ts`, 
 
 | Method | Purpose |
 |---|---|
-| `engine.info` | Version, styles, boards, settings |
+| `engine.info` | Version, styles, boards, feature defaults, the export capability table, settings |
 | `box.create` | Parameters → design (CF2 text, checks, summary), without storing it |
 | `design.replace` | The form's Generate and a reopened job: a new design for the session (`designstore.py`), with an id and revision 1 |
 | `design.get` | The session's current design, or null |
-| `box.export` | Write every part's `.cf2` and/or `.dxf` (`formats`) plus the `.dieline.json` manifest, from the session's design at an exact `design_id` and `revision` (refused if it has changed since), or from `params`. Refuses an existing name with error `-32001` unless `overwrite`; a held folder lock is `-32003`, an abandoned one `-32004` (retry with `break_lock`). The result says whether the sample-table files are `published` or `pending`. |
-| `export.plan` | What an export would write (files per part, replaced files, whether the sample table needs a pickup) and whether it can, without writing |
+| `box.export` | Write every part's `.cf2` and/or `.dxf` (`formats`) plus the `.dieline.json` manifest, from the session's design at an exact `design_id` and `revision` (refused if it has changed since), or from `params`. Refuses an existing name with error `-32001` unless `overwrite`; a held folder lock is `-32003`, an abandoned one `-32004` (retry with `break_lock`). The result says whether the sample-table files are `published` or `pending`. `dxf_expand_perfs` writes perforations as dashed cuts (unverified, so blocked for now). |
+| `export.plan` | What an export would write (files per part, replaced files, whether the sample table needs a pickup) and whether it can, without writing; `formats` gives each format's own readiness |
 | `export.pickup` | The designer confirmed the sample table is idle: move a pending set in (`job_path`, `txn`) |
 | `export.recover` | At start: finish or undo exports a crash interrupted |
 | `job.open` | Reopen a job record: `mode: "exported"` shows the record's own snapshot (v2), `"regenerate"` rebuilds every part with today's rules and lists what changed; both say whether the files on disk are still that set |
@@ -48,7 +48,7 @@ Notifications use method `event` with a `type`: `engine.ready`, `chat.text`, `ch
 
 ## Designs, revisions and parts
 
-The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, for highlighting later. A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
+The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, provenance (structure or feature), `feature_id` and `face_id` (a structure hinge's face is the face it hinges), and stale features' ghosts. A part's payload also lists its features as resolved (faces, copies, a plain-words summary, status) and each export target's readiness (`targets`). A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
 
 ## Styles, boards and units
 
@@ -64,6 +64,14 @@ Publishing (`publish.py`) changes each destination whole or not at all. Every ro
 The sample-table folder (Settings) is a second transaction after the main one commits. Its files are staged before the main commit, in `.<folder>.dieline-pending/` beside it, with its journal, its archive (`superseded/`) and its ownership index: nothing but finished DXFs ever lands in the folder. One new file moves in at once; several, or a replacement, wait until the designer confirms the table isn't picking up (`export.pickup`, offered in a row of its own under the preview, also for the chat's exports). The manifest records what is physically at the table, so a newer export over a set still waiting replaces the right files.
 - DXF R12 in the format the shop sends to the AOLCUT sample table (`dxf.py`): inches, layer `Design`, colour 1 cut, 2 crease. Entities are in cutting order: creases, interior cuts, then the outer perimeter. CF2 writes full circles as two half arcs.
 
+Features (phase 2 of [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md)): a part's features are parameters and placements stored on it (`BoxParams.features`, each with an engine-made id `f1`, `f2`, ...), drawn after the standard:
+
+- `placement.py`: the placement engine. A selector, references on the face (x from a vertical line, y from a horizontal one), `to: near_edge | far_edge | centre` (required), patterns (row, column, grid, spread), and mirroring of opposite faces. Anything with a bounding box around a datum can be placed with it; phase 4's artwork will be.
+- `expressions.py`: typed length and scalar expressions for distances and sizes (`W/2 - 1/4`, `2*CAL`, `2:12`, `50mm`), never run through `eval`.
+- `shapes.py`: library outlines in lines and true arcs: obround, rounded rectangle, circle, D-shape, a four-centre oval for ellipses, hand-flap profiles (with the secant hinge) and notch profiles.
+- `features.py`: handholes, hand flaps, vents, windows, extra scores, notches, perforations and tear strips, built as typed operations that declare their contacts (a hand-flap cut ends on its hinge, a score on the outline, a perforation crosses a crease). Scores, perforations and tear strips follow a straight route across hinged faces, with continuous stationing over jumped slots. A feature that can't be placed is stale: ghosted, not manufactured, export blocked.
+- `rules.py`: a rule spec per operation (cut, crease with its side, perforation with cut, tie, phase and crossing policy, cut-score, pointage) and each target's capability table. Only cut and crease at 2 pt are verified in CF2, and cut and crease in the sample-table DXF; anything else blocks that target, with the reason, while the design stays drawn. The DXF can also write perforations as dashed cuts (a tie centred on each crease), a representation of its own that's unverified and goes through the topology rules.
+
 Faces: every standard carries a face map (`faces.py`), built from the same blank as the drawing: named faces with outside-view frames, assembled and material centres, reference lines, keep-out zones, and the hinge graph (directed axes, IL/OG bend offsets). HSC_GL has a `use` option (tray or lid) that changes which way is up, never the drawing.
 
 Checks:
@@ -74,6 +82,10 @@ Checks:
 - which R&L machine's sheet limits take the blank: a screen that warns, never a reason to block an export. The slotter can't turn a blank: its height runs with the feed. Skip-feed is reported.
 - two checks from the shop's Preflight profile: matching panels within CAL + 1/32, and 2-pt rules only up to 3/16" caliper
 - board-value and calibration warnings
+- feature checks (`feature_checks.py`), each naming the copy ("vent 3 of 4 on P3") with a region to zoom to: clearance from the face's scores, slots and edges and from other features, handhole carry and side webs, the combined ligament above a handhole, flutes along a handhole's long side or a tear strip, the glue landing zone, overlap bands without a matching cut-out, perforation cuts on creases and short ties on thick board, tear-strip width, tab position and joint. Their limits are provisional and flagged.
+- machines report what they can make as well as the sheets they take: a part with a die-cut feature lists only machines that can die-cut (the slotter's die-cutting isn't confirmed, so it isn't listed)
+
+Each check has a category; geometry, feature, fold, partition, artwork and fit are actionable and shown apart from calibration, board and machine notices.
 
 ## The agent
 
@@ -88,10 +100,11 @@ The model's tools:
 | Tool | What it does |
 |---|---|
 | `list_options` | Styles (with options) and boards |
-| `create_box(style, L, W, D, units, board, options, action?, label?, quantity?, dry_run?)` | Generate, check and show in the preview. `action: add` adds another part instead of replacing the design. The result includes a picture of the part, so every design is looked at. |
-| `update_part(part?, ...)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values |
-| `export_files(filename?, formats?, replace?)` | Write every part's CF2 and/or DXF plus the manifest; sample-table files that need a pickup wait for the designer |
-| `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, optional zoom window (`render.py`) |
+| `create_box(style, L, W, D, units, board, options, action?, label?, quantity?, features?, dry_run?)` | Generate, check and show in the preview. `action: add` adds another part instead of replacing the design. The result includes a picture of the part, so every design is looked at. |
+| `update_part(part?, ..., features?)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values. A resize re-resolves every feature (one that no longer fits goes stale) and can carry feature changes. |
+| `set_features(part?, items?, remove?, dry_run?)` | Features by batch upsert: an item without an id is new, one with an id changes that feature (fields left out keep their values), `remove` deletes. A feature the call adds or changes that can't be placed is refused. The result has each feature's faces and plain-words summary, and the picture shows the measured offsets. |
+| `export_files(filename?, formats?, replace?, dxf_expand_perfs?)` | Write every part's CF2 and/or DXF plus the manifest; sample-table files that need a pickup wait for the designer |
+| `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, faces named from the face map (GL, P4 … P1), feature offsets marked edge or centre, optional zoom window (`render.py`) |
 | `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |
 | `get_geometry(line_type?, region?, path?)` | Exact segments and score positions, read-only (`render.py`) |
 | `search_files(query, extensions?)` | Read-only search of the reference folders (default: the work OneDrive folder synced on the PC). It matches words in paths, and inside ArtiosCAD descriptions for files already on the PC (`files.py`). |
@@ -99,7 +112,7 @@ The model's tools:
 | `web_search(query)` | Client-side search through the provider chosen in Settings: Exa (via its hosted MCP endpoint) or Tavily, keyless or with the user's key. Modelled on OpenCode (`web.py`). |
 | `web_fetch(url, format?)` | Client-side fetch following OpenCode's webfetch rules, plus a block on private and local-network addresses (`web.py`) |
 
-The model never writes coordinates. It reads them to check its work. `create_box` and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
+The model never writes coordinates. It reads them to check its work. Feature tools take parameters and placements; the system prompt adds the placement rules (outside view, always edge or centre, ask when the request doesn't say) and a read-back after every feature change. The model can mention a feature as `[handhole f1](feature:p1/f1)`; the chat shows it as a chip that highlights it in the preview. `create_box` and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
 
 **Reference folders:** by default, only the work OneDrive synced on the PC (`OneDriveCommercial`). Personal OneDrive is never included unless added in Settings.
 
@@ -126,7 +139,7 @@ The OpenRouter key and any search-provider keys are stored in Windows Credential
 
 Still to check against our ArtiosCAD (see PLAN.md):
 
-- The CF2 `UM`/`UI` units keyword and the arc direction flag. Cut = 1 and crease = 2 are confirmed by the shop's CF2 import tuning. 3 and 4 are not.
+- The CF2 `UM`/`UI` units keyword and the arc direction flag. Cut = 1 and crease = 2 are confirmed by the shop's CF2 import tuning. 3 and 4 are not, so perforations, cut-scores, reverse creases and mixed pointage block CF2 and DXF exports until an import and cut fixture verifies them.
 - Style formulas:
   - They're copied from the standards. Tests check them against real R&L output: 11 REG-GLIO-NX blank sizes, exported creases for two reference blanks, and two REG_GLI_EXT blanks.
   - A few variables round to 1/16 (their rounding mode is stored after each formula: REG-GLIO-NX CD; REG_GLI_EXT CD and flaps; HSC_GL DP and FL). The direction of modes 2 and 3 is unknown, so the engine computes them exactly and warns when one falls between sixteenths.

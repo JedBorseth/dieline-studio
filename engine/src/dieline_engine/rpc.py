@@ -202,7 +202,8 @@ class Server:
         cfg = self.settings.settings
         return exports.export_design(parts, cfg.resolved_output_dir(), filename, formats, flags["overwrite"],
                                      cfg.resolved_dxf_dir(), **about, break_lock=flags["break_lock"],
-                                     confirm_pickup=flags["confirm_pickup"])  # its reply offers the pickup
+                                     confirm_pickup=flags["confirm_pickup"],  # its reply offers the pickup
+                                     dxf_expand_perfs=_flag(p, "dxf_expand_perfs"))
 
     def _export_plan(self, p: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -212,7 +213,8 @@ class Server:
                     "pickup": False}
         filename, formats = self._export_args(p)
         cfg = self.settings.settings
-        return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir())
+        return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir(),
+                            _flag(p, "dxf_expand_perfs"))
 
     def _export_pickup(self, p: dict[str, Any]) -> dict[str, Any]:
         return exports.pickup(Path(_str(p, "job_path")), _str(p, "txn"), break_lock=_lock_id(p))
@@ -245,6 +247,13 @@ class Server:
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))
         return {"accepted": True}
+
+
+def _flag(p: dict[str, Any], key: str) -> bool:
+    v = p.get(key, False)
+    if not isinstance(v, bool):
+        raise RpcError(INVALID_PARAMS, f"{key} must be true or false")
+    return v
 
 
 def _lock_id(p: dict[str, Any]) -> str | None:

@@ -106,6 +106,8 @@ class Operation:
     ends_on: tuple[str, ...] = ()
     crosses: tuple[str, ...] = ()
     clearance: float = 0.0  # near-miss distance to other operations, in the dieline's units
+    # How it's made (rules.RuleSpec); None means the plain rule of its line type at the part's pointage.
+    rule: object | None = None
 
     def allows(self, other: "Operation", what: str) -> bool:
         names = self.ends_on if what == "ends_on" else self.crosses
@@ -122,6 +124,9 @@ class Dieline:
     ops: dict[str, Operation] = field(default_factory=dict)
     # Named faces, frames, reference lines and hinges (faces.FaceMap), when the engine drew it.
     faces: object | None = None
+    # What later build stages attach (features.py): "tags" maps each feature segment to its feature id,
+    # "features" lists each feature as resolved, "report" keeps the final topology report.
+    extras: dict[str, object] = field(default_factory=dict)
 
     def add_op(self, op: Operation) -> str:
         if op.id in self.ops:
