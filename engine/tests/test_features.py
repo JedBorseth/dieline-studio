@@ -463,9 +463,9 @@ def test_a_perforation_crosses_a_crease_at_a_tie_when_expanded():
     # Continuous: the pattern runs on, a cut lands on a crease, and it's flagged.
     cont = payload([{**perf, "crossing": "continuous", "phase": "1/16"}])
     flagged = [c for c in cont["checks"] if c["id"] == "feature_f1_cut_on_crease"]
+    assert flagged and flagged[0]["status"] == "warn"
     dcont = build([{**perf, "crossing": "continuous", "phase": "1/16"}])
-    if flagged:
-        assert not validate(rules.expand_perforations(dcont)).ok  # the cut crossing the crease is invalid
+    assert not validate(rules.expand_perforations(dcont)).ok  # a cut ending on the crease is invalid there
 
 
 def test_a_perforation_pattern_continues_over_a_jumped_slot():
@@ -690,3 +690,20 @@ def test_inch_defaults_mean_the_same_on_a_millimetre_part():
     fb = face_box(mm, "f1", "P1")
     assert (fb[2] - fb[0], fb[3] - fb[1]) == pytest.approx((3.625, 1.375))
     assert mm.faces.faces["P1"].height - fb[3] == pytest.approx(50 / 25.4)
+
+
+def test_short_ties_on_thick_board_and_the_tear_strip_tab_checks():
+    perf = {"kind": "perforation", "route": {"faces": ["P2"], "direction": "horizontal",
+                                             "at": {"from": "bottom_score", "distance": 3}}}
+    assert "feature_f1_ties" not in checks(payload([perf]))  # 32 B KR is under 3/16 caliper
+    thick = payload([{**perf, "tie": "1/8"}], board="71 BC KR")
+    assert thick["checks"] and "feature_f1_ties" in checks(thick)
+    ts = {"kind": "tear_strip", "route": {"faces": "body_panels", "direction": "horizontal",
+                                          "at": {"from": "bottom_score", "distance": 3}}}
+    c = checks(payload([ts]))
+    assert "glue lands on it" in c["feature_f1_tab_glue"]["message"]
+    outside = checks(payload([ts], options={"closure": "outside"}))
+    assert "can't be reached" in outside["feature_f1_tab_glue"]["message"]
+    near = checks(payload([{"kind": "tear_strip", "tab": "angled_tab", "start": "end", "route": {
+        "faces": ["P3", "P2"], "direction": "horizontal", "at": {"from": "bottom_score", "distance": 3}}}]))
+    assert "feature_f1_tab_score" in near  # the tab sits at the P1/P2 score end of P2
