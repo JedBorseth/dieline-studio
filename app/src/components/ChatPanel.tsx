@@ -19,7 +19,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 
 import { formatToolLabel } from "../lib/chat";
-import type { CheckStatus, Settings } from "../lib/protocol";
+import type { OverallStatus, Settings } from "../lib/protocol";
 import type { ChatItem, Session } from "../lib/store";
 import { cn } from "../lib/utils";
 import { Tip } from "./Tip";
@@ -46,7 +46,7 @@ const SUGGESTIONS = [
   "What styles and boards can you make?",
 ];
 
-export const STATUS_BADGE: Record<CheckStatus, "success" | "warning" | "error"> = {
+export const STATUS_BADGE: Record<OverallStatus, "success" | "warning" | "error"> = {
   pass: "success",
   warn: "warning",
   fail: "error",
@@ -224,7 +224,7 @@ function ToolCard({
 }) {
   const [open, setOpen] = useState(false);
   const label = formatToolLabel(item.name, item.input, item.result);
-  const overall = (item.result as { overall?: CheckStatus } | undefined)?.overall;
+  const overall = (item.result as { overall?: OverallStatus } | undefined)?.overall;
   const error = item.status === "error" ? (item.result as { error?: string } | undefined)?.error : undefined;
   // Format JSON lazily only when the collapsible panel is open so large read_file/get_geometry
   // payloads never re-serialize during streaming.

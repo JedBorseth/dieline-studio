@@ -544,7 +544,7 @@ def test_dxf_arc_angles_are_counter_clockwise():
     text = write_dxf(d)
     assert text.count(" 50\r\n0\r\n 51\r\n90\r\n") == 2
     arc = d.segments[0]
-    d.segments = [Arc(arc.start, arc.start, arc.center, arc.clockwise, arc.type)]
+    d.segments = [Arc(arc.start, arc.start, arc.center, arc.clockwise, arc.type, full_circle=True)]
     text = write_dxf(d)
     assert "\r\nCIRCLE\r\n" in text and "\r\nARC\r\n" not in text
 

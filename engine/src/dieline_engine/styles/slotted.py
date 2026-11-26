@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..boards import Board
-from ..geometry import Dieline, LineType
+from ..geometry import Dieline, LineType, Operation
 
 SLOT = 3 / 8  # slot width, centred on the score (con ... offset2 +/-0.1875)
 HALF_SLOT = SLOT / 2
@@ -166,18 +166,25 @@ def draw(name: str, blank: Blank) -> Dieline:
     # Built with panel 1 at x = 0, then mirrored so the glue lug sits on the left.
     m = lambda pt: (x_end - pt[0], pt[1])  # noqa: E731
     d = Dieline(name=name, units="in")
-    d.add_polyline([m(pt) for pt in reversed(pts)], LineType.CUT, closed=True)
+    outline = d.add_op(Operation("outline", "outline", closed=True))
+    d.add_polyline([m(pt) for pt in reversed(pts)], LineType.CUT, closed=True, op=outline)
 
-    for x in (c4, c3, c2, c1):
-        d.add_line(m((x, y1)), m((x, y2)), LineType.CREASE)
+    def hinge(op_id: str) -> str:
+        # Every standard hinge runs from the outline to the outline: at a slot
+        # bottom, a flap's slot corner, or the body's open edge.
+        return d.add_op(Operation(op_id, "hinge", open_ends="on", ends_on=("outline",)))
+
+    for i, x in zip((4, 3, 2, 1), (c4, c3, c2, c1)):
+        name_ = "hinge_glue" if i == 4 else f"hinge_P{i}_P{i + 1}"
+        d.add_line(m((x, y1)), m((x, y2)), LineType.CREASE, hinge(name_))
     if e:  # the extended lug folds at the body scores
-        for y in (y1, y2):
-            d.add_line(m((x_end, y)), m((c4 + h, y)), LineType.CREASE)
-    for row, y in ((blank.bottom, y1), (blank.top, y2)):
+        for y, end in ((y1, "bottom"), (y2, "top")):
+            d.add_line(m((x_end, y)), m((c4 + h, y)), LineType.CREASE, hinge(f"hinge_lug_ext_{end}"))
+    for row, y, end in ((blank.bottom, y1, "bottom"), (blank.top, y2, "top")):
         if row:
             for i in reversed(range(4)):
                 lo, hi = span(i)
-                d.add_line(m((hi, y)), m((lo, y)), LineType.CREASE)
+                d.add_line(m((hi, y)), m((lo, y)), LineType.CREASE, hinge(f"hinge_{end}_flap_P{i + 1}"))
     return d
 
 

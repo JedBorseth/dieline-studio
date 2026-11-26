@@ -21,11 +21,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import __version__
 from .boards import BOARDS, DEFAULT_BOARD, get_board
-from .cf2 import write_cf2
+from .cf2 import read_cf2, write_cf2
 from .checks import fmt_in, overall, run_checks
-from .dxf import write_dxf
-from .geometry import Dieline
+from .dxf import read_dxf, write_dxf
+from .geometry import Dieline, LineType
 from .styles import STYLES, Dims, get_style
+from .topology import reconstruct, validate
 
 MM_PER_INCH = 25.4
 MAX_INCHES = 240.0  # longer than any R&L machine takes; catches unit mix-ups
@@ -98,9 +99,22 @@ def build(params: BoxParams) -> Dieline:
     return style.make(params.dims_in(), board, params.options)
 
 
-def create_box(params: BoxParams) -> dict:
+class GeometryRefused(ValueError):
+    """The parameters produce geometry that can't be made (an undeclared
+    crossing, overlap or open cut). Nothing becomes a design."""
+
+
+def _validated(params: BoxParams) -> tuple[Dieline, list]:
     dieline = build(params)
-    results = run_checks(dieline)
+    report = validate(dieline)
+    if not report.ok:
+        issues = "; ".join(i.message for i in report.invalid[:3])
+        raise GeometryRefused(f"these parameters give geometry that can't be made: {issues}")
+    return dieline, run_checks(dieline, report)
+
+
+def create_box(params: BoxParams) -> dict:
+    dieline, results = _validated(params)
     return {
         "id": uuid.uuid4().hex[:12],
         "name": dieline.name,
@@ -152,6 +166,49 @@ def safe_filename(name: str, fmt: str = "cf2") -> str:
 
 class DesignCheckFailed(ValueError):
     """Raised when asked to export a design whose checks fail."""
+
+
+class TargetBlocked(DesignCheckFailed):
+    """An output file, read back from its own text, doesn't carry the design
+    or breaks the topology rules after rounding. Only that target is blocked."""
+
+
+# Rule types each target can carry today. Only cut and crease are verified on
+# ArtiosCAD import and the sample table (docs/DESIGN-SYSTEM.md, "Rule types
+# and export capability"); everything else is blocked until it is.
+VERIFIED_RULES = {"cf2": {LineType.CUT, LineType.CREASE}, "dxf": {LineType.CUT, LineType.CREASE}}
+
+
+def check_rules(dieline: Dieline, formats: list[str]) -> None:
+    used = {s.type for s in dieline.segments if s.type != LineType.ANNOTATION}
+    for fmt in formats:
+        blocked = sorted(t.value for t in used - VERIFIED_RULES[fmt])
+        if blocked:
+            raise TargetBlocked(f"{fmt.upper()} not exported: {', '.join(blocked)} isn't verified for "
+                                f"{'ArtiosCAD import' if fmt == 'cf2' else 'the sample table'} yet")
+
+
+def check_outputs(dieline: Dieline, texts: dict[str, str]) -> None:
+    """Validate each output as reconstructed from its own rounded geometry
+    (docs/DESIGN-SYSTEM.md, "Contact and disposition rules")."""
+    design_islands = len(validate(dieline).islands)
+    for fmt, text in texts.items():
+        try:
+            # write_dxf always writes inches; read it back as such, with no unit guessing.
+            back = read_cf2(text).dieline if fmt == "cf2" else read_dxf(text, "in", strict=True)[0]
+        except (ValueError, OverflowError) as exc:
+            raise TargetBlocked(f"{fmt.upper()} not exported: the file doesn't read back ({exc})") from exc
+        try:
+            recon, reason = reconstruct(dieline, back)
+        except (ValueError, OverflowError) as exc:
+            raise TargetBlocked(f"{fmt.upper()} not exported: the file doesn't read back ({exc})") from exc
+        if recon is None:
+            raise TargetBlocked(f"{fmt.upper()} not exported: {reason}")
+        report = validate(recon)
+        if not report.ok:
+            raise TargetBlocked(f"{fmt.upper()} not exported: after rounding, {report.invalid[0].message}")
+        if len(report.islands) > design_islands:
+            raise TargetBlocked(f"{fmt.upper()} not exported: after rounding, {report.islands[0].message}")
 
 
 Format = Literal["cf2", "dxf"]
@@ -262,10 +319,9 @@ def export(
         if not isinstance(f, str) or f not in EXTENSIONS:
             raise ValueError(f"unknown export format {f!r}; use cf2 or dxf")
     formats = list(dict.fromkeys(requested))
-    dieline = build(params)
-    results = run_checks(dieline)
+    dieline, results = _validated(params)
     if overall(results) == "fail":
-        failed = "; ".join(r.message for r in results if r.status == "fail")
+        failed = "; ".join(r.message for r in results if r.status in ("fail", "stale"))
         raise DesignCheckFailed(f"not exported: the design fails its checks ({failed})")
     stem = safe_stem(filename or dieline.name)
     main, dxf_root = output_dir.resolve(), (dxf_dir or output_dir).resolve()
@@ -276,8 +332,10 @@ def export(
     paths = [str(t) for t in targets.values()]
     record = job_record(params, dieline, results, paths)
     record["stem"] = stem
-    payloads = {target: (write_cf2(dieline) if f == "cf2" else write_dxf(dieline)).encode("ascii")
-                for f, target in targets.items()}
+    check_rules(dieline, formats)
+    texts = {f: (write_cf2(dieline) if f == "cf2" else write_dxf(dieline)) for f in formats}
+    check_outputs(dieline, texts)
+    payloads = {target: texts[f].encode("ascii") for f, target in targets.items()}
     payloads[job] = (json.dumps(record, indent=2) + "\n").encode("utf-8")
 
     def ensure_active() -> None:

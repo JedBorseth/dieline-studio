@@ -72,14 +72,27 @@ def write_cf2(dieline: Dieline, pointage: float = DEFAULT_POINTAGE) -> str:
             (x1, y1), (x2, y2) = seg.start, seg.end
             out.append(f"L,{pt},{code},0,{_num(x1)},{_num(y1)},{_num(x2)},{_num(y2)},0,0")
         else:
-            (sx, sy), (ex, ey), (cx, cy) = seg.start, seg.end, seg.center
             direction = ARC_CW if seg.clockwise else ARC_CCW
-            out.append(
-                f"A,{pt},{code},0,{_num(sx)},{_num(sy)},{_num(ex)},{_num(ey)},"
-                f"{_num(cx)},{_num(cy)},{direction},0,0"
-            )
+            (cx, cy) = seg.center
+            for (sx, sy), (ex, ey) in _arc_pieces(seg):
+                out.append(
+                    f"A,{pt},{code},0,{_num(sx)},{_num(sy)},{_num(ex)},{_num(ey)},"
+                    f"{_num(cx)},{_num(cy)},{direction},0,0"
+                )
     out += ["END", "$EOF"]
     return "\r\n".join(out) + "\r\n"
+
+
+def _arc_pieces(a: Arc) -> list[tuple[Point, Point]]:
+    """A full circle is written as two half arcs: an A record whose start and
+    end coincide is read as nothing by some CF2 importers."""
+    if not a.full_circle:
+        if math.dist(a.start, a.end) <= 1e-9:
+            raise ValueError("an arc whose start and end coincide must be flagged as a full circle")
+        return [(a.start, a.end)]
+    cx, cy = a.center
+    opposite = (2 * cx - a.start[0], 2 * cy - a.start[1])
+    return [(a.start, opposite), (opposite, a.start)]
 
 
 @dataclass(slots=True)
@@ -228,7 +241,8 @@ def read_cf2(text: str, max_depth: int = 16, max_segments: int = MAX_SEGMENTS) -
                         warnings.append(
                             f"arc in {name!r} is scaled non-uniformly; drawn as a circular arc (approximate)"
                         )
-                    dieline.segments.append(Arc(s, e, c, cw, to_type(f[2])))
+                    full = math.dist(s, e) <= 1e-9
+                    dieline.segments.append(Arc(s, s if full else e, c, cw, to_type(f[2]), full))
                 elif key == "C" and len(f) >= 3:
                     sub = f[1]
                     if sub not in blocks:

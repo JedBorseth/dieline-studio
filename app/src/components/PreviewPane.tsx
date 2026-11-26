@@ -2,10 +2,14 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   CircleCheckIcon,
+  CircleDashedIcon,
+  CircleHelpIcon,
+  CircleMinusIcon,
   CircleXIcon,
   CrosshairIcon,
   DownloadIcon,
   FolderOpenIcon,
+  InfoIcon,
   RulerIcon,
   ScanIcon,
   SlidersHorizontalIcon,
@@ -530,16 +534,36 @@ const CHECK_ICON: Record<CheckStatus, React.ReactNode> = {
   pass: <CircleCheckIcon className="size-3.5 shrink-0 text-success" />,
   warn: <TriangleAlertIcon className="size-3.5 shrink-0 text-warning" />,
   fail: <CircleXIcon className="size-3.5 shrink-0 text-destructive" />,
+  stale: <CircleDashedIcon className="size-3.5 shrink-0 text-destructive" />,
+  unavailable: <CircleHelpIcon className="size-3.5 shrink-0 text-warning" />,
+  info: <InfoIcon className="size-3.5 shrink-0 text-muted-foreground" />,
+  not_applicable: <CircleMinusIcon className="size-3.5 shrink-0 text-muted-foreground" />,
 };
 
-const CHECK_LABEL: Record<string, string> = { pass: "Pass", warn: "Warning", fail: "Fail" };
+const CHECK_LABEL: Record<CheckStatus, string> = {
+  pass: "Pass",
+  warn: "Warning",
+  fail: "Fail",
+  stale: "Stale",
+  unavailable: "Couldn't check",
+  info: "Note",
+  not_applicable: "Not applicable",
+};
+
+/** Statuses whose meaning the icon alone doesn't carry: their label is shown, not only read out. */
+const SHOWN_LABEL: ReadonlySet<CheckStatus> = new Set(["stale", "unavailable", "not_applicable"]);
+
+/** Statuses that need no attention: they don't count against "n/m pass". */
+const QUIET: ReadonlySet<CheckStatus> = new Set(["pass", "info", "not_applicable"]);
 
 function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind: "design" }>["design"]> }) {
   const [open, setOpen] = useState(design.overall === "fail");
   useEffect(() => {
     if (design.overall === "fail") setOpen(true);
   }, [design.id, design.overall]);
-  const failing = design.checks.filter((c) => c.status !== "pass");
+  // info and not_applicable don't take part; everything else either passed or needs a look.
+  const counted = design.checks.filter((c) => c.status !== "info" && c.status !== "not_applicable");
+  const passed = counted.filter((c) => c.status === "pass").length;
   return (
     <Collapsible className="shrink-0 border-t" open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger className="group flex h-9 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
@@ -548,7 +572,7 @@ function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind:
         </Badge>
         <span className="font-medium">Checks</span>
         <span className="text-muted-foreground">
-          {design.checks.length - failing.length}/{design.checks.length} pass
+          {passed}/{counted.length} pass
         </span>
         <span className="flex-1" />
         <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
@@ -560,13 +584,14 @@ function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind:
               <span className="flex h-[1lh] items-center" aria-hidden>
                 {CHECK_ICON[c.status]}
               </span>
-              <span className="sr-only">{CHECK_LABEL[c.status]}: </span>
+              {SHOWN_LABEL.has(c.status) ? null : <span className="sr-only">{CHECK_LABEL[c.status]}: </span>}
               <span
                 className={cn(
                   "min-w-0 wrap-anywhere",
-                  c.status === "pass" ? "text-muted-foreground" : "text-foreground",
+                  QUIET.has(c.status) ? "text-muted-foreground" : "text-foreground",
                 )}
               >
+                {SHOWN_LABEL.has(c.status) ? <span className="font-medium">{CHECK_LABEL[c.status]}: </span> : null}
                 {c.message}
               </span>
             </li>

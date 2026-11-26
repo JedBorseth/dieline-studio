@@ -51,7 +51,15 @@ $target = Join-Path $binDir "dieline-engine-$triple.exe"
 Copy-Item (Join-Path $distDir "dieline-engine.exe") $target -Force
 Write-Host "Sidecar ready: $target"
 
-# Smoke test: the engine must answer engine.info over stdio.
-$reply = '{"jsonrpc":"2.0","id":1,"method":"engine.info"}' | & $target | Select-Object -Skip 1 -First 1
-if ($reply -notmatch '"result"') { throw "sidecar smoke test failed: $reply" }
+# Smoke test: the engine must answer engine.info over stdio, and build a box,
+# which runs the topology checks and the CF2 writer inside the exe.
+$requests = @(
+    '{"jsonrpc":"2.0","id":1,"method":"engine.info"}',
+    '{"jsonrpc":"2.0","id":2,"method":"box.create","params":{"style":"reg-glio-nx","length":14,"width":8,"depth":6}}'
+)
+# The first line is the engine.ready event; replies may arrive in either order.
+$replies = ($requests | & $target | Select-Object -Skip 1 -First 2) -join "`n"
+if ($replies -notmatch '"styles"' -or $replies -notmatch '"cf2"') {
+    throw "sidecar smoke test failed: $replies"
+}
 Write-Host "Smoke test passed."

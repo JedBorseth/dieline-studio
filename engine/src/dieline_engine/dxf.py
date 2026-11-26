@@ -36,7 +36,7 @@ def _num(v: float) -> str:
 def write_dxf(dieline: Dieline) -> str:
     """The dieline as DXF R12 text, in inches."""
     k = 1.0 if dieline.units == "in" else 1 / 25.4
-    manufactured = [s for s in dieline.segments if s.type != LineType.ANNOTATION]
+    manufactured = cutting_order(dieline)
     unsupported = sorted({s.type.value for s in manufactured if s.type not in DXF_COLOURS})
     if unsupported:
         raise ValueError(f"DXF export has no sample-table colour for: {', '.join(unsupported)}")
@@ -63,7 +63,9 @@ def write_dxf(dieline: Dieline) -> str:
             out += [_code(0, "LINE"), *head,
                     _code(10, _num(x1 * k)), _code(20, _num(y1 * k)),
                     _code(11, _num(x2 * k)), _code(21, _num(y2 * k))]
-        elif isinstance(s, Arc) and math.dist(s.start, s.end) <= 1e-9:
+        elif isinstance(s, Arc) and not s.full_circle and math.dist(s.start, s.end) <= 1e-9:
+            raise ValueError("an arc whose start and end coincide must be flagged as a full circle")
+        elif isinstance(s, Arc) and s.full_circle:
             # A full circle (hole): an ARC with equal angles is degenerate in DXF.
             cx, cy = s.center
             out += [_code(0, "CIRCLE"), *head,
@@ -80,6 +82,23 @@ def write_dxf(dieline: Dieline) -> str:
                     _code(50, _num(start)), _code(51, _num(end))]
     out += [_code(0, "ENDSEC"), _code(0, "EOF")]
     return "".join(out)
+
+
+def cutting_order(dieline: Dieline) -> list:
+    """Manufactured segments in the order the sample table should cut them:
+    creases and other rules first, then interior cuts (holes, slits), then the
+    outer perimeter, so the board stays held down until the last cut. Order
+    within each group is kept. A dieline without operations (read from a file)
+    can't tell its perimeter apart, so its cuts keep their order after the rules."""
+    manufactured = [s for s in dieline.segments if s.type != LineType.ANNOTATION]
+
+    def rank(s) -> int:
+        if s.type != LineType.CUT:
+            return 0
+        op = dieline.ops.get(s.op) if s.op else None
+        return 2 if op is None or op.kind == "outline" else 1
+
+    return sorted(manufactured, key=rank)
 
 
 # ------------------------------------------------------------------ reading
@@ -99,7 +118,7 @@ def _header_int(pairs: list[tuple[str, str]], name: str) -> int | None:
     return None
 
 
-def read_dxf(text: str, units: str = "in") -> tuple[Dieline, list[str]]:
+def read_dxf(text: str, units: str = "in", strict: bool = False) -> tuple[Dieline, list[str]]:
     """Read LINE, ARC and CIRCLE entities from a DXF (R12 or later) for viewing.
 
     Colours follow the shop's DXF import tuning: 1 = cut, 2 = crease. Anything
@@ -174,18 +193,41 @@ def read_dxf(text: str, units: str = "in") -> tuple[Dieline, list[str]]:
                 colour = layer_colour.get(e.get("8", "0").casefold(), 7)
             t = types.get(abs(colour), LineType.ANNOTATION)
             if e["_type"] == "LINE":
+                if strict and not all(math.isfinite(float(e[k])) for k in ("10", "20", "11", "21")):
+                    raise ValueError("a LINE with an invalid coordinate")
                 d.add_line((float(e["10"]) * factor, float(e["20"]) * factor),
                            (float(e["11"]) * factor, float(e["21"]) * factor), t)
             else:
                 cx, cy, r = float(e["10"]) * factor, float(e["20"]) * factor, float(e["40"]) * factor
-                a0 = math.radians(float(e.get("50", 0))) if e["_type"] == "ARC" else 0.0
-                a1 = math.radians(float(e.get("51", 360))) if e["_type"] == "ARC" else 0.0
+                if strict:
+                    # Our own files, read back to check them: every value must make sense as written.
+                    if not all(math.isfinite(v) for v in (cx, cy, r)) or r <= 0:
+                        raise ValueError(f"a {e['_type']} with an invalid centre or radius")
+                    if e["_type"] == "ARC":
+                        if "50" not in e or "51" not in e:
+                            raise ValueError("an ARC without its start and end angles")
+                        d0, d1 = float(e["50"]), float(e["51"])
+                        if not (math.isfinite(d0) and math.isfinite(d1)):
+                            raise ValueError("an ARC with an invalid angle")
+                        span = (d1 - d0) % 360
+                        if span < 1e-6 or span > 360 - 1e-6:
+                            raise ValueError("an ARC whose start and end angles are equal")
+                        a0, a1 = math.radians(d0), math.radians(d0 + span)
+                    else:
+                        a0 = a1 = 0.0
+                    full = e["_type"] == "CIRCLE"
+                else:
+                    a0 = math.radians(float(e.get("50", 0))) if e["_type"] == "ARC" else 0.0
+                    a1 = math.radians(float(e.get("51", 360))) if e["_type"] == "ARC" else 0.0
+                    full = e["_type"] == "CIRCLE" or abs((math.degrees(a1 - a0)) % 360) < 1e-9
                 start = (cx + r * math.cos(a0), cy + r * math.sin(a0))
                 end = (cx + r * math.cos(a1), cy + r * math.sin(a1))
-                d.segments.append(Arc(start, end, (cx, cy), False, t))
-        except (KeyError, ValueError):
+                d.segments.append(Arc(start, start if full else end, (cx, cy), False, t, full))
+        except (KeyError, ValueError) as exc:
+            if strict:
+                raise ValueError(str(exc) if isinstance(exc, ValueError) else f"an unreadable {e['_type']}") from exc
             warnings.append(f"skipped an unreadable {e['_type']}")
-    if units == "in" and insunits in (None, 0) and d.segments:
+    if not strict and units == "in" and insunits in (None, 0) and d.segments:
         w, h = d.size()
         if max(w, h) > 300:  # no R&L blank is 25 feet long: almost certainly millimetres
             d.units = "mm"

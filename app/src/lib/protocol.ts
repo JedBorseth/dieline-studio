@@ -1,7 +1,10 @@
 // Types for the engine's JSON-RPC protocol (engine/src/dieline_engine/rpc.py).
 // Keep the two in sync.
 
-export type CheckStatus = "pass" | "warn" | "fail";
+/** A design's overall result: fail blocks export, warn needs a look. */
+export type OverallStatus = "pass" | "warn" | "fail";
+/** One check's result. stale counts as fail, unavailable as warn; info and not_applicable never change the overall. */
+export type CheckStatus = OverallStatus | "info" | "not_applicable" | "unavailable" | "stale";
 
 export interface CheckResult {
   id: string;
@@ -61,7 +64,7 @@ export interface Design {
   params: BoxParams;
   cf2: string;
   checks: CheckResult[];
-  overall: CheckStatus;
+  overall: OverallStatus;
   summary: DesignSummary;
 }
 
@@ -167,7 +170,7 @@ export interface ExportResult {
   job_path: string;
   /** Files of an earlier export under this name, moved to the superseded folder. */
   superseded: string[];
-  overall: CheckStatus;
+  overall: OverallStatus;
   name: string;
 }
 

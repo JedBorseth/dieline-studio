@@ -33,6 +33,7 @@ class Line:
     start: Point
     end: Point
     type: LineType
+    op: str | None = None  # id of the Operation that drew it (Dieline.ops)
 
     @property
     def length(self) -> float:
@@ -44,6 +45,8 @@ class Arc:
     """Circular arc from start to end around center.
 
     clockwise=False means counter-clockwise (positive angle direction).
+    full_circle=True means one whole turn from start back to the same point;
+    otherwise start and end must differ and the sweep is less than a turn.
     """
 
     start: Point
@@ -51,6 +54,8 @@ class Arc:
     center: Point
     clockwise: bool
     type: LineType
+    full_circle: bool = False
+    op: str | None = None
 
     @property
     def radius(self) -> float:
@@ -59,6 +64,8 @@ class Arc:
     @property
     def sweep(self) -> float:
         """Signed sweep angle in radians (positive = counter-clockwise)."""
+        if self.full_circle:
+            return -math.tau if self.clockwise else math.tau
         a0 = math.atan2(self.start[1] - self.center[1], self.start[0] - self.center[0])
         a1 = math.atan2(self.end[1] - self.center[1], self.end[0] - self.center[0])
         sweep = a1 - a0
@@ -78,6 +85,33 @@ class Arc:
 Segment = Line | Arc
 
 
+@dataclass(frozen=True, slots=True)
+class Operation:
+    """One thing the engine drew: an outline, a hinge, a hole, a slit...
+
+    Every segment names the operation it belongs to. The operation declares
+    which contacts with other operations are deliberate, which is how the
+    topology checks tell a designed junction from a mistake
+    (docs/DESIGN-SYSTEM.md, "Contact and disposition rules").
+
+    ends_on / crosses / never list operation kinds or ids; "*" means any.
+    """
+
+    id: str
+    kind: str  # outline | hinge | hole | slit | score | perf | annotation | cut | crease
+    closed: bool = False  # its segments form closed loops
+    # "none": no open ends allowed; "on": every open end must touch an operation
+    # it may end on; "free": open ends may stop in the board (creases, nicks).
+    open_ends: str = "none"
+    ends_on: tuple[str, ...] = ()
+    crosses: tuple[str, ...] = ()
+    clearance: float = 0.0  # near-miss distance to other operations, in the dieline's units
+
+    def allows(self, other: "Operation", what: str) -> bool:
+        names = self.ends_on if what == "ends_on" else self.crosses
+        return "*" in names or other.kind in names or other.id in names
+
+
 @dataclass(slots=True)
 class Dieline:
     name: str
@@ -85,17 +119,29 @@ class Dieline:
     segments: list[Segment] = field(default_factory=list)
     # Free-form facts about how the dieline was made (style, dims, board, ...).
     meta: dict[str, object] = field(default_factory=dict)
+    ops: dict[str, Operation] = field(default_factory=dict)
 
-    def add_line(self, start: Point, end: Point, type: LineType) -> None:
-        self.segments.append(Line(_round_pt(start), _round_pt(end), type))
+    def add_op(self, op: Operation) -> str:
+        if op.id in self.ops:
+            raise ValueError(f"duplicate operation id {op.id!r}")
+        self.ops[op.id] = op
+        return op.id
 
-    def add_polyline(self, points: list[Point], type: LineType, closed: bool = False) -> None:
+    def add_line(self, start: Point, end: Point, type: LineType, op: str | None = None) -> None:
+        self.segments.append(Line(_round_pt(start), _round_pt(end), type, op))
+
+    def add_arc(self, start: Point, end: Point, center: Point, clockwise: bool, type: LineType,
+                full_circle: bool = False, op: str | None = None) -> None:
+        self.segments.append(Arc(_round_pt(start), _round_pt(end), _round_pt(center), clockwise, type,
+                                 full_circle, op))
+
+    def add_polyline(self, points: list[Point], type: LineType, closed: bool = False, op: str | None = None) -> None:
         pts = list(points)
         if closed:
             pts.append(pts[0])
         for a, b in zip(pts, pts[1:]):
             if math.dist(a, b) > EPS:
-                self.add_line(a, b, type)
+                self.add_line(a, b, type, op)
 
     def of_type(self, type: LineType) -> list[Segment]:
         return [s for s in self.segments if s.type == type]

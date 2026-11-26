@@ -12,13 +12,19 @@ import math
 from collections import Counter
 from dataclasses import asdict, dataclass
 
-from .geometry import EPS, PRECISION, Arc, Dieline, Line, LineType, Point
+from .geometry import EPS, Dieline, LineType
+from .topology import Issue, Report, validate
+
+
+# pass | info | warn | fail | not_applicable | unavailable | stale. A refused
+# mutation is not a check: it never becomes a revision (docs/DESIGN-SYSTEM.md, "Checks").
+STATUSES = ("pass", "info", "warn", "fail", "not_applicable", "unavailable", "stale")
 
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     id: str
-    status: str  # "pass" | "warn" | "fail"
+    status: str
     message: str
 
     def to_dict(self) -> dict[str, str]:
@@ -57,10 +63,6 @@ MACHINES: list[Machine] = [
 ]
 
 
-def _key(p: Point) -> tuple[float, float]:
-    return (round(p[0], PRECISION - 1), round(p[1], PRECISION - 1))
-
-
 def check_line_types(d: Dieline) -> CheckResult:
     bad = [s for s in d.segments if not isinstance(s.type, LineType)]
     if bad:
@@ -70,105 +72,50 @@ def check_line_types(d: Dieline) -> CheckResult:
     return CheckResult("line_types", "pass", f"all line types valid ({summary})")
 
 
-def check_zero_length(d: Dieline) -> CheckResult:
-    n = sum(1 for s in d.segments if s.length <= EPS)
-    if n:
-        return CheckResult("zero_length", "fail", f"{n} zero-length segment(s)")
-    return CheckResult("zero_length", "pass", "no zero-length segments")
+def _sample(issues: list[Issue], units: str) -> str:
+    pts = [i.point for i in issues if i.point is not None][:3]
+    where = ", ".join(f"({x:.4g}, {y:.4g})" for x, y in pts)
+    first = issues[0].message
+    more = f" and {len(issues) - 1} more" if len(issues) > 1 else ""
+    return f"{first}{more}" + (f" at {where}" if where else "")
 
 
-def check_closed_outline(d: Dieline) -> CheckResult:
-    """Every cut endpoint must join an even number of cut segments (closed loops)."""
-    degree: Counter[tuple[float, float]] = Counter()
-    for s in d.of_type(LineType.CUT):
-        degree[_key(s.start)] += 1
-        degree[_key(s.end)] += 1
-    if not degree:
-        return CheckResult("closed_outline", "fail", "no cut lines")
-    open_ends = [p for p, n in degree.items() if n % 2]
-    if open_ends:
-        sample = ", ".join(f"({x:g}, {y:g})" for x, y in open_ends[:4])
-        return CheckResult("closed_outline", "fail", f"{len(open_ends)} open cut end(s), e.g. {sample}")
-    return CheckResult("closed_outline", "pass", "cut outline is closed")
-
-
-def check_overlaps(d: Dieline) -> CheckResult:
-    """No duplicate or overlapping collinear lines (any line type)."""
-    lines = [s for s in d.segments if isinstance(s, Line) and s.type != LineType.ANNOTATION]
-    groups: dict[tuple, list[tuple[float, float, Line]]] = {}
-    for ln in lines:
-        (x1, y1), (x2, y2) = ln.start, ln.end
-        ang = math.atan2(y2 - y1, x2 - x1) % math.pi
-        if round(ang, 6) >= round(math.pi, 6):  # fold the wrap-around back onto 0
-            ang = 0.0
-        offset = -x1 * math.sin(ang) + y1 * math.cos(ang)  # distance along the normal
-        t1 = x1 * math.cos(ang) + y1 * math.sin(ang)  # position along the line
-        t2 = x2 * math.cos(ang) + y2 * math.sin(ang)
-        key = (round(ang, 6), round(offset, PRECISION - 1))
-        groups.setdefault(key, []).append((min(t1, t2), max(t1, t2), ln))
-    overlaps = 0
-    for spans in groups.values():
-        spans.sort(key=lambda s: s[0])
-        reach = -math.inf
-        for lo, hi, _ in spans:
-            if lo < reach - EPS * 10:
-                overlaps += 1
-            reach = max(reach, hi)
-    overlaps += _arc_overlaps([s for s in d.segments if isinstance(s, Arc) and s.type != LineType.ANNOTATION])
-    if overlaps:
-        return CheckResult("overlaps", "fail", f"{overlaps} duplicate or overlapping segment(s)")
-    return CheckResult("overlaps", "pass", "no duplicate or overlapping segments")
-
-
-def _arc_overlaps(arcs: list[Arc]) -> int:
-    """Count pairs of arcs on the same circle whose swept intervals overlap."""
-    circles: dict[tuple, list[tuple[float, float, float]]] = {}
-    for a in arcs:
-        sweep = a.sweep
-        start = a.end if a.clockwise else a.start  # normalise to a CCW interval
-        a0 = math.atan2(start[1] - a.center[1], start[0] - a.center[0]) % math.tau
-        key = (_key(a.center), round(a.radius, PRECISION - 1))
-        circles.setdefault(key, []).append((a0, abs(sweep), a.radius))
-    count = 0
-    for spans in circles.values():
-        for i in range(len(spans)):
-            for j in range(i + 1, len(spans)):
-                a1, l1, r = spans[i]
-                a2, l2, _ = spans[j]
-                eps = EPS * 10 / max(r, EPS)
-                d = (a2 - a1) % math.tau  # where interval j starts, relative to i
-                if d < l1 - eps or d + l2 > math.tau + eps:
-                    count += 1
-    return count
-
-
-def check_crossings(d: Dieline) -> CheckResult:
-    """No two lines may cross through each other's interiors.
-
-    T-junctions (a crease ending on a cut) and shared endpoints are fine; a
-    crossing means a self-intersecting outline or a rule cutting through a
-    panel. Arcs are not yet included.
-    """
-    lines = [s for s in d.segments if isinstance(s, Line) and s.type != LineType.ANNOTATION]
-    crossings: list[Point] = []
-    for i in range(len(lines)):
-        (ax, ay), (bx, by) = lines[i].start, lines[i].end
-        for j in range(i + 1, len(lines)):
-            (cx, cy), (dx, dy) = lines[j].start, lines[j].end
-            rx, ry, sx, sy = bx - ax, by - ay, dx - cx, dy - cy
-            denom = rx * sy - ry * sx
-            if abs(denom) < 1e-12:
-                continue  # parallel or collinear: check_overlaps handles those
-            t = ((cx - ax) * sy - (cy - ay) * sx) / denom
-            u = ((cx - ax) * ry - (cy - ay) * rx) / denom
-            tol_t = EPS * 10 / math.hypot(rx, ry)
-            tol_u = EPS * 10 / math.hypot(sx, sy)
-            if tol_t < t < 1 - tol_t and tol_u < u < 1 - tol_u:
-                crossings.append((ax + t * rx, ay + t * ry))
-    if crossings:
-        sample = ", ".join(f"({x:.1f}, {y:.1f})" for x, y in crossings[:4])
-        return CheckResult("crossings", "fail", f"{len(crossings)} crossing line(s), e.g. at {sample}")
-    return CheckResult("crossings", "pass", "no lines cross")
+def check_topology(d: Dieline, report: Report | None = None) -> list[CheckResult]:
+    """The contact and disposition rules (topology.py). Invalid geometry is a
+    `fail` here; the design pipeline refuses it before it becomes a revision."""
+    r = report or validate(d)
+    out: list[CheckResult] = []
+    groups = [
+        ("zero_length", ("zero_length", "arc"), "no zero-length segments, arcs consistent"),
+        ("closed_outline", ("open_end", "branch", "outline", "weld"), "cut outline is closed; open ends are all declared"),
+        ("overlaps", ("overlap",), "no duplicate or overlapping segments"),
+        ("crossings", ("crossing", "tangent", "contact"), "no undeclared crossings or contacts"),
+    ]
+    # Broken segments stop the analysis early: what it never reached is unknown, not passed.
+    early = any(i.kind in ("zero_length", "arc", "finite") for i in r.invalid)
+    for cid, kinds, ok in groups:
+        if cid == "zero_length":
+            kinds = (*kinds, "finite")
+        issues = [i for i in r.invalid if i.kind in kinds]
+        if issues:
+            out.append(CheckResult(cid, "fail", _sample(issues, d.units)))
+        elif early:
+            out.append(CheckResult(cid, "unavailable", "not checked until the segments above are valid"))
+        else:
+            out.append(CheckResult(cid, "pass", ok))
+    off = [i for i in r.invalid if i.kind == "off_board"]
+    if off:
+        out.append(CheckResult("material", "fail", _sample(off, d.units)))
+    elif r.invalid:
+        out.append(CheckResult("material", "unavailable", "not checked until the geometry above is valid"))
+    elif r.islands:
+        out.append(CheckResult("material", "fail", _sample(r.islands, d.units) +
+                               "; bridge it, or accept that it drops out"))
+    else:
+        out.append(CheckResult("material", "pass", "the blank is one connected piece"))
+    if r.near_misses:
+        out.append(CheckResult("clearance", "warn", _sample(r.near_misses, d.units)))
+    return out
 
 
 def _fit(w: float, h: float, m: Machine) -> str:
@@ -320,20 +267,19 @@ def fmt_in(x: float) -> str:
     return f"{whole} {num}/{den}" if whole else f"{num}/{den}"
 
 
-def run_checks(d: Dieline) -> list[CheckResult]:
-    results = [
-        check_line_types(d),
-        check_zero_length(d),
-        check_closed_outline(d),
-        check_overlaps(d),
-        check_crossings(d),
-        check_machines(d),
-    ]
+def run_checks(d: Dieline, report: Report | None = None) -> list[CheckResult]:
+    results = [check_line_types(d), *check_topology(d, report), check_machines(d)]
     results += check_standard(d)
     results += check_preflight(d)
     return results
 
 
 def overall(results: list[CheckResult]) -> str:
+    """fail if any check fails or is stale (export blocked); warn if any warns
+    or couldn't run; otherwise pass. info and not_applicable never change it."""
     statuses = {r.status for r in results}
-    return "fail" if "fail" in statuses else "warn" if "warn" in statuses else "pass"
+    if statuses & {"fail", "stale"}:
+        return "fail"
+    if statuses & {"warn", "unavailable"}:
+        return "warn"
+    return "pass"

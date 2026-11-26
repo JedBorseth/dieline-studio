@@ -51,11 +51,11 @@ Exports:
 - A `<name>.dieline.json` job record next to every export: parameters, board values snapshot, sizes and checks. The UI's Open… regenerates the design from it and lists anything that changed since, such as corrected board values.
 
 A name is one file set (CF2, DXF, job). An export never mixes sets. If any file of the name exists, it asks. Replace moves the whole old set to `superseded/<name> <time>/` first, and each new file is written to a temporary name and then renamed. DXF can go to a separate sample-table folder (Settings).
-- DXF R12 in the format the shop sends to the AOLCUT sample table (`dxf.py`): inches, layer `Design`, colour 1 cut, 2 crease.
+- DXF R12 in the format the shop sends to the AOLCUT sample table (`dxf.py`): inches, layer `Design`, colour 1 cut, 2 crease. Entities are in cutting order: creases, interior cuts, then the outer perimeter. CF2 writes full circles as two half arcs.
 
 Checks:
 
-- geometry
+- topology (`topology.py`): every segment belongs to an operation (outline, hinge, hole…) that declares its deliberate contacts. Undeclared crossings, overlaps, tangencies, open cut ends and broken arcs refuse the design before it exists. Loose board (an island, or a cut dividing the blank) is drawn but blocks export. Near misses warn. Each output file is read back and checked again after rounding, and a target that fails is blocked. Faces are traced exactly through lines and arcs, with no tessellation.
 - the standard's own L ≥ W check
 - a warning when a value the standard rounds to 1/16 falls between sixteenths
 - which R&L machine's sheet limits take the blank: a screen that warns, never a reason to block an export. The slotter can't turn a blank: its height runs with the feed. Skip-feed is reported.
@@ -129,7 +129,6 @@ Still to check against our ArtiosCAD (see PLAN.md):
 ## Known gaps
 
 - Before distributing installers, generate the full license notices for bundled dependencies (npm, Python packages inside the sidecar, Rust crates) and ship them with `THIRD_PARTY_NOTICES.md`, which currently covers the T3 Code primitives and direct UI dependencies.
-- Arcs aren't yet included in the line-crossing check.
 - Opening a raw CF2 shows it but doesn't change the chat's current design (a CF2 has no parameters), so "export this" in the chat still means the chat's last design.
 - A design made in the form while a chat turn is running isn't handed to the chat (the UI warns).
 - Exports are serialised within one app instance only. Two designers replacing the same name in a shared server folder at the same moment aren't coordinated, and a share dropping mid-replace can leave the set partly moved. The superseded copies stay, and nothing is deleted.

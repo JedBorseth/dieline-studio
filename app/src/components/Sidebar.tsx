@@ -1,5 +1,6 @@
 import { DiamondIcon, PlusIcon, SettingsIcon } from "lucide-react";
 
+import type { OverallStatus } from "../lib/protocol";
 import type { Session } from "../lib/store";
 import { cn } from "../lib/utils";
 import { Tip } from "./Tip";
@@ -17,7 +18,7 @@ interface Props {
   engineVersion?: string;
 }
 
-const DOT: Record<string, string> = {
+const DOT: Record<OverallStatus, string> = {
   pass: "bg-success",
   warn: "bg-warning",
   fail: "bg-destructive",
