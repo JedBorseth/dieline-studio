@@ -156,7 +156,9 @@ def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT
             kinds += ft.kinds
             fallback += ft.fallback
             radii += curve.radius_samples()
-        prims = [q for q in prims if q.full or math.dist(q.start, q.end) > 1e-9]
+        # Zero-length pieces go, and their kinds with them: kinds[i] always describes prims[i].
+        keep = [k for k, q in enumerate(prims) if q.full or math.dist(q.start, q.end) > 1e-9]
+        prims, kinds = [prims[k] for k in keep], [kinds[k] for k in keep]
         if not prims:
             continue
         closed = s.closed
@@ -463,7 +465,8 @@ def _centre(cs: list[Contour]) -> None:
 # ------------------------------------------------------------------ the agent's sketch (0-100 canvas)
 
 CANVAS = 100.0
-_TOKEN = re.compile(r"[MmLlQqCcAaZzHhVvSsTt]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_TOKEN = re.compile(r"[MmLlQqCcAaZzHhVvSsTt]|" + _NUMBER.pattern)
 
 
 def parse_path(d: str, *, what: str, canvas: bool, corrections: list[float], strict_arcs: bool,
@@ -497,6 +500,21 @@ def parse_path(d: str, *, what: str, canvas: bool, corrections: list[float], str
         if not math.isfinite(v):
             raise SourceError(f"{what}: a number isn't finite")
         return v
+
+    def flag() -> int:
+        # SVG's grammar: an arc flag is one character, 0 or 1, so "0150" is flags 0 and 1, then 50.
+        nonlocal i
+        if i >= len(toks) or toks[i].isalpha():
+            raise SourceError(f"{what}: a {cmd} command is missing a number")
+        t = toks[i]
+        rest = t[1:]
+        if t[0] not in "01" or (rest and not _NUMBER.fullmatch(rest)):
+            raise SourceError(f"{what}: an arc's large-arc and sweep flags must be 0 or 1")
+        if rest:
+            toks[i] = rest
+        else:
+            i += 1
+        return int(t[0])
 
     def check(p: Point) -> Point:
         if canvas and not (-1e-9 <= p[0] <= CANVAS + 1e-9 and -1e-9 <= p[1] <= CANVAS + 1e-9):
@@ -574,9 +592,7 @@ def parse_path(d: str, *, what: str, canvas: bool, corrections: list[float], str
             pos = q
         elif c == "A":
             rx, ry, rot = num(), num(), num()
-            large, sweep = num(), num()
-            if large not in (0, 1) or sweep not in (0, 1):
-                raise SourceError(f"{what}: an arc's large-arc and sweep flags must be 0 or 1")
+            large, sweep = flag(), flag()
             q = check((base[0] + num(), base[1] + num()))
             if rx == 0 or ry == 0:
                 if math.dist(q, pos) > 1e-12:

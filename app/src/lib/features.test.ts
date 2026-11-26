@@ -12,6 +12,7 @@ import {
   regionToMm,
   replaceLoses,
   sceneToPrimitive,
+  segmentExtent,
 } from "./features.ts";
 import type { Design, SceneSegment } from "./protocol.ts";
 
@@ -127,4 +128,27 @@ test("the header pill and the flags waiting for the designer", () => {
     { id: "material", status: "fail", message: "" },
   ]);
   assert.deepEqual(flags.map((c) => c.id), ["artwork_a1_flag_slot"]);
+});
+
+test("a shallow arc of a large radius is framed by what it sweeps, not its whole circle", () => {
+  // Radius 80 in, the arc a gentle bow from (0, 0) to (4, 0), bulging down to y = -0.025.
+  const r = 80;
+  const cy = Math.sqrt(r * r - 4);
+  const bow: SceneSegment = {
+    type: "cut", op: "a1.1", kind: "artwork", provenance: "agent sketch", feature_id: "a1", face_id: "P2",
+    arc: true, start: [0, 0], end: [4, 0], center: [2, cy], clockwise: false,
+  };
+  const f = agentSketches([bow], "in").frames[0].box;
+  assert.ok(f.xmax - f.xmin < 4 * 25.4 + 1e-6 && f.ymax - f.ymin < 0.03 * 25.4);
+  assert.ok(Math.abs(f.ymin - (cy - r) * 25.4) < 1e-6);
+  // Each direction sweeps its own extremes: counter-clockwise from (1, 0) to (0, 1) about the origin
+  // passes nothing beyond its ends; clockwise between them passes 270, 180 deg.
+  const q = (clockwise: boolean): SceneSegment => ({
+    ...bow, start: [1, 0], end: [0, 1], center: [0, 0], clockwise,
+  });
+  const ys = (pts: [number, number][]) => pts.map((p) => Math.round(p[1] * 1e9) / 1e9);
+  const xs = (pts: [number, number][]) => pts.map((p) => Math.round(p[0] * 1e9) / 1e9);
+  assert.equal(Math.min(...ys(segmentExtent(q(false)))), 0);
+  assert.equal(Math.min(...ys(segmentExtent(q(true)))), -1);
+  assert.equal(Math.min(...xs(segmentExtent(q(true)))), -1);
 });

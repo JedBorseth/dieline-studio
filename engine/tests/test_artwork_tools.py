@@ -176,3 +176,18 @@ def test_the_job_record_keeps_artwork_provenance_and_its_drawn_outlines(tmp_path
     assert art["islands"][0]["status"] == "bridged" and len(art["outlines"]) == 2
     assert record["parts"][0]["params"]["artwork"][0]["sketch"]["shapes"]
     assert out
+
+
+def test_an_import_that_cant_be_placed_is_refused_before_any_card_is_shown(tmp_path):
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    (refs / "big.svg").write_bytes(SVG)
+    ag, t = agent(tmp_path, refs=[refs])
+    ag._dispatch(t, "create_box", BOX, "c1")
+    with pytest.raises(ValueError, match="can't be placed"):
+        ag._dispatch(t, "set_artwork", {"items": [{"kind": "import", "path": str(refs / "big.svg"), "width": 30,
+                                                   "placement": MID}]}, "c2")
+    assert not ag.artwork_imports._items  # no card waiting
+    out = ag._dispatch(t, "set_artwork", {"items": [{"kind": "import", "path": str(refs / "big.svg"), "width": 3,
+                                                     "loop_rules": {"6": "crease"}, "placement": MID}]}, "c3")
+    assert out["import"]["artwork"]["status"] == "ok" and ag.artwork_imports._items

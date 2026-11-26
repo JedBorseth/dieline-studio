@@ -401,6 +401,7 @@ class Island:
     region: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     bridges: int = 0
     width: float = 0.0
+    segs: tuple[Segment, ...] = ()  # the island's own loop as drawn: its exact identity
 
 
 @dataclass(slots=True)
@@ -437,11 +438,25 @@ class Art:
     def segs(self) -> list[Segment]:
         return [s for c in self.live() for s in c.segs]
 
-    def fingerprint(self) -> str:
-        """The artwork as drawn: an acknowledgement is for exactly this geometry."""
+    def fingerprint(self, face: Face | None = None) -> str:
+        """Everything that decides what's cut: an acknowledgement is for exactly this. Each segment
+        (rule, ends, centre, direction, full circle), each outline's rule spec (pointage), and the face
+        it's on with that face's frame on the blank (a resize that keeps the flat coordinates still
+        moves the face round it), so any change asks again."""
         h = hashlib.sha1()
+
+        def r6(p: Any) -> Any:
+            return None if p is None else tuple(round(v, 6) for v in p)
+
+        h.update(repr(("face", self.face)).encode())
+        if face is not None:
+            h.update(repr((round(face.width, 6), round(face.height, 6), r6(face.origin), r6(face.x_axis),
+                           r6(face.y_axis), [r6(q) for q in face.polygon])).encode())
+        for op in sorted(self.ops, key=lambda o: o.id):
+            h.update(repr((op.id, op.kind, op.closed, op.rule)).encode())
         for s in sorted(self.segs(), key=lambda s: (s.start, s.end)):
-            h.update(repr((s.type.value, s.start, s.end, getattr(s, "center", None))).encode())
+            h.update(repr((s.type.value, s.start, s.end, getattr(s, "center", None), getattr(s, "clockwise", None),
+                           getattr(s, "full_circle", None))).encode())
         return h.hexdigest()[:16]
 
     def to_dict(self, units: str = "in") -> dict[str, Any]:
@@ -1049,30 +1064,48 @@ def bridge(island: _Loop, hole: _Loop, children: list[_Loop], others: list[Segme
 # ------------------------------------------------------------------ islands
 
 
+def _pass_limit(loops: int) -> int:
+    """How many passes a face's islands get: each fix that changes the nesting takes one, and each
+    removes a cut loop or joins an island to its hole, so this is never reached by sound artwork."""
+    return 8 + 2 * loops
+
+
 def _islands(arts: list[Art], d: Dieline, flute_axis: str) -> list[dict[str, Any]]:
     """Find every island the artwork makes (with the features' holes), apply each one's chosen fix,
-    and record what's left. Returns records for the checks (and for check_topology to leave to them)."""
+    and record what's left. Returns records for the checks, each with the island's exact loop, so
+    check_topology leaves only that island (unhandled or an accepted drop-out) to the artwork checks.
+
+    Each pass works out the nesting and fixes every island it can whose loop and hole no fix in that
+    pass has touched; a partial cut changes the nesting of everything inside it, so it ends the pass.
+    The passes are bounded; if the bound is reached, every island still unresolved fails (never
+    silently dropped). An island no artwork owns (a feature's hole inside another feature's) gets no
+    record: the topology's material check fails it."""
     faces = sorted({a.face for a in arts if a.status == "ok" and a.face})
     records: list[dict[str, Any]] = []
     for a in arts:
         a.islands = []
     for face in faces:
-        handled: set[int] = set()
-        for _ in range(6):  # each pass may change the nesting (a bridge, a partial cut)
+        handled: set[tuple[Segment, ...]] = set()
+        limit = _pass_limit(len(_face_loops(arts, d, face)))
+        for _ in range(limit):
             loops = _face_loops(arts, d, face)
             _nest(loops)
             changed = False
+            touched: set[tuple[Segment, ...]] = set()
             pending = [lp for lp in loops if lp.depth >= 2 and lp.depth % 2 == 0]
             for lp in sorted(pending, key=lambda x: x.depth):
                 owner = lp.art if lp.art is not None else (lp.parent.art if lp.parent is not None else None)
                 if owner is None:
-                    continue  # a feature inside a feature: the features' own checks report it
-                key = id(lp.segs[0]) if lp.drawn is None else hash((owner.id, lp.drawn.n, lp.index))
+                    continue  # a feature inside a feature: no artwork to fix it, so the material check fails it
+                key = tuple(lp.segs)
                 if key in handled:
+                    continue
+                if key in touched or (lp.parent is not None and tuple(lp.parent.segs) in touched):
+                    changed = True  # its loop or hole was just redrawn: work it out again next pass
                     continue
                 iid = f"i{len(owner.islands) + 1}"
                 isl = Island(iid, lp.drawn.n if lp.drawn else 0, lp.parent.drawn.n if lp.parent and lp.parent.drawn
-                             else None, None, "open", point=_mid(lp.segs[0]), region=_box(lp.segs))
+                             else None, None, "open", point=_mid(lp.segs[0]), region=_box(lp.segs), segs=key)
                 fixes = owner.spec.get("islands")
                 fix = fixes if isinstance(fixes, str) else (fixes or {}).get(iid)
                 isl.fix = fix
@@ -1097,7 +1130,7 @@ def _islands(arts: list[Art], d: Dieline, flute_axis: str) -> list[dict[str, Any
                                  if o.id == f"{owner.id}.{hd.n}" else o for o in owner.ops]
                     isl.status = "partial_cut"
                     changed = True
-                    break
+                    break  # everything inside the hole changes depth
                 # bridge / stencil
                 children = [x for x in loops if x.parent is lp]
                 others = [s for x in loops if x is not lp and x is not hole and x not in children for s in x.segs]
@@ -1111,7 +1144,9 @@ def _islands(arts: list[Art], d: Dieline, flute_axis: str) -> list[dict[str, Any
                 new_loops, count, sides = got
                 hd, idr = hole.drawn, lp.drawn
                 assert idr is not None
-                keep = [lo for k, lo in enumerate(hd.loops) if k != hole.index]
+                touched.add(key)
+                touched.add(tuple(hole.segs))
+                keep = [lo for lo in hd.loops if lo is not hole.segs]
                 hd.loops = keep + new_loops
                 hd.kinds.update({s: "bridge" for s in sides})
                 for s in idr.segs:
@@ -1119,22 +1154,36 @@ def _islands(arts: list[Art], d: Dieline, flute_axis: str) -> list[dict[str, Any
                 for s in [s for lo in new_loops for s in lo]:
                     if s not in hd.kinds:
                         hd.kinds[s] = "arc" if isinstance(s, Arc) else "line"
-                idr.loops = [lo for k, lo in enumerate(idr.loops) if k != lp.index]
+                idr.loops = [lo for lo in idr.loops if lo is not lp.segs]
                 if not idr.loops:
                     idr.merged_into = hd.n
                 hd.radii += idr.radii
                 isl.status, isl.bridges, isl.width = ("bridged" if fix == "bridge" else "stencil"), count, \
                     owner.bridge_width
                 changed = True
-                break
             if not changed:
                 break
+        else:
+            # The bound ran out: fail closed. Every island still there and not yet decided fails.
+            loops = _face_loops(arts, d, face)
+            _nest(loops)
+            for lp in sorted([x for x in loops if x.depth >= 2 and x.depth % 2 == 0], key=lambda x: x.depth):
+                owner = lp.art if lp.art is not None else (lp.parent.art if lp.parent is not None else None)
+                key = tuple(lp.segs)
+                if owner is None or key in handled:
+                    continue
+                handled.add(key)
+                owner.islands.append(Island(
+                    f"i{len(owner.islands) + 1}", lp.drawn.n if lp.drawn else 0,
+                    lp.parent.drawn.n if lp.parent and lp.parent.drawn else None, None, "failed",
+                    f"the engine stopped working out this face's islands after {limit} passes; simplify the "
+                    "artwork or choose drop_out", _mid(lp.segs[0]), _box(lp.segs), segs=key))
         for a in arts:
             if a.face != face:
                 continue
             for isl in a.islands:
                 records.append({"artwork": a.id, "island": isl.id, "status": isl.status, "point": isl.point,
-                                "region": isl.region, "loop": isl.loop})
+                                "region": isl.region, "loop": isl.loop, "segs": isl.segs})
     return records
 
 
@@ -1188,13 +1237,15 @@ def apply(d: Dieline, items: list[dict[str, Any]], params: Any, board: Any) -> N
             out.segments += a.segs()
         return out
 
-    records: list[dict[str, Any]] = []
-    for _ in range(3):
+    # Islands, then the whole design validated; artwork that breaks it is set aside (stale) and the rest
+    # redrawn from their drafts (bridges depend on what else is live). Every pass sets at least one
+    # artwork aside, so this ends; the islands are always worked out for exactly what's composed.
+    while True:
         live = [a for a in arts if a.status == "ok"]
         records = _islands(live, base, flute_axis)
         final = compose(live)
         report = validate(final)
-        if report.ok:
+        if report.ok or not live:
             break
         good: list[Art] = []
         for a in live:
@@ -1206,16 +1257,18 @@ def apply(d: Dieline, items: list[dict[str, Any]], params: Any, board: Any) -> N
                 mine = [i for i in r.invalid if any(o.startswith(a.id + ".") or o == "outline" for o in i.ops)]
                 issue = (mine or r.invalid)[0]
                 a.status, a.reason = "stale", friendly(f"{issue.message}; move or resize {a.name}", trial)
-        # Redraw from the drafts (bridges depend on what else is live).
+        if len(good) == len(live):  # each fits alone but not together: never loop on it
+            for a in live:
+                a.status, a.reason = "stale", f"{a.name} breaks the design together with the other artwork"
         for a in arts:
             if a.status == "ok":
                 try:
                     _draft(a, ctx, part_pointage)
                 except (ArtworkError, src.SourceError, ValueError) as exc:
                     a.status, a.reason = "stale", str(exc)
-    live = [a for a in arts if a.status == "ok"]
-    final = compose(live)
-    report = validate(final)
+    for a in arts:
+        if a.status != "ok":
+            a.islands = []
     d.segments, d.ops = final.segments, final.ops
     tags: dict[Segment, dict[str, Any]] = d.extras.get("tags") or {}  # type: ignore[assignment]
     for a in live:

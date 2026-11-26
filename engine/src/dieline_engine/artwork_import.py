@@ -40,6 +40,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_ELEMENTS = 5000
 MAX_ENTITIES = 20000
 MAX_DEPTH = 8
+MAX_NESTED_COMPARE = 200  # closed subpaths of one filled path compared for the fill-rule note
 MAX_IMPORT_PATH_CHARS = 500_000
 UNITS_IN = {"in": 1.0, "mm": 1 / 25.4, "cm": 1 / 2.54, "pt": 1 / 72, "pc": 1 / 6, "ft": 12.0, "m": 1000 / 25.4}
 
@@ -174,7 +175,10 @@ def _length(v: str | None, what: str) -> tuple[float, str] | None:
     m = _LEN.match(v)
     if not m:
         raise ImportRefused(f"can't read the SVG {what} {v!r}")
-    return float(m.group(1)), m.group(2)
+    x = float(m.group(1))
+    if not math.isfinite(x):
+        raise ImportRefused(f"the SVG {what} {v!r} isn't finite")
+    return x, m.group(2)
 
 
 def _transform(text: str | None) -> Affine:
@@ -223,6 +227,8 @@ def _num(el: Any, name: str, default: float | None = None) -> float:
 
 def _points(text: str | None) -> list[Point]:
     nums = [float(x) for x in re.findall(_NUM, text or "")]
+    if not all(math.isfinite(x) for x in nums):
+        raise SourceError("a <polygon> or <polyline> with a point that isn't finite")
     return [(nums[i], nums[i + 1]) for i in range(0, len(nums) - 1, 2)]
 
 
@@ -289,12 +295,29 @@ def parse_svg(data: bytes) -> Parsed:
     out = Parsed([], None, format="svg")
     # Units: a physical width/height with a viewBox sets inches per user unit.
     vb = [float(x) for x in re.findall(_NUM, root.get("viewBox") or "")]
+    if not all(math.isfinite(x) for x in vb):
+        raise ImportRefused("the SVG's viewBox has a number that isn't finite")
     wl, hl = _length(root.get("width"), "width"), _length(root.get("height"), "height")
     k = None
     physical = ("in", "mm", "cm", "pt", "pc")
-    for dim, idx in ((wl, 2), (hl, 3)):
-        if k is None and dim and dim[1] in physical and dim[0] > 0:
-            k = dim[0] * UNITS_IN[dim[1]] / vb[idx] if len(vb) == 4 and vb[idx] > 0 else 1 / 96
+    ks = [dim[0] * UNITS_IN[dim[1]] / vb[idx] if len(vb) == 4 and vb[idx] > 0 else 1 / 96
+          for dim, idx in ((wl, 2), (hl, 3)) if dim and dim[1] in physical and dim[0] > 0]
+    if ks:
+        k = ks[0]
+    if len(ks) == 2 and abs(ks[0] - ks[1]) > 1e-6 * max(ks):
+        # The viewBox has another shape than width x height: SVG fits it in (preserveAspectRatio, meet by
+        # default), so the drawing is at the smaller scale, centred. "none" would stretch it, which a
+        # uniform import can't do.
+        par = (root.get("preserveAspectRatio") or "xMidYMid meet").split()
+        if par and par[0] == "none":
+            raise ImportRefused("the SVG stretches its drawing to a width and height of another shape "
+                                "(preserveAspectRatio none); artwork is scaled uniformly, so fix the file's size or "
+                                "viewBox")
+        slice_ = len(par) > 1 and par[1] == "slice"
+        k = max(ks) if slice_ else min(ks)
+        out.notes.append(f"the SVG's viewBox isn't the shape of its width and height, so it's scaled as SVG "
+                         f"{'slices' if slice_ else 'fits'} it ({'the larger' if slice_ else 'the smaller'} of the "
+                         "two scales)" + ("; what the slice clips off is imported whole" if slice_ else ""))
     out.units_in = k
     if k is None:
         out.notes.append("the SVG has no physical size (px or no units), so the artwork needs a width, height or "
@@ -312,6 +335,7 @@ def parse_svg(data: bytes) -> Parsed:
     notes: list[str] = []
     corrections: list[float] = []
     drawn = 0
+    visits = 0  # every element walked, with <use> expanded: a small file of nested uses can't run away
 
     def note(text: str) -> None:
         if text not in notes:
@@ -321,7 +345,11 @@ def parse_svg(data: bytes) -> Parsed:
         unsupported[what] = unsupported.get(what, 0) + 1
 
     def walk(el: Any, m: Affine, depth: int, hidden: bool, chain: tuple[str, ...]) -> None:
-        nonlocal drawn
+        nonlocal drawn, visits
+        visits += 1
+        if visits > MAX_ELEMENTS * 4:
+            raise ImportRefused(f"the SVG has more than {MAX_ELEMENTS * 4} elements once its <use> references "
+                                "are expanded")
         tag = _tag(el)
         st = _style(el)
         here = compose(m, _transform(el.get("transform")))
@@ -375,8 +403,11 @@ def parse_svg(data: bytes) -> Parsed:
         fill, stroke = st.get("fill"), st.get("stroke")
         if fill == "none" and stroke not in (None, "none"):
             note("stroke-only shapes are imported as their centre lines, not their stroke's outline")
-        if (fill or "black") != "none" and len(subs) > 1 and st.get("fill-rule", "nonzero") == "nonzero" and \
-                _same_way_nested(subs):
+        nonzero = (fill or "black") != "none" and len(subs) > 1 and st.get("fill-rule", "nonzero") == "nonzero"
+        if nonzero and sum(1 for s in subs if s.closed) > MAX_NESTED_COMPARE:
+            note("a filled path has too many outlines to compare which way each runs (fill-rule nonzero), so the "
+                 "file may show solid what is cut: check the retained and discarded result")
+        elif nonzero and _same_way_nested(subs):
             note("a filled path's inner outline runs the same way as its outer one (fill-rule nonzero), so the "
                  "file shows it solid, but both outlines are cut: the inside comes out or stays as an island")
         flip = (1.0, 0.0, 0.0, -1.0, 0.0, 0.0)  # y down to y up
@@ -443,6 +474,26 @@ READ = {"LINE", "ARC", "CIRCLE", "LWPOLYLINE", "POLYLINE", "SPLINE", "ELLIPSE", 
 SILENT = {"VERTEX", "SEQEND", "ENDBLK", "ATTRIB", "ATTDEF"}
 
 
+def _float(v: str, what: str) -> float:
+    """A DXF value as a finite number; anything else refuses the import."""
+    try:
+        x = float(v)
+    except ValueError:
+        raise ImportRefused(f"the DXF has {what} that isn't a number ({v[:20]!r})") from None
+    if not math.isfinite(x):
+        raise ImportRefused(f"the DXF has {what} that isn't finite ({v[:20]!r})")
+    return x
+
+
+def _int(v: str | None, default: int, what: str) -> int:
+    if v is None or not v.strip():
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        raise ImportRefused(f"the DXF has {what} that isn't a whole number ({v[:20]!r})") from None
+
+
 def _pairs(text: str) -> list[tuple[int, str]]:
     lines = text.splitlines()
     out = []
@@ -472,13 +523,13 @@ class _Ent:
             if default is None:
                 raise SourceError(f"a {self.type} without group {code}")
             return default
-        x = float(v)
-        if not math.isfinite(x):
-            raise SourceError(f"a {self.type} with a value that isn't finite")
-        return x
+        return _float(v, f"a {self.type} value (group {code})")
+
+    def i(self, code: int, default: int) -> int:
+        return _int(self.get(code), default, f"a {self.type} value (group {code})")
 
     def all(self, code: int) -> list[float]:
-        return [float(v) for c, v in self.codes if c == code]
+        return [_float(v, f"a {self.type} value (group {code})") for c, v in self.codes if c == code]
 
 
 def _entities(pairs: list[tuple[int, str]], start: int, stop_at: str) -> tuple[list[_Ent], int]:
@@ -556,9 +607,9 @@ def parse_dxf(data: bytes) -> Parsed:
                 if pairs[j][0] == 2:
                     name = pairs[j][1]
                 elif pairs[j][0] == 10:
-                    bx = float(pairs[j][1])
+                    bx = _float(pairs[j][1], "a BLOCK base point")
                 elif pairs[j][0] == 20:
-                    by = float(pairs[j][1])
+                    by = _float(pairs[j][1], "a BLOCK base point")
                 j += 1
             base = (bx, by)
             ents, j = _entities(pairs, j, "ENDBLK")
@@ -583,7 +634,7 @@ def parse_dxf(data: bytes) -> Parsed:
 
     def colour_rule(e: _Ent, inherited: int | None) -> tuple[str | None, bool]:
         """(rule from its colour, whether it's on a layer that's off)."""
-        col = int(e.get(62, "256") or 256)
+        col = e.i(62, 256)
         lay = (e.get(8, "0") or "0").casefold()
         off = layer_colour.get(lay, 7) < 0
         if col == 0 and inherited is not None:  # BYBLOCK
@@ -681,15 +732,15 @@ def parse_dxf(data: bytes) -> Parsed:
                 x = None
                 for code, val in e.codes:
                     if code == 10:
-                        x = float(val)
+                        x = _float(val, "an LWPOLYLINE vertex")
                     elif code == 20 and x is not None:
-                        verts.append(((x, float(val)), 0.0))
+                        verts.append(((x, _float(val, "an LWPOLYLINE vertex")), 0.0))
                     elif code == 42 and verts:
-                        verts[-1] = (verts[-1][0], float(val))
-                closed = int(e.get(70, "0") or 0) & 1 == 1
+                        verts[-1] = (verts[-1][0], _float(val, "an LWPOLYLINE bulge"))
+                closed = e.i(70, 0) & 1 == 1
                 poly(e, verts, closed, mm, rule)
             elif t == "POLYLINE":
-                flags = int(e.get(70, "0") or 0)
+                flags = e.i(70, 0)
                 if flags & (8 | 16 | 64):
                     out_of_plane.append("a 3D POLYLINE or mesh")
                     return
@@ -706,7 +757,7 @@ def parse_dxf(data: bytes) -> Parsed:
                 if abs(e.f(210, 0.0)) > 1e-9 or abs(e.f(220, 0.0)) > 1e-9 or abs(abs(nz) - 1) > 1e-9:
                     out_of_plane.append("a SPLINE whose plane isn't the drawing's")
                     return
-                deg = int(e.get(71, "3") or 3)
+                deg = e.i(71, 3)
                 knots = e.all(40)
                 weights = e.all(41)
                 xs, ys = e.all(10), e.all(20)
@@ -720,7 +771,7 @@ def parse_dxf(data: bytes) -> Parsed:
                 except CurveError as exc:
                     raise SourceError(str(exc)) from None
                 curve = Nurbs(deg, tuple(knots), tuple(ctrl), tuple(weights))
-                closed = int(e.get(70, "0") or 0) & 1 == 1 and math.dist(curve.point(0), curve.point(1)) < 1e-9
+                closed = e.i(70, 0) & 1 == 1 and math.dist(curve.point(0), curve.point(1)) < 1e-9
                 emit(Sub([curve], True) if closed else curve, m, rule)
             elif t == "ELLIPSE":
                 zcheck(e, 30, 31)
@@ -731,6 +782,9 @@ def parse_dxf(data: bytes) -> Parsed:
                 c = (e.f(10), e.f(20))
                 u = (e.f(11), e.f(21))
                 ratio = e.f(40)
+                if not 1e-9 < ratio <= 1 + 1e-9 or math.hypot(*u) <= 1e-12:
+                    raise SourceError("an ELLIPSE with no size (its axis or ratio is zero, or the ratio isn't "
+                                      "between 0 and 1)")
                 v = (-u[1] * ratio, u[0] * ratio) if nz > 0 else (u[1] * ratio, -u[0] * ratio)
                 t0, t1 = e.f(41, 0.0), e.f(42, math.tau)
                 span = (t1 - t0) % math.tau or math.tau
@@ -740,7 +794,7 @@ def parse_dxf(data: bytes) -> Parsed:
             elif t == "INSERT":
                 if depth >= MAX_DEPTH:
                     raise ImportRefused("blocks nest more than 8 deep")
-                if int(e.get(70, "1") or 1) > 1 or int(e.get(71, "1") or 1) > 1:
+                if e.i(70, 1) > 1 or e.i(71, 1) > 1:
                     unsupported["arrayed INSERT (rows or columns)"] = unsupported.get("arrayed INSERT (rows or "
                                                                                       "columns)", 0) + 1
                     return
@@ -760,9 +814,11 @@ def parse_dxf(data: bytes) -> Parsed:
                             (sx, 0.0, 0.0, sy, 0.0, 0.0)),
                     (1.0, 0.0, 0.0, 1.0, -base[0], -base[1]))
                 mm = compose(compose(m, ocs(e)), t_ins)
-                col = int(e.get(62, "256") or 256)
+                col = e.i(62, 256)
                 for ch in ents:
                     handle(ch, mm, depth + 1, col if col not in (0, 256) else inherited)
+        except ImportRefused:
+            raise  # a limit, or a file that can't be read: never listed and skipped
         except (SourceError, ValueError) as exc:
             key = f"an unreadable {t} ({exc})"
             unsupported[key] = unsupported.get(key, 0) + 1

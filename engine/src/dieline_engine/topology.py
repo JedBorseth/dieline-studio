@@ -48,6 +48,8 @@ class Issue:
     message: str
     point: Point | None = None
     ops: tuple[str, ...] = ()
+    # An island or split: the drawn segments its board's outer boundary runs along (its exact identity).
+    segs: tuple[Segment, ...] = field(default=(), compare=False, repr=False)
 
 
 @dataclass(slots=True)
@@ -997,7 +999,8 @@ def _material(arr: _Arrangement, rep: Report, tagged: bool) -> None:
         msg = ("a cut divides the blank into separate pieces" if sliced
                else "a piece of board inside a cut-out has nothing holding it (an island)")
         e = arr.edges[b[1][0][0]]
-        rep.islands.append(Issue(kind, msg, e.mid()))
+        bound = tuple(dict.fromkeys(arr.edges[i].piece.seg for i, _ in b[1]))
+        rep.islands.append(Issue(kind, msg, e.mid(), segs=bound))
     # Every rule and every open cut must lie on the board (closed contours are the boundary itself).
     for i, e in enumerate(arr.edges):
         if e.piece.seg.type == LineType.CUT and e.op.closed:
