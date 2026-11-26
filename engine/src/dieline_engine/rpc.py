@@ -66,6 +66,7 @@ class Server:
             "settings.update": self._settings_update,
             "chat.send": self._chat_send,
             "chat.set_design": self._chat_set_design,
+            "layout.choose": self._layout_choose,
             "chat.cancel": lambda p: self.agent.cancel(_str(p, "session_id")) or {"ok": True},
             "chat.reset": lambda p: self.agent.reset(_str(p, "session_id")) or {"ok": True},
         }
@@ -159,7 +160,7 @@ class Server:
             raw = p["parts"]
             if not isinstance(raw, list) or not raw or not all(isinstance(x, dict) for x in raw):
                 raise RpcError(INVALID_PARAMS, "parts must be a non-empty list of parts")
-            parts = [{**x, "params": BoxParams.model_validate(x.get("params") or {})} for x in raw]
+            parts = [{**x, "params": designs.parse_params(x.get("params") or {})} for x in raw]
             return self.agent.set_parts(_str(p, "session_id"), parts, p.get("groups") or [], p.get("links") or [],
                                         expected)
         params = BoxParams.model_validate(p.get("params") or {})
@@ -243,6 +244,14 @@ class Server:
         """Older name for design.replace."""
         self.agent.set_design(_str(p, "session_id"), BoxParams.model_validate(p.get("params") or {}))
         return {"ok": True}
+
+    def _layout_choose(self, p: dict[str, Any]) -> dict[str, Any]:
+        """The designer clicked a product-mode layout card: commit that candidate (refused if it expired)."""
+        action, set_id = p.get("action"), p.get("set_id")
+        for k, v in (("action", action), ("set_id", set_id)):
+            if v is not None and not isinstance(v, str):
+                raise RpcError(INVALID_PARAMS, f"{k} must be a string")
+        return self.agent.choose_layout(_str(p, "session_id"), _str(p, "candidate_id"), action, set_id)
 
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))

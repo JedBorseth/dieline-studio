@@ -30,6 +30,8 @@ CATEGORY_OF = {
     "machines": "machine", "preflight_panels": "machine", "preflight_pointage": "machine",
     "board": "calibration", "rounding": "calibration", "calibration": "calibration",
 }
+# Checks named by prefix: stale links, partition pieces and sets, fit links and stacks.
+PREFIX_CATEGORY = (("link_", "geometry"), ("partition_", "partition"), ("fit_", "fit"), ("stack_", "fit"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +47,8 @@ class CheckResult:
     def to_dict(self) -> dict[str, object]:
         out = asdict(self)
         if out.get("category") is None:
-            cat = CATEGORY_OF.get(self.id) or ("geometry" if self.id.startswith("link_") else None)
+            cat = CATEGORY_OF.get(self.id) or next(
+                (c for pre, c in PREFIX_CATEGORY if self.id.startswith(pre)), None)
             if cat:
                 out["category"] = cat
         if out.get("region") is not None:

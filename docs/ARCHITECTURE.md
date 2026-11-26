@@ -43,12 +43,21 @@ Line-delimited JSON-RPC 2.0. TypeScript types are in `app/src/lib/protocol.ts`, 
 | `settings.get` / `settings.update` | Model, effort, export folder, API key (write-only) |
 | `chat.send` / `chat.cancel` / `chat.reset` | Start, stop or clear a chat turn; progress arrives as events |
 | `chat.set_design` | Older name for `design.replace` |
+| `layout.choose` | The designer clicked a product-mode layout card: commit that candidate (refused once it has expired) |
 
 Notifications use method `event` with a `type`: `engine.ready`, `chat.text`, `chat.thinking`, `chat.tool_start`, `chat.tool_result`, `chat.error`, `chat.turn_end` and `design`. The shell adds `engine.exit`.
 
 ## Designs, revisions and parts
 
 The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, provenance (structure or feature), `feature_id` and `face_id` (a structure hinge's face is the face it hinges), and stale features' ghosts. A part's payload also lists its features as resolved (faces, copies, a plain-words summary, status) and each export target's readiness (`targets`). A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
+
+## Partitions
+
+Slotted partition sets (`partitions.py`, drawn by `styles/partitions.py`). Every input mode becomes one grid: the installed clear cells along the long and short axes, the walls between them (each a piece with its board) and the rules. `plan_set` does the arithmetic once (cells + walls = box span, piece length = span − clearance, slot centres from the first wall), sizes each slot from the **mating** piece's caliper, and splits the walls into piece types: one part per distinct plan, with its quantity, in a `partition_set` group. A part's parameters are the set's grid plus its role, so it rebuilds alone. Slots are cut into the piece's one closed outline: lead-in mouths, square or full-radius bottoms (round when at least twice the 1/8" bend radius). Each piece has a face map with one face, `piece`. The rules are industry defaults (`partition-rules-1`), and every partition carries a "not calibrated" warning.
+
+`partsets.py` holds the design changes (add a set, `replace_set` keeping the group id and matching pieces by role, fit links, stacks, removing a set). `layouts.py` keeps product-mode candidates per chat, each tied to the design revision, board values and rule version it was made from. `expressions.py` evaluates typed length expressions (`D - 1/2`, `2 * CAL`) for partition values.
+
+The design's own checks (`fit.py`, run with every payload): each set's crossings (interlock, reciprocity, small cells), each fit link (container inside vs contained outside), stacks (tiers plus pads against the depth), two sets in one box without a stack, and the "not checked" notes.
 
 ## Styles, boards and units
 
@@ -84,6 +93,8 @@ Checks:
 - board-value and calibration warnings
 - feature checks (`feature_checks.py`), each naming the copy ("vent 3 of 4 on P3") with a region to zoom to: clearance from the face's scores, slots and edges and from other features, handhole carry and side webs, the combined ligament above a handhole, flutes along a handhole's long side or a tear strip, the glue landing zone, overlap bands without a matching cut-out, perforation cuts on creases and short ties on thick board, tear-strip width, tab position and joint. Their limits are provisional and flagged.
 - machines report what they can make as well as the sheets they take: a part with a die-cut feature lists only machines that can die-cut (the slotter's die-cutting isn't confirmed, so it isn't listed)
+- partition pieces: slot fit, residual web, mouths and rims, height against the box depth, orientation notes, calibration (`partitions.piece_checks`). Refused before a set exists: slots that don't overlap (usable depths, round bottoms counted), a slot that cuts through, a slot narrower than its mating board, slots or mouths that run together, cells of 0 or less, a 1 × n set without `confirm_degenerate`, and 1 × 1.
+- the design's own checks (`fit.py`): partition sets, fit links and stacks, shown above the part tabs
 
 Each check has a category; geometry, feature, fold, partition, artwork and fit are actionable and shown apart from calibration, board and machine notices.
 
@@ -101,8 +112,12 @@ The model's tools:
 |---|---|
 | `list_options` | Styles (with options) and boards |
 | `create_box(style, L, W, D, units, board, options, action?, label?, quantity?, features?, dry_run?)` | Generate, check and show in the preview. `action: add` adds another part instead of replacing the design. The result includes a picture of the part, so every design is looked at. |
-| `update_part(part?, ..., features?)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values. A resize re-resolves every feature (one that no longer fits goes stale) and can carry feature changes. |
+| `update_part(part?, ..., features?)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values. A resize re-resolves every feature (one that no longer fits goes stale) and can carry feature changes. A partition piece can only be relabelled; `remove_part` with a set or stack id removes the group (a set takes its pieces). |
 | `set_features(part?, items?, remove?, dry_run?)` | Features by batch upsert: an item without an id is new, one with an id changes that feature (fields left out keep their values), `remove` deletes. A feature the call adds or changes that can't be placed is refused. The result has each feature's faces and plain-words summary, and the picture shows the measured offsets. |
+| `create_partition(input_mode, ..., action?, set_id?, contained_in?, confirm_degenerate?, label?, dry_run?)` | A slotted partition set from `box_cells`, `cell_sizes` or `pieces`: one part per distinct piece in a `partition_set` group, a fit link when `contained_in` names its box, and a read-back of the layout, cells, pieces, flute and "not calibrated". Actions: `add`, `replace_design`, `replace_set` (keeps the group id). `product` mode returns layout candidates as chat cards and draws nothing. |
+| `choose_layout(candidate_id, message_id, ...)` | Commits a product-mode candidate, only after the designer named it in that message (recorded in the set). The designer's card click does the same without the model. |
+| `link_fit(container, contained)` / `unlink_fit(link)` | Fit links between parts and groups, checked on every revision |
+| `create_stack(tiers, pads?, pad_board?, contained_in?)` | Partition sets in tiers with layer pads, checked against the box's depth |
 | `export_files(filename?, formats?, replace?, dxf_expand_perfs?)` | Write every part's CF2 and/or DXF plus the manifest; sample-table files that need a pickup wait for the designer |
 | `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, faces named from the face map (GL, P4 … P1), feature offsets marked edge or centre, optional zoom window (`render.py`) |
 | `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |
@@ -112,7 +127,7 @@ The model's tools:
 | `web_search(query)` | Client-side search through the provider chosen in Settings: Exa (via its hosted MCP endpoint) or Tavily, keyless or with the user's key. Modelled on OpenCode (`web.py`). |
 | `web_fetch(url, format?)` | Client-side fetch following OpenCode's webfetch rules, plus a block on private and local-network addresses (`web.py`) |
 
-The model never writes coordinates. It reads them to check its work. Feature tools take parameters and placements; the system prompt adds the placement rules (outside view, always edge or centre, ask when the request doesn't say) and a read-back after every feature change. The model can mention a feature as `[handhole f1](feature:p1/f1)`; the chat shows it as a chip that highlights it in the preview. `create_box` and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
+The model never writes coordinates. It reads them to check its work. Feature tools take parameters and placements; the system prompt adds the placement rules (outside view, always edge or centre, ask when the request doesn't say) and a read-back after every feature change. The model can mention a feature as `[handhole f1](feature:p1/f1)`; the chat shows it as a chip that highlights it in the preview. `create_box`, `create_partition` (the set's plan view and each piece) and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
 
 **Reference folders:** by default, only the work OneDrive synced on the PC (`OneDriveCommercial`). Personal OneDrive is never included unless added in Settings.
 

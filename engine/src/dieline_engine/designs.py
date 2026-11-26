@@ -10,7 +10,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer  # noqa: F401
 
 from .boards import BOARDS, DEFAULT_BOARD, get_board
 from .cf2 import read_cf2, write_cf2
@@ -121,7 +121,11 @@ class BoxParams(BaseModel):
         return dims
 
 
-def build(params: BoxParams) -> Dieline:
+def build(params: "BoxParams | PartParams") -> Dieline:
+    if _is_partition(params):
+        from . import partitions
+
+        return partitions.build(params)  # type: ignore[arg-type]
     style = get_style(params.style)
     board = get_board(params.board)
     d = style.make(params.dims_in(), board, params.options)
@@ -149,21 +153,53 @@ def _feature_meta(d: Dieline) -> None:
     d.meta["features"] = [{"id": b.id, "kind": b.kind, "status": b.status} for b in built]
 
 
+# A part's parameters: a standard box, or one piece of a partition set (partitions.py).
+PartParams = Any
+
+
+def _is_partition(params: Any) -> bool:
+    return getattr(params, "style", None) == "partition-slotted"
+
+
+def parse_params(raw: Any) -> Any:
+    """A part's parameters from JSON (a job record, the UI): a standard box or a partition piece."""
+    if isinstance(raw, BaseModel):
+        return raw
+    if isinstance(raw, dict) and raw.get("style") == "partition-slotted":
+        from .partitions import PartitionParams
+
+        return PartitionParams.model_validate(raw)
+    return BoxParams.model_validate(raw)
+
+
+def record_params(params: Any, dieline: Dieline) -> dict:
+    """Parameters as a job record keeps them: options resolved to their values,
+    so a later default change can't alter a reopened job."""
+    if _is_partition(params):
+        return params.model_dump()
+    return {**params.model_dump(), "options": dieline.meta.get("options", params.options)}
+
+
 class GeometryRefused(ValueError):
     """The parameters produce geometry that can't be made (an undeclared
     crossing, overlap or open cut). Nothing becomes a design."""
 
 
-def _validated(params: BoxParams) -> tuple[Dieline, list]:
+def _validated(params: Any) -> tuple[Dieline, list]:
     dieline = build(params)
     report = dieline.extras.get("report") or validate(dieline)
     if not report.ok:
         issues = "; ".join(i.message for i in report.invalid[:3])
         raise GeometryRefused(f"these parameters give geometry that can't be made: {issues}")
-    return dieline, run_checks(dieline, report)
+    results = run_checks(dieline, report)
+    if _is_partition(params):
+        from . import partitions
+
+        results += partitions.checks_for(params)
+    return dieline, results
 
 
-def create_box(params: BoxParams) -> dict:
+def create_box(params: Any) -> dict:
     dieline, results = _validated(params)
     from .rules import readiness  # noqa: PLC0415
 
@@ -178,12 +214,12 @@ def create_box(params: BoxParams) -> dict:
         # Each export target's readiness: a target-specific block (an unverified rule) isn't in overall.
         "targets": readiness(dieline),
     }
-    if params.features:
+    if getattr(params, "features", None):
         out["features"] = [b.to_dict() for b in dieline.extras.get("features", [])]  # type: ignore[union-attr]
     return out
 
 
-def face_map(params: BoxParams, full: bool = False) -> dict:
+def face_map(params: Any, full: bool = False) -> dict:
     """The named faces of a design: the compact view a model uses to name positions,
     or (full) every frame, reference line, edge span, keep-out and hinge."""
     d = build(params)

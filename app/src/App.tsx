@@ -99,6 +99,11 @@ export default function App() {
             onSend={(text) => void send(active.id, text)}
             onStop={() => void request("chat.cancel", { session_id: active.id }).catch(() => undefined)}
             onOpenSettings={openSettings}
+            onChooseLayout={async (candidateId) => {
+              const sessionId = active.id;
+              const design = await request("layout.choose", { session_id: sessionId, candidate_id: candidateId });
+              dispatch({ type: "preview", source: { kind: "design", design, origin: "form" }, sessionId });
+            }}
           />
           <Splitter
             onDrag={resizePreview}

@@ -75,6 +75,29 @@ export function formatToolLabel(
     }
     case "list_faces":
       return `list_faces${str(args.part) ? ` · ${str(args.part)}` : ""} · panels, flaps and their edges`;
+    case "create_partition": {
+      const mode = str(args.input_mode);
+      const cands = (result as { candidates?: unknown[] } | undefined)?.candidates;
+      const cells =
+        typeof args.cells_long === "number" && typeof args.cells_short === "number"
+          ? ` · ${args.cells_long} × ${args.cells_short} cells`
+          : "";
+      const count = typeof args.count === "number" ? ` · ${args.count} items` : "";
+      const tail = Array.isArray(cands) ? ` · ${cands.length} layout${cands.length === 1 ? "" : "s"} to choose from` : "";
+      return `create_partition${mode ? ` · ${mode}` : ""}${cells}${count}${tail}`;
+    }
+    case "choose_layout":
+      return `choose_layout${str(args.candidate_id) ? ` · ${str(args.candidate_id)}` : ""}${
+        str(args.message_id) ? ` (named in ${str(args.message_id)})` : ""
+      }`;
+    case "link_fit":
+      return `link_fit · ${str(args.contained)} in ${str(args.container)}`;
+    case "unlink_fit":
+      return `unlink_fit · ${str(args.link)}`;
+    case "create_stack":
+      return `create_stack${Array.isArray(args.tiers) ? ` · ${args.tiers.length} tiers` : ""}${
+        typeof args.pads === "number" ? ` · ${args.pads} pads` : ""
+      }`;
     case "update_part":
       return `update_part${str(args.part) ? ` · ${str(args.part)}` : ""}`;
     case "remove_part":

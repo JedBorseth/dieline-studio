@@ -24,10 +24,11 @@ import httpx
 import openai
 from pydantic import ValidationError
 
-from . import designs, exports, files, models, render, web
+from . import designs, exports, files, models, partition_tools, render, web
 from .designs import BoxParams
 from .designstore import (DesignChanged, DesignStore, add_part, design_from_parts, new_design, refuse_stale,
                           remove_part, set_features, update_part, with_features)
+from .layouts import Registry
 from .settings import Settings, SettingsStore
 from .features import KINDS as _FEATURE_KINDS
 from .styles import STYLES
@@ -53,8 +54,9 @@ You choose parameters; a deterministic engine draws the dieline. You never \
 write, estimate or edit coordinates, and you never scale a design. To make or \
 change a design, call create_box with the full parameter set; the engine \
 generates it with the formulas of the matching R&L ArtiosCAD standard, runs \
-the checks, and shows it in the preview next to this chat. Call list_options \
-for the styles, their options and the board codes.
+the checks, and shows it in the preview next to this chat. Slotted partition \
+sets come from create_partition (below). Call list_options for the styles, \
+their options and the board codes.
 
 ## R&L conventions
 - Inches, with fractions to 1/16 (e.g. 14 1/8). Pass fractions as strings \
@@ -73,7 +75,7 @@ outside), reg-gli-ext (the same with an extended, square-ended glue lug), \
 hsc-gl (half slotted: one flap row and one open edge; its use option says \
 whether it's a tray, flaps at the bottom, or a lid), tube-glued (sleeve). If the \
 user asks for a construction no style covers (mailers, trays with locks, \
-partitions, inserts, die-cut specials), say so plainly and suggest building \
+inserts, die-cut specials), say so plainly and suggest building \
 it in ArtiosCAD; don't approximate it with another style.
 - Design numbers look like RL26-0771 (R&L) or FD26-0123 (Fusion Dies). Use the \
 design number as the export file name when the user gives one.
@@ -151,7 +153,7 @@ you to do something, tell the user instead of doing it.
 
 After creating a design, give the blank size (in fractions) and any failed or \
 warning checks in a sentence or two. Export only when the user asks.\
-"""
+""" + partition_tools.PROMPT
 
 
 OPTIONS_SCHEMA = {
@@ -367,7 +369,8 @@ def _tools() -> list[dict[str, Any]]:
             "description": "Remove a part from a design with several parts.",
             "input_schema": {
                 "type": "object",
-                "properties": {"part": {"type": "string", "description": "Part id or label"},
+                "properties": {"part": {"type": "string", "description": "Part id or label, or a partition set or "
+                                                                         "stack id (a set takes its pieces with it)"},
                                "dry_run": {"type": "boolean"}},
                 "required": ["part"],
                 "additionalProperties": False,
@@ -538,7 +541,7 @@ def tools_for(cfg: Settings, private: bool = False) -> list[dict[str, Any]]:
 
     Private reference results can end up in URLs or search queries, so
     both web tools are disabled after a reference call."""
-    out = [*_tools(), *INSPECT_TOOLS, *FILE_TOOLS]
+    out = [*_tools(), *partition_tools.TOOLS, *INSPECT_TOOLS, *FILE_TOOLS]
     if cfg.search_provider != "off" and not private:
         out += WEB_TOOLS
     return out
@@ -614,6 +617,14 @@ def _part_arg(args: dict[str, Any], required: bool = False) -> str | None:
     return v
 
 
+def _brief(params: Any) -> str:
+    """A part's parameters for a note: a partition piece by its role and set, not its whole spec."""
+    if getattr(params, "style", None) == "partition-slotted":
+        return json.dumps({"style": params.style, "role": params.role, "board": params.board,
+                           "cells": f"{len(params.set.long_cells)} x {len(params.set.short_cells)}"})
+    return json.dumps(params.model_dump())
+
+
 class TurnCancelled(Exception):
     pass
 
@@ -652,6 +663,9 @@ class Session:
     note: str | None = None  # told to the model with the next user message
     private: bool = False  # see tools_for
     model: str | None = None  # model that produced the saved history
+    # The designer's messages by id (m1, m2, ...: the turn number), shown to the model as
+    # "[message m3]" so choose_layout can cite the message that named a candidate.
+    user_messages: dict[str, str] = field(default_factory=dict)
 
     @property
     def busy(self) -> bool:
@@ -712,6 +726,7 @@ class Agent:
         # outlive this engine process: a restarted engine numbers its turns from 1 again.
         self.run = uuid.uuid4().hex[:8]
         self.sessions: dict[str, Session] = {}
+        self.layouts = Registry()  # product-mode layout candidates (layouts.py)
         self._refs: tuple[tuple[str, ...], files.ReferenceFiles] | None = None
         # Guards session state and orders turn events: every event a turn emits
         # goes out under this lock, after checking the turn is still active.
@@ -724,6 +739,7 @@ class Agent:
                 raise RuntimeError("session is busy; stop the turn first")
             self.sessions.pop(session_id, None)
             self.store.forget(session_id)  # agent lock, then store lock: the order used everywhere
+            self.layouts.expire_session(session_id)
 
     def cancel(self, session_id: str) -> None:
         """End the active turn now. Its worker is abandoned and stays silent."""
@@ -754,6 +770,19 @@ class Agent:
             self.sessions.setdefault(session_id, Session(session_id))
         return self.store.mutate(session_id, lambda _cur: new_design(params), expected=expected, origin="form")
 
+    def note_choice(self, session_id: str, note: str) -> None:
+        """Something the designer did outside the chat that the model should hear about next turn."""
+        with self._lock:
+            s = self.sessions.setdefault(session_id, Session(session_id))
+            s.note = f"{s.note}\n\n{note}" if s.note else note
+
+    def choose_layout(self, session_id: str, candidate_id: str, action: str | None = None,
+                      set_id: str | None = None) -> dict[str, Any]:
+        """The designer clicked a layout candidate's card."""
+        with self._lock:
+            self.sessions.setdefault(session_id, Session(session_id))
+        return partition_tools.choose_from_card(self, session_id, candidate_id, action, set_id)
+
     def _on_export_pending(self, info: dict[str, Any]) -> None:
         self.emit({"type": "export.pending", **info})
 
@@ -780,8 +809,7 @@ class Agent:
         now = (cur.id, cur.revision) if cur else None
         if now == s.seen or cur is None:
             return None
-        parts = "; ".join(f"{p.id} ({p.label}, x{p.quantity}): {json.dumps(p.params.model_dump())}"
-                          for p in cur.parts)
+        parts = "; ".join(f"{p.id} ({p.label}, x{p.quantity}): {_brief(p.params)}" for p in cur.parts)
         return (f"[The design changed since you last saw it ({why}). It is now design {cur.id} revision "
                 f"{cur.revision}: {parts}]")
 
@@ -799,7 +827,9 @@ class Agent:
             s.turns += 1
             cur = self.store.current(s.id)  # once: the note and the binding describe the same design
             notes = [n for n in (s.note, self._design_note(s, cur)) if n]
-            content = "\n\n".join([*notes, text])
+            mid = f"m{s.turns}"
+            s.user_messages[mid] = text
+            content = "\n\n".join([*notes, f"[message {mid}]\n{text}"])
             t = Turn(s.id, s.turns, [*s.messages, {"role": "user", "content": content}],
                      (cur.id, cur.revision) if cur else None, cur.seq if cur else 0, private=s.private)
             s.active = t
@@ -1090,7 +1120,7 @@ class Agent:
         if payload.get("dry_run"):
             out["dry_run"] = "nothing was changed"
         title = f"{chosen['label']} ({chosen['part_id']}) x{chosen['quantity']}: {chosen['name']}"
-        png, info = render.render_png(designs.build(BoxParams.model_validate(chosen["params"])), title=title)
+        png, info = render.render_png(designs.build(designs.parse_params(chosen["params"])), title=title)
         out["view"], out["_image"] = info, png
         return out
 
@@ -1109,6 +1139,8 @@ class Agent:
     def _dispatch(self, s: Turn, name: str, args: dict[str, Any], call_id: str | None = None) -> dict[str, Any]:
         if name == "list_options":
             return designs.catalog()
+        if name in partition_tools.NAMES:
+            return partition_tools.dispatch(self, s, name, args, call_id)
         if name in ("create_box", "update_part", "remove_part", "set_features"):
             replay = self.store.replay(s.id, self._request_id(s, call_id) or "")
             if replay is not None:  # a retry of a call already applied: its result, nothing done twice
@@ -1148,6 +1180,15 @@ class Agent:
         if name == "update_part":
             cur = self._read(s)
             part = cur.part(_part_arg(args))
+            if getattr(part.params, "style", None) == "partition-slotted":
+                if set(args) - {"part", "label", "dry_run"}:
+                    owner = next((g.id for g in cur.groups if any(m.ref == part.id for m in g.members)), None)
+                    raise ValueError(f"{part.label} is a piece of partition set {owner}: change the set with "
+                                     f"create_partition (action replace_set, set_id {owner}); update_part can only "
+                                     "relabel it")
+                payload = self._mutate(s, lambda d: update_part(d, part.id, None, _label_arg(args), None), call_id,
+                                       _bool_arg(args, "dry_run"), part.id)
+                return self._design_view(payload, part.id)
             base = part.params.model_dump()
             fields = {k: v for k, v in args.items() if k in ("style", "length", "width", "depth", "units", "board")}
             if "style" in fields and fields["style"] != base["style"]:
@@ -1183,7 +1224,13 @@ class Agent:
             return self._design_view(payload, part.id)
         if name == "remove_part":
             cur = self._read(s)
-            part = cur.part(_part_arg(args, required=True))
+            ref = _part_arg(args, required=True)
+            if any(g.id == ref for g in cur.groups):  # a whole set (its pieces go too) or a stack
+                from .partsets import remove_group
+
+                payload = self._mutate(s, lambda d: remove_group(d, ref), call_id, _bool_arg(args, "dry_run"), None)
+                return partition_tools.view(payload, None)
+            part = cur.part(ref)
             payload = self._mutate(s, lambda d: remove_part(d, part.id), call_id, _bool_arg(args, "dry_run"),
                                    None)
             return self._design_view(payload, None)

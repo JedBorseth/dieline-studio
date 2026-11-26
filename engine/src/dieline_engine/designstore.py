@@ -43,7 +43,7 @@ class DesignChanged(ValueError):
 class Part:
     id: str  # stable, engine-made: p1, p2, ...
     label: str
-    params: BoxParams
+    params: BoxParams  # or a partition piece's PartitionParams (partitions.py)
     quantity: int = 1
     piece_no: str | None = None  # the shop's number for it, when known
 
@@ -60,6 +60,8 @@ class Group:
     id: str
     kind: str  # partition_set | telescoping | stack | assembly
     members: tuple[Member, ...]
+    # Group-level settings, e.g. a stack's layer pads ({"pads": 2, "pad_board": "32 B KR"}).
+    extra: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +154,9 @@ def design_from_parts(parts: list[dict[str, Any]], groups: Any = (), links: Any 
                     raise ValueError(f"job file group {g['id']} has a member this app doesn't write")
                 members.append(Member(m["ref"], str(m.get("role", "")), q))
             members = tuple(members)
-            gs.append(Group(g["id"], str(g.get("kind", "assembly")), members))
+            extra = g.get("extra") if isinstance(g.get("extra"), dict) else {}
+            gs.append(Group(g["id"], str(g.get("kind", "assembly")), members,
+                            tuple(sorted((str(k), v) for k, v in extra.items()))))
     lks = [FitLink(str(lk["id"]), str(lk["container"]), str(lk["contained"]))
            for lk in (links if isinstance(links, list) else [])
            if isinstance(lk, dict) and all(isinstance(lk.get(k), str) for k in ("id", "container", "contained"))]
@@ -214,6 +218,8 @@ def with_features(params: BoxParams, items: list[Any] | None, remove: list[Any] 
     new items get engine-made ids, changed items keep theirs, `remove` deletes. Returns the ids touched."""
     from . import features  # noqa: PLC0415
 
+    if not isinstance(params, BoxParams):
+        raise ValueError("features go on standard box parts only; partition pieces can't take them yet")
     feats, touched = features.upsert(params.features, items, remove)
     base = params.model_dump()
     base.pop("features", None)
@@ -325,7 +331,8 @@ class DesignStore:
             "seq": state.seq,
             "parts": parts,
             "groups": [{"id": g.id, "kind": g.kind,
-                        "members": [{"ref": m.ref, "role": m.role, "quantity": m.quantity} for m in g.members]}
+                        "members": [{"ref": m.ref, "role": m.role, "quantity": m.quantity} for m in g.members],
+                        **({"extra": dict(g.extra)} if g.extra else {})}
                        for g in state.groups],
             "links": [{"id": lk.id, "container": lk.container, "contained": lk.contained} for lk in state.links],
             "design_checks": [c.to_dict() for c in design_checks],
@@ -342,6 +349,9 @@ class DesignStore:
                 out.append(CheckResult(f"link_{lk.id}", "stale",
                                        f"fit link {lk.id} points at {', '.join(missing)}, which is no longer in "
                                        "the design; relink it or remove it"))
+        from . import fit  # partition sets, fit links and stacks (fit.py)
+
+        out += fit.design_checks(state)
         return out
 
     def _build(self, params: BoxParams) -> _Built:

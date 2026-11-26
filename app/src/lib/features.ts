@@ -3,7 +3,7 @@
 // docs/DESIGN-SYSTEM.md, "UI".
 
 import { type Primitive, toSvgPath } from "./cf2.ts";
-import type { CheckResult, Design, SceneSegment } from "./protocol.ts";
+import { type CheckResult, type Design, isPartitionParams, type SceneSegment } from "./protocol.ts";
 
 const MM_PER_IN = 25.4;
 
@@ -87,12 +87,15 @@ export function isActionable(c: CheckResult): boolean {
 export function replaceLoses(design: Design | null | undefined): string | null {
   if (!design) return null;
   const parts = design.parts?.length ? design.parts : [design];
-  const features = parts.reduce((n, p) => n + (p.params.features?.length ?? 0), 0);
+  const features = parts.reduce((n, p) => n + (isPartitionParams(p.params) ? 0 : (p.params.features?.length ?? 0)), 0);
   const others = parts.length - 1;
-  if (!features && !others) return null;
+  // A partition set (or any group) isn't one plain standard part either.
+  const set = parts.some((p) => isPartitionParams(p.params)) || (design.groups?.length ?? 0) > 0;
+  if (!features && !others && !set) return null;
   const lost = [
     features ? `${features} feature${features > 1 ? "s" : ""}` : "",
     others ? `${others} other part${others > 1 ? "s" : ""}` : "",
+    set ? "its partition set" : "",
   ].filter(Boolean);
   return `Replace the current design? Its features, overrides and extra parts will be lost (${lost.join(", ")}).`;
 }
