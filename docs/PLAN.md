@@ -29,6 +29,8 @@
 
 **Progress (2026-11-25, later):** the engine now replicates R&L's own ServerLib standards (REG-GLIO-NX, HSC_GL, Tube_Glued) in inches with their board codes. It also writes the sample table's DXF format. The formulas reproduce two real R&L blanks to the 1/10,000". Research and evidence: `.local/ARTIOS-WORKFLOW.md` (private). Next: the import test (milestone 3), confirming board values from the board library, then 5PW, die-cut trays and the wing-lock mailers.
 
+**Next (2026-11-25):** custom designs: features (handholes, hand flaps, vents, perfs, tear strips, scores, notches), slotted partitions, a panel builder for one-offs, and cut-out artwork. Spec and phases: [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md).
+
 ## Open questions
 
 - ~~Which box styles does the company use most?~~ From this year's designs: REG-GLIO-NX (RSC) by far, then REG_GLI_EXT, HSC_GL, MEATBOX wing-lock, Tube_Glued, die-cut trays, 5PW.
