@@ -28,6 +28,9 @@ export interface CheckResult {
   feature_id?: string;
   /** Where to zoom: [x0, y0, x1, y1] in the design's units on the flat blank. */
   region?: [number, number, number, number];
+  /** Suspicious artwork: what the designer acknowledges it by, in the checks panel (never the agent). */
+  ack?: string;
+  acknowledged?: boolean;
 }
 
 /** A feature as stored on a part: parameters and a placement, never coordinates (engine features.py). */
@@ -38,10 +41,20 @@ export interface FeatureSpec {
   [key: string]: unknown;
 }
 
-/** A feature as the engine resolved it on a part. stale: it no longer fits; it blocks export. */
+/** Artwork as stored on a part (engine artwork.py): a source and a placement on one face. */
+export interface ArtworkSpec {
+  id?: string;
+  kind: "shape" | "stencil_text" | "stroke_text" | "sketch" | "import";
+  label?: string;
+  [key: string]: unknown;
+}
+
+export type ArtworkProvenance = "library artwork" | "imported artwork" | "agent sketch";
+
+/** A feature (or a piece of artwork) as the engine resolved it on a part. stale: it no longer fits; it blocks export. */
 export interface FeatureInfo {
   id: string;
-  kind: FeatureSpec["kind"];
+  kind: FeatureSpec["kind"] | "artwork";
   label: string;
   status: "ok" | "stale";
   reason?: string;
@@ -52,6 +65,12 @@ export interface FeatureInfo {
   selector: unknown;
   region?: [number, number, number, number];
   copy_regions?: [number, number, number, number][];
+  /** Artwork only: where it came from, whether the agent drew it, its islands and rules. */
+  provenance?: ArtworkProvenance;
+  agent_drawn?: boolean;
+  artwork_kind?: ArtworkSpec["kind"];
+  islands?: { id: string; status: string; fix: string | null; reason?: string }[];
+  rules?: Record<string, number>;
 }
 
 /** One drawn segment, tagged for highlighting (design units, flat blank, y up). */
@@ -59,7 +78,7 @@ export interface SceneSegment {
   type: "cut" | "crease" | "perforation" | "score" | "annotation";
   op: string | null;
   kind: string | null;
-  provenance: "structure" | "feature";
+  provenance: "structure" | "feature" | ArtworkProvenance;
   feature_id?: string;
   face_id?: string;
   /** A stale feature's ghost: drawn, never manufactured. */
@@ -93,6 +112,10 @@ export interface BoxParams {
   options?: Record<string, OptionValue>;
   /** Features on the part, each with a stable engine-made id. The form never sends these. */
   features?: FeatureSpec[];
+  /** Artwork on the part (a1, a2, ...). */
+  artwork?: ArtworkSpec[];
+  /** Suspicious-artwork flags the designer acknowledged. */
+  acknowledged?: string[];
 }
 
 /** One piece of a slotted partition set: the set's whole spec plus which piece it is (engine partitions.py). */
@@ -504,6 +527,13 @@ export interface Methods {
   /** The designer clicked a layout candidate's card: commit it (refused once it has expired). */
   "layout.choose": [
     { session_id: string; candidate_id: string; action?: "add" | "replace_design" | "replace_set"; set_id?: string },
+    Design,
+  ];
+  /** The designer approved an artwork import on its chat card (the agent can't). */
+  "artwork.approve_import": [{ session_id: string; import_id: string; without_unsupported?: boolean }, Design];
+  /** The designer acknowledged suspicious artwork in the checks panel, on the design shown. */
+  "artwork.acknowledge": [
+    { session_id: string; design_id: string; revision: number; part_id: string; keys: string[] },
     Design,
   ];
   "settings.get": [Record<string, never>, Settings];

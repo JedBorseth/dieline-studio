@@ -35,6 +35,8 @@
 
 **Progress (2026-11-26):** design-system phase 3 is built: slotted partition sets from four input modes (box and cells, cell sizes, pieces, or a product count with layout cards), their checks, fit links and stacks, and part tabs with design-level checks. Every partition is flagged "not calibrated" until real R&L sets are compared.
 
+**Progress (2026-11-26):** design-system phase 4 is built: artwork from the shape library, stencil and stroke lettering, the agent's sketch and approved SVG/DXF imports, fitted with arcs; islands with bridges, stencil, partial cut or drop-out; aggregated tooling checks; and suspicious-artwork flags only the designer can acknowledge. The phase-5 panel builder is next.
+
 ## Open questions
 
 - ~~Which box styles does the company use most?~~ From this year's designs: REG-GLIO-NX (RSC) by far, then REG_GLI_EXT, HSC_GL, MEATBOX wing-lock, Tube_Glued, die-cut trays, 5PW.

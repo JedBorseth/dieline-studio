@@ -509,6 +509,35 @@ def _roots(w: _Where, prev: _Prev) -> set[Path]:
 # ------------------------------------------------------------------ the manifest
 
 
+def artwork_record(d: Any) -> list[dict[str, Any]]:
+    """Each artwork as exported: where it came from (agent-drawn said so), its file's hash for an
+    import, and its outlines as drawn on the blank, so a moved or changed source can't change the job."""
+    from .artwork import PROVENANCE  # noqa: PLC0415
+    from .geometry import Arc  # noqa: PLC0415
+
+    out = []
+    for a in d.extras.get("artwork") or []:
+        item: dict[str, Any] = {"id": a.id, "label": a.label, "kind": a.kind, "status": a.status,
+                                "provenance": PROVENANCE[a.provenance], "face": a.face, "summary": a.words}
+        if a.agent_drawn:
+            item["agent_drawn"] = "agent-drawn artwork: verify before cutting"
+        src = a.spec.get("source")
+        if isinstance(src, dict):
+            item["source"] = {k: src.get(k) for k in ("name", "path", "sha256", "format")}
+        if a.islands:
+            item["islands"] = [{"id": i.id, "status": i.status, "fix": i.fix} for i in a.islands]
+        outlines = []
+        for dr in a.live():
+            for loop in dr.loops:
+                outlines.append({"rule": dr.rule, "segments": [
+                    ({"arc": [*s.start, *s.end, *s.center, int(s.clockwise), int(s.full_circle)]} if isinstance(s, Arc)
+                     else {"line": [*s.start, *s.end]}) for s in loop]})
+        item["outlines"] = outlines
+        out.append(item)
+    return out
+
+
+
 def _part_record(b: _Built, files: list[dict[str, Any]]) -> dict[str, Any]:
     params = b.part.params
     board = get_board(params.board)
@@ -531,6 +560,7 @@ def _part_record(b: _Built, files: list[dict[str, Any]]) -> dict[str, Any]:
         "geometry_sha256": _geometry_digest(cf2),
         "cf2": cf2,  # as exported: "open as exported" shows exactly this
         "files": files,
+        **({"artwork": artwork_record(b.dieline)} if b.dieline.extras.get("artwork") else {}),
     }
 
 

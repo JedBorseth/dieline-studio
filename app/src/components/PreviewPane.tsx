@@ -21,7 +21,9 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { type Cf2Doc, type LineKind, parseCf2 } from "../lib/cf2";
 import { EngineError, request, subscribe } from "../lib/engine";
 import {
+  agentSketches,
   featurePaths,
+  hasAgentDrawn,
   isActionable,
   type MmBox,
   onFocusFeature,
@@ -181,6 +183,30 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     () => (shown ? featurePaths(shown.scene, { stale: true }, shown.summary.units) : []),
     [shown],
   );
+  // Agent-drawn artwork: an accent colour in a dashed frame labelled "Agent-drawn sketch".
+  const sketches = useMemo(() => (shown ? agentSketches(shown.scene, shown.summary.units) : undefined), [shown]);
+  const agentDrawn = hasAgentDrawn(design);
+  /** The designer acknowledges a suspicious-artwork flag, on exactly the design on screen. */
+  const acknowledge = async (c: CheckResult): Promise<void> => {
+    if (!design || !shown || !c.ack || design.design_id === undefined || design.revision === undefined) return;
+    const sid = sessionId;
+    try {
+      const next = await request("artwork.acknowledge", {
+        session_id: sid,
+        design_id: design.design_id,
+        revision: design.revision,
+        part_id: shown.part_id ?? "p1",
+        keys: [c.ack],
+      });
+      onPreview({ kind: "design", design: next, origin: "form" }, sid);
+    } catch (err) {
+      if (err instanceof EngineError && err.code === DESIGN_CHANGED) {
+        void refresh(sid, err.message);
+        return;
+      }
+      if (here(sid)) setStatus({ tone: "error", text: err instanceof Error ? err.message : String(err) });
+    }
+  };
   // A feature link in the chat: switch to its part, highlight it and zoom to it.
   const partsRef = useRef(parts);
   partsRef.current = parts;
@@ -560,6 +586,16 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
                   : "from form"}
           </Badge>
         )}
+        {source?.kind === "design" && agentDrawn && (
+          <Badge
+            variant="info"
+            className="ml-1 shrink-0 font-normal"
+            title="This design has artwork the agent sketched itself (not from the library or a file): verify its shape and size before cutting"
+          >
+            <InfoIcon aria-hidden />
+            Agent-drawn artwork
+          </Badge>
+        )}
         <div className="min-w-2 flex-1" />
         <ToolbarButton
           label="Parameters"
@@ -712,6 +748,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
             onZoom={setZoom}
             highlight={source?.kind === "design" ? highlight : undefined}
             ghosts={source?.kind === "design" ? ghosts : undefined}
+            sketches={source?.kind === "design" ? sketches : undefined}
             focus={source?.kind === "design" ? focus : null}
           />
         ) : (
@@ -799,7 +836,14 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
           }}
         />
       ) : null}
-      {shown && <Checks design={shown} designChecks={[]} onSelect={selectCheck} />}
+      {shown && (
+        <Checks
+          design={shown}
+          designChecks={[]}
+          onSelect={selectCheck}
+          onAcknowledge={source?.kind === "design" ? acknowledge : undefined}
+        />
+      )}
 
       <footer className="flex h-7 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t px-3 text-[11px] text-muted-foreground tabular-nums">
         {doc && (
@@ -1259,6 +1303,11 @@ function FeatureList({
                   <span className="font-medium">
                     {f.label} {f.id}
                   </span>{" "}
+                  {f.agent_drawn && (
+                    <Badge variant="warning" size="sm" className="mr-1 align-baseline">
+                      agent-drawn
+                    </Badge>
+                  )}
                   <span className="text-muted-foreground">
                     {f.status === "stale" ? `stale: ${f.reason ?? ""}` : f.summary}
                   </span>
@@ -1302,12 +1351,16 @@ function Checks({
   design,
   designChecks,
   onSelect,
+  onAcknowledge,
 }: {
   design: Design;
   designChecks: CheckResult[];
   /** A check about a feature or a region: switch to it, highlight it and zoom. */
   onSelect?: (c: CheckResult) => void;
+  /** Suspicious artwork: the designer acknowledges it here (the agent never can). */
+  onAcknowledge?: (c: CheckResult) => Promise<void>;
 }) {
+  const [acking, setAcking] = useState<string | null>(null);
   // The part's checks, then the design's own (fit links, groups), which block export too. Actionable ones
   // (geometry, features, ...) come first, apart from calibration, board and machine notices.
   const all = [...designChecks, ...design.checks];
@@ -1367,6 +1420,23 @@ function Checks({
               >
                 {SHOWN_LABEL.has(c.status) ? <span className="font-medium">{CHECK_LABEL[c.status]}: </span> : null}
                 {c.message}
+                {c.ack && !c.acknowledged && c.status === "fail" && onAcknowledge && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-2 align-baseline"
+                    disabled={acking !== null}
+                    title="I've looked at this artwork and it isn't structure: allow the export"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setAcking(c.id);
+                      void onAcknowledge(c).finally(() => setAcking(null));
+                    }}
+                  >
+                    {acking === c.id ? <Spinner /> : null}
+                    Acknowledge
+                  </Button>
+                )}
               </span>
             </li>
           ))}

@@ -79,3 +79,12 @@ Build-time only (not shipped):
 Tailwind's build pulls in `@tailwindcss/node`/`oxide`, `enhanced-resolve`, `jiti`,
 `magic-string`, `tapable` (MIT), `graceful-fs` (BlueOak-1.0.0, permissive) and
 `lightningcss` (MPL-2.0, already a dependency of Vite). None of these are bundled into the app.
+
+## Engine sidecar: artwork
+
+| Package | Version | License | Use |
+| --- | --- | --- | --- |
+| `defusedxml` | 0.7.1 | PSF-2.0 | Safe XML parsing of imported SVG artwork (no DTDs, entities or external references) |
+
+The stencil and stroke lettering (`engine/src/dieline_engine/glyphs.py`) is an original
+straight-line skeleton font drawn for this app. No third-party font is bundled.

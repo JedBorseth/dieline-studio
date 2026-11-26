@@ -16,7 +16,7 @@ How the app is put together. For the reasons behind it see [CONTEXT.md](CONTEXT.
 │  Tauri shell (app/src-tauri/src/engine.rs)                                  │
 │                           │ JSON-RPC lines on stdin/stdout                  │
 │  Python sidecar: dieline-engine (engine/)                                   │
-│    rpc.py ─ designs.py ─ styles/ ─ features.py ─ cf2.py/dxf.py ─ checks.py  │
+│    rpc.py ─ designs.py ─ styles/ ─ features.py ─ artwork.py ─ cf2/dxf ─ checks│
 │       └─ agent.py ── HTTPS ──► OpenRouter (user's API key) ──► model provider│
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -44,12 +44,14 @@ Line-delimited JSON-RPC 2.0. TypeScript types are in `app/src/lib/protocol.ts`, 
 | `chat.send` / `chat.cancel` / `chat.reset` | Start, stop or clear a chat turn; progress arrives as events |
 | `chat.set_design` | Older name for `design.replace` |
 | `layout.choose` | The designer clicked a product-mode layout card: commit that candidate (refused once it has expired) |
+| `artwork.approve_import` | The designer approved an artwork import on its chat card (`without_unsupported` when the file had content the importer can't read) |
+| `artwork.acknowledge` | The designer acknowledged suspicious-artwork flags in the checks panel, on the design id and revision shown; only keys the checks offer |
 
 Notifications use method `event` with a `type`: `engine.ready`, `chat.text`, `chat.thinking`, `chat.tool_start`, `chat.tool_result`, `chat.error`, `chat.turn_end` and `design`. The shell adds `engine.exit`.
 
 ## Designs, revisions and parts
 
-The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, provenance (structure or feature), `feature_id` and `face_id` (a structure hinge's face is the face it hinges), and stale features' ghosts. A part's payload also lists its features as resolved (faces, copies, a plain-words summary, status) and each export target's readiness (`targets`). A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
+The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, provenance (structure, feature, library artwork, imported artwork or agent sketch), `feature_id` and `face_id` (a structure hinge's face is the face it hinges), and stale features' ghosts. A part's payload also lists its features as resolved (faces, copies, a plain-words summary, status) and each export target's readiness (`targets`). A reopened job of several parts comes back as one design, with its part ids (`design.replace` with `parts`).
 
 ## Partitions
 
@@ -79,6 +81,16 @@ Features (phase 2 of [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md)): a part's features ar
 - `expressions.py`: typed length and scalar expressions for distances and sizes (`W/2 - 1/4`, `2*CAL`, `2:12`, `50mm`), never run through `eval`.
 - `shapes.py`: library outlines in lines and true arcs: obround, rounded rectangle, circle, D-shape, a four-centre oval for ellipses, hand-flap profiles (with the secant hinge) and notch profiles.
 - `features.py`: handholes, hand flaps, vents, windows, extra scores, notches, perforations and tear strips, built as typed operations that declare their contacts (a hand-flap cut ends on its hinge, a score on the outline, a perforation crosses a crease). Scores, perforations and tear strips follow a straight route across hinged faces, with continuous stationing over jumped slots. A feature that can't be placed is stale: ghosted, not manufactured, export blocked.
+Artwork (phase 4 of [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md)): decorative cut-outs and lettering on one face, drawn after the features (`BoxParams.artwork`, ids `a1`, `a2`, ...):
+
+- `curves.py`: Béziers, elliptical arcs and (rational) splines fitted with biarcs within 0.002 in at final size; chords only where arcs can't fit, counted. SVG endpoint arcs to centre form, with the radius correction.
+- `glyphs.py`: the app's own skeleton font (A–Z, 0–9, basic punctuation). Stroke text is the skeleton; stencil text thickens it and cuts every junction back to a stencil break, so no counter is ever an island.
+- `artwork_sources.py`: the shape library (circle, ellipse, rounded rectangle, polygon, star, heart, smiley, arrow), text, and the agent's sketch on a 0–100 canvas (SVG coordinates, M L Q C A Z); scaling, fitting and closing.
+- `artwork_import.py`: SVG (defusedxml) and ASCII DXF, with transforms, `use`, blocks, bulges, splines and ellipses; lists what it can't read; stores the parsed geometry with the file's hash.
+- `artwork.py`: placement on one face (placement.py), a rule per outline, and islands across artwork and feature holes with their fixes: bridges (corridors across the flutes first), stencil, partial cut, drop-out.
+- `artwork_checks.py`: one aggregated result per tooling check (bend radius from the source curvature, acute corners, short straights, thin webs), edge clearance and keep-outs, islands, and the suspicious-artwork flags the designer acknowledges.
+- `artwork_tools.py`: `set_artwork`, imports waiting for the designer, and acknowledgements.
+
 - `rules.py`: a rule spec per operation (cut, crease with its side, perforation with cut, tie, phase and crossing policy, cut-score, pointage) and each target's capability table. Only cut and crease at 2 pt are verified in CF2, and cut and crease in the sample-table DXF; anything else blocks that target, with the reason, while the design stays drawn. The DXF can also write perforations as dashed cuts (a tie centred on each crease), a representation of its own that's unverified and goes through the topology rules.
 
 Faces: every standard carries a face map (`faces.py`), built from the same blank as the drawing: named faces with outside-view frames, assembled and material centres, reference lines, keep-out zones, and the hinge graph (directed axes, IL/OG bend offsets). HSC_GL has a `use` option (tray or lid) that changes which way is up, never the drawing.
@@ -95,6 +107,7 @@ Checks:
 - machines report what they can make as well as the sheets they take: a part with a die-cut feature lists only machines that can die-cut (the slotter's die-cutting isn't confirmed, so it isn't listed)
 - partition pieces: slot fit, residual web, mouths and rims, height against the box depth, orientation notes, calibration (`partitions.piece_checks`). Refused before a set exists: slots that don't overlap (usable depths, round bottoms counted), a slot that cuts through, a slot narrower than its mating board, slots or mouths that run together, cells of 0 or less, a 1 × n set without `confirm_degenerate`, and 1 × 1.
 - the design's own checks (`fit.py`): partition sets, fit links and stacks, shown above the part tabs
+- artwork (`artwork_checks.py`): islands (fail until bridged, stencilled, partial-cut or accepted as a drop-out), aggregated tooling checks with a count, the worst value and up to five places, edge clearance and keep-outs, an info note for agent-drawn artwork, and suspicious-artwork flags that block export until the designer acknowledges them. An acknowledgement is for the artwork exactly as drawn; the store refuses any chat change that adds one.
 
 Each check has a category; geometry, feature, fold, partition, artwork and fit are actionable and shown apart from calibration, board and machine notices.
 
@@ -118,6 +131,7 @@ The model's tools:
 | `choose_layout(candidate_id, message_id, ...)` | Commits a product-mode candidate, only after the designer named it in that message (recorded in the set). The designer's card click does the same without the model. |
 | `link_fit(container, contained)` / `unlink_fit(link)` | Fit links between parts and groups, checked on every revision |
 | `create_stack(tiers, pads?, pad_board?, contained_in?)` | Partition sets in tiers with layer pads, checked against the box's depth |
+| `set_artwork(part?, items?, remove?, dry_run?)` | Decorative artwork by batch upsert, like set_features: library shapes, stencil or stroke text, the agent's sketch, or an import. Moving or resizing by id doesn't resend a sketch. An import is read from the reference folders as `read_file` is and waits for the designer's approval on its chat card; the agent can't approve it or acknowledge a flag. |
 | `export_files(filename?, formats?, replace?, dxf_expand_perfs?)` | Write every part's CF2 and/or DXF plus the manifest; sample-table files that need a pickup wait for the designer |
 | `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, faces named from the face map (GL, P4 … P1), feature offsets marked edge or centre, optional zoom window (`render.py`) |
 | `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |
@@ -127,7 +141,7 @@ The model's tools:
 | `web_search(query)` | Client-side search through the provider chosen in Settings: Exa (via its hosted MCP endpoint) or Tavily, keyless or with the user's key. Modelled on OpenCode (`web.py`). |
 | `web_fetch(url, format?)` | Client-side fetch following OpenCode's webfetch rules, plus a block on private and local-network addresses (`web.py`) |
 
-The model never writes coordinates. It reads them to check its work. Feature tools take parameters and placements; the system prompt adds the placement rules (outside view, always edge or centre, ask when the request doesn't say) and a read-back after every feature change. The model can mention a feature as `[handhole f1](feature:p1/f1)`; the chat shows it as a chip that highlights it in the preview. `create_box`, `create_partition` (the set's plan view and each piece) and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
+The model never writes structural coordinates. It reads them to check its work; the one exception is an artwork sketch on its own 0–100 canvas, placed by the engine and labelled agent-drawn everywhere (the checks, the preview, the picture and the job record). Feature tools take parameters and placements; the system prompt adds the placement rules (outside view, always edge or centre, ask when the request doesn't say) and a read-back after every feature change. The model can mention a feature as `[handhole f1](feature:p1/f1)`; the chat shows it as a chip that highlights it in the preview. `create_box`, `create_partition` (the set's plan view and each piece) and `view_design` return PNGs, and the chat's tool cards show the same picture, so the designer sees what the model checked. Tool messages are text-only in this API, so the pictures follow in a user message. Tool inputs are validated before anything runs. A cancelled or failed turn is dropped from the conversation, so the history stays append-only.
 
 **Reference folders:** by default, only the work OneDrive synced on the PC (`OneDriveCommercial`). Personal OneDrive is never included unless added in Settings.
 

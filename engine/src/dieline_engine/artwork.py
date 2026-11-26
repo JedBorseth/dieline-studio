@@ -462,7 +462,8 @@ class Art:
             out["region"] = [round(v, 4) for v in b]
             out["copy_regions"] = [out["region"]]
         if self.islands:
-            out["islands"] = [{"id": i.id, "status": i.status, "fix": i.fix, **({"reason": i.reason} if i.reason else {})}
+            out["islands"] = [{"id": i.id, "status": i.status, "fix": i.fix,
+                               **({"reason": i.reason} if i.reason else {})}
                               for i in self.islands]
         rules: dict[str, int] = {}
         for c in self.live():

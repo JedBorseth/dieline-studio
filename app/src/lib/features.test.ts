@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  agentSketches,
   featurePaths,
+  hasAgentDrawn,
   isActionable,
+  pendingFlags,
   keepFeatureLinks,
   parseFeatureHref,
   regionToMm,
@@ -69,4 +72,59 @@ test("Generate asks before replacing features or extra parts", () => {
   assert.match(replaceLoses(withFeatures) ?? "", /^Replace the current design\? Its features, overrides and extra parts will be lost \(1 feature\)/);
   const twoParts = { ...base, parts: [{ ...base, part_id: "p1" }, { ...base, part_id: "p2" }] } as unknown as Design;
   assert.match(replaceLoses(twoParts) ?? "", /1 other part/);
+});
+
+test("artwork links name a part and an artwork", () => {
+  assert.deepEqual(parseFeatureHref("feature:p1/a3"), { partId: "p1", featureId: "a3" });
+  assert.equal(parseFeatureHref("feature:p1/b3"), null);
+});
+
+const artScene: SceneSegment[] = [
+  { type: "cut", op: "outline", kind: "outline", provenance: "structure", arc: false, start: [0, 0], end: [9, 0] },
+  {
+    type: "cut", op: "a1.1", kind: "artwork", provenance: "agent sketch", feature_id: "a1", face_id: "P2",
+    arc: true, start: [3, 2], end: [3, 2], center: [2, 2], clockwise: false, full_circle: true,
+  },
+  {
+    type: "crease", op: "a1.2", kind: "artwork_crease", provenance: "agent sketch", feature_id: "a1", face_id: "P2",
+    arc: false, start: [1, 4], end: [3, 4],
+  },
+  {
+    type: "cut", op: "a2.1", kind: "artwork", provenance: "library artwork", feature_id: "a2", face_id: "P1",
+    arc: false, start: [6, 1], end: [7, 1],
+  },
+  {
+    type: "annotation", op: null, kind: null, provenance: "agent sketch", feature_id: "a3", stale: true,
+    arc: false, start: [0, 5], end: [1, 5],
+  },
+];
+
+test("agent-drawn artwork gets its own overlay: line styles kept, one framed box per sketch", () => {
+  const o = agentSketches(artScene, "in");
+  assert.deepEqual(o.paths.map((p) => p.type), ["cut", "crease"]);
+  assert.equal(o.frames.length, 1);
+  const f = o.frames[0];
+  assert.equal(f.featureId, "a1");
+  // The circle (centre 2, 2, radius 1) and the crease up to y = 4, in millimetres.
+  assert.deepEqual(
+    [f.box.xmin, f.box.ymin, f.box.xmax, f.box.ymax].map((v) => Math.round(v * 100) / 100),
+    [25.4, 25.4, 76.2, 101.6],
+  );
+  assert.deepEqual(agentSketches(undefined).frames, []);
+});
+
+test("the header pill and the flags waiting for the designer", () => {
+  const base = { checks: [], features: [] } as unknown as Design;
+  assert.equal(hasAgentDrawn(base), false);
+  const drawn = {
+    ...base,
+    parts: [{ ...base, features: [{ id: "a1", kind: "artwork", status: "ok", agent_drawn: true }] }],
+  } as unknown as Design;
+  assert.equal(hasAgentDrawn(drawn), true);
+  const flags = pendingFlags([
+    { id: "artwork_a1_flag_slot", status: "fail", message: "", ack: "a1:slot:x" },
+    { id: "artwork_a1_flag_span", status: "info", message: "", ack: "a1:span:x", acknowledged: true },
+    { id: "material", status: "fail", message: "" },
+  ]);
+  assert.deepEqual(flags.map((c) => c.id), ["artwork_a1_flag_slot"]);
 });

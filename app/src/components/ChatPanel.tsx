@@ -42,6 +42,8 @@ interface Props {
   onOpenSettings: () => void;
   /** The designer clicked a layout candidate's card; rejects with the engine's reason (e.g. expired). */
   onChooseLayout?: (candidateId: string) => Promise<void>;
+  /** The designer approved an artwork import on its card; rejects with the engine's reason. */
+  onApproveImport?: (importId: string, withoutUnsupported: boolean) => Promise<void>;
 }
 
 const SUGGESTIONS = [
@@ -56,7 +58,16 @@ export const STATUS_BADGE: Record<OverallStatus, "success" | "warning" | "error"
   fail: "error",
 };
 
-export function ChatPanel({ session, settings, engineError, onSend, onStop, onOpenSettings, onChooseLayout }: Props) {
+export function ChatPanel({
+  session,
+  settings,
+  engineError,
+  onSend,
+  onStop,
+  onOpenSettings,
+  onChooseLayout,
+  onApproveImport,
+}: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedToBottomRef = useRef(true);
   const [lightbox, setLightbox] = useState<{ src: string; title: string } | null>(null);
@@ -116,7 +127,13 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
             <EmptyState busy={session.busy} onSend={handleSend} />
           ) : (
             session.items.map((item) => (
-              <Item key={item.id} item={item} onInspectImage={setLightbox} onChooseLayout={onChooseLayout} />
+              <Item
+                key={item.id}
+                item={item}
+                onInspectImage={setLightbox}
+                onChooseLayout={onChooseLayout}
+                onApproveImport={onApproveImport}
+              />
             ))
           )}
           {session.busy && (
@@ -175,10 +192,12 @@ const Item = memo(function Item({
   item,
   onInspectImage,
   onChooseLayout,
+  onApproveImport,
 }: {
   item: ChatItem;
   onInspectImage: (img: { src: string; title: string }) => void;
   onChooseLayout?: (candidateId: string) => Promise<void>;
+  onApproveImport?: (importId: string, withoutUnsupported: boolean) => Promise<void>;
 }) {
   switch (item.kind) {
     case "user":
@@ -220,6 +239,9 @@ const Item = memo(function Item({
           {item.name === "create_partition" && item.status === "done" && onChooseLayout && (
             <LayoutCards result={item.result} onChoose={onChooseLayout} />
           )}
+          {item.name === "set_artwork" && item.status === "done" && onApproveImport && (
+            <ImportCard result={item.result} onApprove={onApproveImport} />
+          )}
         </>
       );
     case "notice":
@@ -231,6 +253,88 @@ const Item = memo(function Item({
       );
   }
 });
+
+/** An artwork import waiting for the designer: what will be cut (the picture above), what the file
+ *  has that wasn't read, and the approval only the designer can give. */
+export interface PendingImport {
+  id: string;
+  file: string;
+  format: string;
+  outlines: number;
+  units: string;
+  unsupported: string[];
+  notes: string[];
+}
+
+export function pendingImport(result: unknown): PendingImport | null {
+  const imp = (result as { import?: PendingImport } | undefined)?.import;
+  return imp && typeof imp.id === "string" && Array.isArray(imp.unsupported) ? imp : null;
+}
+
+function ImportCard({
+  result,
+  onApprove,
+}: {
+  result: unknown;
+  onApprove: (importId: string, withoutUnsupported: boolean) => Promise<void>;
+}) {
+  const imp = pendingImport(result);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (!imp) return null;
+  const without = imp.unsupported.length > 0;
+  const approve = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await onApprove(imp.id, without);
+      setDone(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className={cn("flex flex-col gap-2 rounded-lg border bg-card p-3 text-xs shadow-xs/5", done && "border-success/60")}>
+      <div className="flex items-baseline gap-2">
+        <span className="font-medium text-sm">Import {imp.file}?</span>
+        <span className="text-muted-foreground">
+          {imp.format.toUpperCase()}, {imp.outlines} outline{imp.outlines === 1 ? "" : "s"}, units {imp.units}
+        </span>
+      </div>
+      <p className="text-muted-foreground">
+        The picture above shows what would be cut: shaded areas drop out, white stays board. Nothing is added until you
+        approve it.
+      </p>
+      {imp.notes.length > 0 && (
+        <ul className="list-disc pl-4 text-warning-foreground">
+          {imp.notes.map((n) => (
+            <li key={n}>{n}</li>
+          ))}
+        </ul>
+      )}
+      {without && (
+        <div>
+          <p className="font-medium">Not imported (this importer can't read it):</p>
+          <ul className="list-disc pl-4">
+            {imp.unsupported.map((u) => (
+              <li key={u}>{u}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <Button size="xs" variant={done ? "outline" : "secondary"} disabled={busy || done} onClick={() => void approve()}>
+          {busy ? <Spinner size="sm" /> : null}
+          {done ? "Imported" : without ? "Import without the unsupported content" : "Import it"}
+        </Button>
+      </div>
+      {error && <p className="text-destructive-foreground wrap-anywhere">{error}</p>}
+    </div>
+  );
+}
 
 /** Product-mode layout candidates as cards: the designer's click is the normal way to choose one. */
 function LayoutCards({ result, onChoose }: { result: unknown; onChoose: (candidateId: string) => Promise<void> }) {

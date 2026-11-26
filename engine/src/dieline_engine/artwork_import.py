@@ -824,12 +824,11 @@ def chain(pieces: list[tuple[Any, str | None]], tol: float | None = None) -> lis
         while True:
             p = open_[cur][0]
             q = _ends(p)[1 if fwd else 0]
-            nxt = [(j, w) for j, w in at(q) if j != cur]
-            if len(nxt) != 1 or used[nxt[0][0]] or open_[nxt[0][0]][1] != open_[i][1]:
+            same = [(j, w) for j, w in at(q) if open_[j][1] == open_[i][1]]  # a crease ending on a cut is no join
+            nxt = [(j, w) for j, w in same if j != cur]
+            if len(same) != 2 or len(nxt) != 1 or used[nxt[0][0]]:
                 return seq
             j, w = nxt[0]
-            if len(at(q)) != 2:
-                return seq
             used[j] = True
             piece = open_[j][0]
             seq.append(piece if w == 0 else reverse_piece(piece))

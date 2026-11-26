@@ -86,6 +86,13 @@ export function formatToolLabel(
       const tail = Array.isArray(cands) ? ` · ${cands.length} layout${cands.length === 1 ? "" : "s"} to choose from` : "";
       return `create_partition${mode ? ` · ${mode}` : ""}${cells}${count}${tail}`;
     }
+    case "set_artwork": {
+      const items = Array.isArray(args.items) ? (args.items as Record<string, unknown>[]) : [];
+      const kinds = items.map((i) => str(i.kind) || str(i.id)).filter(Boolean);
+      const removed = Array.isArray(args.remove) ? ` · remove ${args.remove.length}` : "";
+      const pending = (result as { import?: unknown } | undefined)?.import ? " · waiting for your approval" : "";
+      return `set_artwork${kinds.length ? ` · ${kinds.join(", ")}` : ""}${removed}${pending}`;
+    }
     case "choose_layout":
       return `choose_layout${str(args.candidate_id) ? ` · ${str(args.candidate_id)}` : ""}${
         str(args.message_id) ? ` (named in ${str(args.message_id)})` : ""

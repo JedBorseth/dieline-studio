@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import glyphs
-from .curves import (FIT_TOL_IN, ARC_CORRECTION_MAX, Bezier, Curve, CurveError, EllipseArc, Nurbs, arc_prim, axis_ellipse,
-                     check_nurbs, fit, svg_arc)
+from .curves import (ARC_CORRECTION_MAX, FIT_TOL_IN, Bezier, Curve, CurveError, EllipseArc, Nurbs, arc_prim,
+                     axis_ellipse, check_nurbs, fit, svg_arc)
 from .shapes import Prim, bbox as prim_bbox, circle as sh_circle, rounded_rect, transform
 
 Point = tuple[float, float]
@@ -305,7 +305,8 @@ def library(spec: dict[str, Any], size) -> Local:
         e = EllipseArc((0.0, 0.0), w / 2, h / 2, 0.0, 0.0, math.tau)
         ft = fit(e)
         c = Contour(ft.prims, ft.kinds, True, None, e.radius_samples(), None, "ellipse")
-        return Local([c], "library", f"{fmt_in(w)} x {fmt_in(h)} in ellipse (arcs within 0.002 in)", fallback=ft.fallback)
+        return Local([c], "library", f"{fmt_in(w)} x {fmt_in(h)} in ellipse (arcs within 0.002 in)",
+                     fallback=ft.fallback)
     if shape == "rounded_rect":
         w, h = size("width"), size("height")
         r = size("corner_radius", 0.0)

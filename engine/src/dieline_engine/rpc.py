@@ -67,6 +67,8 @@ class Server:
             "chat.send": self._chat_send,
             "chat.set_design": self._chat_set_design,
             "layout.choose": self._layout_choose,
+            "artwork.approve_import": self._approve_import,
+            "artwork.acknowledge": self._acknowledge,
             "chat.cancel": lambda p: self.agent.cancel(_str(p, "session_id")) or {"ok": True},
             "chat.reset": lambda p: self.agent.reset(_str(p, "session_id")) or {"ok": True},
         }
@@ -252,6 +254,21 @@ class Server:
             if v is not None and not isinstance(v, str):
                 raise RpcError(INVALID_PARAMS, f"{k} must be a string")
         return self.agent.choose_layout(_str(p, "session_id"), _str(p, "candidate_id"), action, set_id)
+
+    def _approve_import(self, p: dict[str, Any]) -> dict[str, Any]:
+        """The designer approved an artwork import on its chat card (the agent can't)."""
+        return self.agent.approve_import(_str(p, "session_id"), _str(p, "import_id"),
+                                         _flag(p, "without_unsupported"))
+
+    def _acknowledge(self, p: dict[str, Any]) -> dict[str, Any]:
+        """The designer acknowledged suspicious artwork in the checks panel, on the design they see."""
+        keys = p.get("keys")
+        if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
+            raise RpcError(INVALID_PARAMS, "keys must be a list of acknowledgement keys")
+        rev = p.get("revision")
+        if not isinstance(rev, int):
+            raise RpcError(INVALID_PARAMS, "revision must be the revision shown")
+        return self.agent.acknowledge(_str(p, "session_id"), (_str(p, "design_id"), rev), _str(p, "part_id"), keys)
 
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))

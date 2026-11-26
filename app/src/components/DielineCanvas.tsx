@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { type Cf2Doc, type LineKind, toSvgPath } from "../lib/cf2";
-import type { MmBox } from "../lib/features";
+import type { MmBox, SketchOverlay } from "../lib/features";
 
 export const KIND_LABELS: Record<LineKind, string> = {
   cut: "Cut",
@@ -30,6 +30,8 @@ interface Props {
   ghosts?: string[];
   /** Zoom to this box (mm, y up) whenever token changes. */
   focus?: { box: MmBox; token: number } | null;
+  /** Agent-drawn artwork: drawn in the accent colour inside a dashed frame labelled "Agent-drawn sketch". */
+  sketches?: SketchOverlay;
 }
 
 function fitBox(doc: Cf2Doc): ViewBox {
@@ -48,7 +50,7 @@ function boxView(b: MmBox): ViewBox {
   return { x: b.xmin - pad, y: -b.ymax - pad, w: w + 2 * pad, h: h + 2 * pad };
 }
 
-export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom, highlight, ghosts, focus }: Props) {
+export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom, highlight, ghosts, focus, sketches }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [view, setView] = useState<ViewBox>(() => fitBox(doc));
   const drag = useRef<{ x: number; y: number } | null>(null);
@@ -150,6 +152,26 @@ export function DielineCanvas({ doc, visible, fitToken, onCursor, onZoom, highli
         (p) => visible[p.type] && <path key={p.key} d={p.d} className={`ln ln-${p.type}`} />,
       )}
       {ghosts?.map((d, i) => <path key={`g${i}`} d={d} className="ln ln-ghost" />)}
+      {sketches?.paths.map(
+        (p, i) =>
+          visible[p.type === "annotation" ? "other" : p.type] && (
+            <path key={`s${i}`} d={p.d} className={`ln ln-sketch ln-${p.type}`} />
+          ),
+      )}
+      {sketches?.frames.map((f) => {
+        const pad = Math.max(2, (f.box.xmax - f.box.xmin) * 0.04);
+        const w = f.box.xmax - f.box.xmin + 2 * pad;
+        const h = f.box.ymax - f.box.ymin + 2 * pad;
+        const size = Math.max(3, Math.min(w, h) * 0.07);
+        return (
+          <g key={`f${f.featureId}`} aria-label={`Agent-drawn sketch ${f.featureId}`}>
+            <rect className="sketch-frame" x={f.box.xmin - pad} y={-f.box.ymax - pad} width={w} height={h} />
+            <text className="sketch-label" x={f.box.xmin - pad} y={-f.box.ymax - pad - size * 0.4} fontSize={size}>
+              Agent-drawn sketch {f.featureId}
+            </text>
+          </g>
+        );
+      })}
       {highlight?.map((d, i) => <path key={`h${i}`} d={d} className="ln ln-highlight" />)}
     </svg>
   );

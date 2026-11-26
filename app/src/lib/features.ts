@@ -15,9 +15,9 @@ export interface MmBox {
   ymax: number;
 }
 
-/** "feature:p1/f2" → the part and feature it points at. */
+/** "feature:p1/f2" (or an artwork's "feature:p1/a1") → the part and feature it points at. */
 export function parseFeatureHref(href: string | undefined | null): { partId: string; featureId: string } | null {
-  const m = /^feature:(p\d+)\/(f\d+)$/.exec((href ?? "").trim());
+  const m = /^feature:(p\d+)\/([fa]\d+)$/.exec((href ?? "").trim());
   return m ? { partId: m[1], featureId: m[2] } : null;
 }
 
@@ -87,7 +87,11 @@ export function isActionable(c: CheckResult): boolean {
 export function replaceLoses(design: Design | null | undefined): string | null {
   if (!design) return null;
   const parts = design.parts?.length ? design.parts : [design];
-  const features = parts.reduce((n, p) => n + (isPartitionParams(p.params) ? 0 : (p.params.features?.length ?? 0)), 0);
+  const features = parts.reduce(
+    (n, p) =>
+      n + (isPartitionParams(p.params) ? 0 : (p.params.features?.length ?? 0) + (p.params.artwork?.length ?? 0)),
+    0,
+  );
   const others = parts.length - 1;
   // A partition set (or any group) isn't one plain standard part either.
   const set = parts.some((p) => isPartitionParams(p.params)) || (design.groups?.length ?? 0) > 0;
@@ -117,4 +121,52 @@ export function onFocusFeature(cb: (target: FocusFeature) => void): () => void {
   const listener = (e: Event) => cb((e as CustomEvent<FocusFeature>).detail);
   window.addEventListener(EVENT, listener);
   return () => window.removeEventListener(EVENT, listener);
+}
+
+// ------------------------------------------------------------------ artwork
+
+/** Agent-drawn artwork, drawn apart in the preview: its paths keep their line style, and a dashed
+ *  frame round each sketch is labelled "Agent-drawn sketch". */
+export interface SketchOverlay {
+  paths: { d: string; type: "cut" | "crease" | "perforation" | "score" | "annotation" }[];
+  frames: { featureId: string; box: MmBox }[];
+}
+
+export function agentSketches(scene: SceneSegment[] | undefined, units?: string): SketchOverlay {
+  const out: SketchOverlay = { paths: [], frames: [] };
+  const boxes = new Map<string, MmBox>();
+  for (const s of scene ?? []) {
+    if (s.provenance !== "agent sketch" || s.stale || !s.feature_id) continue;
+    const prim = sceneToPrimitive(s, units);
+    out.paths.push({ d: toSvgPath(prim), type: s.type });
+    const k = scale(units);
+    const pts: [number, number][] = [s.start, s.end];
+    if (s.arc && s.center) {
+      // The arc's whole circle bounds it (a frame a little generous is fine).
+      const r = Math.hypot(s.start[0] - s.center[0], s.start[1] - s.center[1]);
+      pts.push([s.center[0] - r, s.center[1] - r], [s.center[0] + r, s.center[1] + r]);
+    }
+    const b = boxes.get(s.feature_id) ?? { xmin: Infinity, ymin: Infinity, xmax: -Infinity, ymax: -Infinity };
+    for (const [x, y] of pts) {
+      b.xmin = Math.min(b.xmin, x * k);
+      b.ymin = Math.min(b.ymin, y * k);
+      b.xmax = Math.max(b.xmax, x * k);
+      b.ymax = Math.max(b.ymax, y * k);
+    }
+    boxes.set(s.feature_id, b);
+  }
+  for (const [featureId, box] of boxes) out.frames.push({ featureId, box });
+  return out;
+}
+
+/** Whether any part of the design carries agent-drawn artwork (the header's info pill). */
+export function hasAgentDrawn(design: Design | null | undefined): boolean {
+  if (!design) return false;
+  const parts = design.parts?.length ? design.parts : [design];
+  return parts.some((p) => (p.features ?? []).some((f) => f.agent_drawn && f.status === "ok"));
+}
+
+/** Suspicious-artwork flags waiting for the designer's acknowledgement. */
+export function pendingFlags(checks: CheckResult[]): CheckResult[] {
+  return checks.filter((c) => Boolean(c.ack) && !c.acknowledged && c.status === "fail");
 }

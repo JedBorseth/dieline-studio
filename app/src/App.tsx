@@ -104,6 +104,15 @@ export default function App() {
               const design = await request("layout.choose", { session_id: sessionId, candidate_id: candidateId });
               dispatch({ type: "preview", source: { kind: "design", design, origin: "form" }, sessionId });
             }}
+            onApproveImport={async (importId, withoutUnsupported) => {
+              const sessionId = active.id;
+              const design = await request("artwork.approve_import", {
+                session_id: sessionId,
+                import_id: importId,
+                without_unsupported: withoutUnsupported,
+              });
+              dispatch({ type: "preview", source: { kind: "design", design, origin: "form" }, sessionId });
+            }}
           />
           <Splitter
             onDrag={resizePreview}

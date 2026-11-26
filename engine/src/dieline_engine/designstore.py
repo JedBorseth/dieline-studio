@@ -236,6 +236,62 @@ def set_features(d: DesignState, ref: str | None, items: list[Any] | None, remov
     return update_part(d, old.id, params), old.id, touched
 
 
+def with_artwork(params: BoxParams, items: list[Any] | None, remove: list[Any] | None = None, *,
+                 trusted: bool = False) -> tuple[BoxParams, list[str]]:
+    """A part's parameters with artwork upserted by id (docs/DESIGN-SYSTEM.md, "Same pattern everywhere").
+    Untrusted (the agent's) input can't carry an import's geometry: that comes only with the designer's
+    approval. Acknowledgements of removed artwork go with it."""
+    from . import artwork  # noqa: PLC0415
+
+    if not isinstance(params, BoxParams):
+        raise ValueError("artwork goes on standard box parts only; partition pieces can't take it yet")
+    arts, touched = artwork.upsert(params.artwork, items, remove, trusted=trusted)
+    base = params.model_dump()
+    base.pop("artwork", None)
+    acks = [k for k in params.acknowledged if k.split(":")[0] in {a["id"] for a in arts}]
+    base["acknowledged"] = acks
+    fm = _designs.build(BoxParams.model_validate(base)).faces if arts else None
+    arts = artwork.bind(arts, fm, touched)
+    return BoxParams.model_validate({**base, "artwork": arts}), touched
+
+
+def set_artwork(d: DesignState, ref: str | None, items: list[Any] | None, remove: list[Any] | None = None, *,
+                trusted: bool = False) -> tuple[DesignState, str, list[str]]:
+    """Upsert and remove one part's artwork. Returns the new state, the part id and the ids touched."""
+    old = d.part(ref)
+    params, touched = with_artwork(old.params, items, remove, trusted=trusted)
+    return update_part(d, old.id, params), old.id, touched
+
+
+def acknowledge(d: DesignState, ref: str, keys: list[str]) -> DesignState:
+    """The designer acknowledged suspicious artwork in the checks panel (never the agent: the store
+    refuses a chat change that adds one)."""
+    old = d.part(ref)
+    if not isinstance(old.params, BoxParams):
+        raise ValueError("that part has no artwork")
+    acks = sorted(set(old.params.acknowledged) | set(keys))
+    return update_part(d, old.id, old.params.model_copy(update={"acknowledged": acks}))
+
+
+def _acks(state: DesignState | None) -> dict[str, set[str]]:
+    if state is None:
+        return {}
+    return {p.id: set(getattr(p.params, "acknowledged", None) or []) for p in state.parts}
+
+
+class AcknowledgeRefused(ValueError):
+    """Only the designer can acknowledge suspicious artwork."""
+
+
+def _no_new_acks(cur: DesignState | None, proposed: DesignState) -> None:
+    """A chat change may keep or drop acknowledgements, never add one, even by replacing the design."""
+    before = _acks(cur) if cur is not None and proposed.id == cur.id else {}
+    for pid, keys in _acks(proposed).items():
+        if keys - before.get(pid, set()):
+            raise AcknowledgeRefused("only the designer can acknowledge suspicious artwork, in the checks panel; "
+                                     "the chat can't (tell the user what the flag is about instead)")
+
+
 def refuse_stale(payload: dict[str, Any], part_id: str, ids: list[str]) -> None:
     """A call that adds or changes a feature is refused if that feature can't be placed: the
     previous revision stays. (Only a resize or a style change may leave a feature stale.)"""
@@ -394,6 +450,8 @@ class DesignStore:
             seq = self._seq.get(session, 0)
         _check_expected(cur, expected)
         proposed = change(cur)
+        if origin == "chat":
+            _no_new_acks(cur, proposed)
         if cur is not None and proposed.id == cur.id:
             proposed = replace(proposed, revision=cur.revision + 1)
         proposed = replace(proposed, seq=seq + 1)

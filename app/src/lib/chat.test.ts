@@ -110,3 +110,14 @@ test("formatModelSummary formats live, non-reasoning, dynamic, unlisted, and off
     "Claude Opus 5.5 · Any OpenRouter model with tool calling and image input.",
   );
 });
+
+test("set_artwork tool rows say what changed and when an import waits for the designer", () => {
+  assert.equal(
+    formatToolLabel("set_artwork", { items: [{ kind: "sketch" }, { id: "a1" }], remove: ["a2"] }, {}),
+    "set_artwork · sketch, a1 · remove 1",
+  );
+  assert.equal(
+    formatToolLabel("set_artwork", { items: [{ kind: "import", path: "x.svg" }] }, { import: { id: "import1" } }),
+    "set_artwork · import · waiting for your approval",
+  );
+});

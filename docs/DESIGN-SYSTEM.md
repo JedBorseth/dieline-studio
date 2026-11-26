@@ -1,6 +1,6 @@
 # Design system: features, partitions, the panel builder and artwork
 
-Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Phases 1 (foundations), 2 (features on standards) and 3 (partitions) are built; see [Phase 2 as built](#phase-2-as-built) and [Partitions as built](#partitions-as-built) for the readings taken where this spec left a choice. For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
+Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Phases 1 (foundations), 2 (features on standards), 3 (partitions) and 4 (artwork) are built; see [Phase 2 as built](#phase-2-as-built), [Partitions as built](#partitions-as-built) and [Artwork as built](#artwork-as-built) for the readings taken where this spec left a choice. For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Today the app draws four R&L standards and nothing else. Designers also need handholes, vents, extra scores, partitions, pads, inserts, trays, wraps and one-off changes to a standard. About half of this year's R&L designs were drawn by hand rather than from a standard, so this is most of the work.
 
@@ -1040,7 +1040,7 @@ If regenerating fails, the as-exported snapshot is still viewable.
 3. **Partitions** (built 2026-11-26)
    - the crossing model, all four input modes and `choose_layout`
    - the checks, the fit and stack checks plus the tools that set fit links (the links themselves exist from phase 1), and part tabs
-4. **Artwork**
+4. **Artwork** (built 2026-11-26)
    - the library, stencil text, sketch and import (with biarc fitting)
    - islands and bridges, the aggregated checks, and the suspicious-artwork flags
 5. **Panel builder**
@@ -1106,10 +1106,60 @@ Where this spec left a choice open, phase 3 took the safest reading:
 - **Stacks** keep their pads in the group (`extra: {pads, pad_board}`); pads become parts with the panel builder.
 - **Check results** take their category from the id's prefix (`partition_` → partition, `fit_` and `stack_` → fit), so the checks panel files them with the actionable checks.
 
+## Artwork as built
+
+Where this spec left a choice open, phase 4 took the safest reading:
+
+**Sources**
+
+- **Library:** `circle` (diameter), `ellipse` (fitted with biarcs, not the four-centre oval the window uses), `rounded_rect`, `polygon` (sides, across its corners), `star` (points, inner ratio), `heart` (two lobes and two straight sides), `smiley` (the eyes and mouth are holes; its face outline is `none` or `crease`, never cut, which would make the eyes islands) and `arrow` (pointing right; turn it with `rotation_deg`).
+- **Lettering** is the app's own straight-line skeleton font: capitals 6 units tall, stroke 1 unit. Stencil text cuts **every** junction back to a break, so no counter is ever closed. A break is max(0.6 units, the minimum bridge, max(3/16", 1.5 × CAL)); letter spacing is at least the thin-web limit. Text too small to keep its breaks is refused with the height it needs. Lowercase is drawn as capitals.
+- **Sketch:** "SVG-style" is read literally: the canvas is SVG coordinates (x right, y **down**), so an agent's SVG habits draw the right way up. Only M L Q C A Z (absolute or relative); H V S T are refused in a sketch but read in imported SVG. The datum is the centre of what's drawn, and the width or height given is of what's drawn, not of the canvas.
+- **Arc radius correction:** refused above 1% in a sketch; reported, not refused, in an imported SVG (a file from a drawing program is taken as written).
+- **Imports** are approved by the **designer** on the chat card, never by the agent; with unsupported content the button says it imports without it. A waiting import expires when the design changes. The part stores the parsed geometry in the file's own units with its name, path and SHA-256, what wasn't read and the notes, so the file is never read again.
+- **SVG:** px and unitless files need a size (px counts as unitless). Hidden elements aren't imported and are listed, so the import waits; `<style>` sheets aren't read (noted); clipping and masks are listed and ignored; stroke-only shapes are cut on their centre line (noted); a filled path whose inner outline runs the same way as its outer one under `nonzero` is noted (it looks solid but cuts as a ring and a middle).
+- **DXF:** colour 1 means cut and 2 crease by default, as the shop's files carry them. Layers that are off aren't imported. A SPLINE given only by fit points and an arrayed INSERT are unsupported. Anything off the drawing plane (any z, any extrusion not along Z) refuses the whole import. Separate entities join into a path only where exactly two ends coincide (within a ten-millionth of the drawing). A binary DXF is refused.
+- **Limits:** 5 MB per file, 20,000 DXF entities (blocks expanded), 5,000 SVG shapes, 5,000 segments and 600 outlines after fitting.
+
+**Placement and rules**
+
+- Artwork is one copy on one face: a selector must resolve to one face, patterns and mirroring aren't offered (add another item). Partition pieces refuse artwork, as they refuse features.
+- Each outline's rule comes from `loop_rules` (by its number in the read-back), then the item's `rule`, then the source's own (a DXF crease, the smiley's outline), then cut (stroke text: crease). Cut, perforation and partial cut need a closed outline.
+- `closed: true` snaps a path's ends within 0.005" at final size; a gap at an arc closes with a short line, so the arc keeps its radius.
+
+**Islands**
+
+- Worked out per face from every closed through-cut loop: artwork cut outlines and the features' holes (handholes, vents, windows), nested even-odd with the outline as depth 0. A loop at an even depth of 2 or more bounds an island. Other cuts (hand-flap cuts, scores) are obstacles for bridges, not loops.
+- Islands are numbered per artwork (`i1`, `i2`, ...), and `islands` sets a fix for all of them or per id. An island whose loop or hole is a feature's, or another artwork's, can only be dropped out.
+- **Partial cut** turns the hole's outer loop (the one between the board and the hole round the island) into a partial cut: the ring stays, scored, and the island becomes a plain hole that drops out. No board is left unheld.
+- **Bridges** are straight corridors exactly the bridge width (`bridge_width` may only widen it). They're tried across the flutes first (vertical flutes: along the flat x), then along them, then diagonally, from points inside the island's board; each side must leave the island and then cross the hole's outer loop at 30° or more, with nothing else in the corridor. The second corridor prefers the opposite direction. The two outlines become the pieces of the hole between the corridors, and the whole design is validated again. **Stencil** is the same construction, reported as stencil breaks.
+- The topology's `material` check leaves artwork islands to the artwork check, which fails an unhandled one and reports a handled one as info (a partial cut or a drop-out as an explicit choice).
+
+**Checks**
+
+- Bend radius: arcs drawn as such and the source curvature of fitted curves (fitted arcs aren't measured); one place per outline.
+- Acute corners: the angle between the two segments at a true corner (the tangent turns more than 1°), on either side.
+- Short straights: source lines and bridge sides with a corner at both ends.
+- Thin webs: between different artwork outlines (not a stencil letter's own pieces, which are bridges, and not across a bridge) and from artwork to the features' cuts on its face.
+- Locations are given as the artwork id and face coordinates seen from outside.
+
+**Suspicious artwork**
+
+- Long straight: 1" or longer, within 3° of parallel and within 1" of any edge or crease of its face.
+- Slot-like: a closed cut no more than 1/2" wide and at least 3:1, mostly straight, within 1" of the face's edge. Standards have no mates yet.
+- Span: over 80% of the face's width or height.
+- Rule: a crease or perforation whose **path length** is over half the face's width (the literal reading: a large creased circle is flagged too).
+- One flag per artwork and kind. Its acknowledgement key is the artwork id, the kind and a fingerprint of the artwork as drawn, so moving, resizing or resizing the box asks again. Acknowledgements are stored on the part (`acknowledged`). The store refuses any chat change that adds one (dry runs too, and through any tool); the RPC needs the design id and revision on screen and accepts only keys the checks offer.
+
+**UI and picture**
+
+- The preview redraws agent sketches over the dieline in an accent colour with their own line style, in a dashed frame labelled "Agent-drawn sketch a1"; the header shows an "Agent-drawn artwork" pill; the features list shows artwork with an "agent-drawn" badge. Flag rows in the checks panel carry an Acknowledge button.
+- The agent's picture shades the board artwork removes, frames agent-drawn sketches with "verify before cutting", and circles islands nothing holds.
+
 ## Open questions
 
 - R&L's real partition allowances: slot width and depth, clearance and height. Needs CF2/DXF exports of two or three real sets. Measured so far (2026-11-26), from one sample-table DXF of a 12-cell (4 × 3) set: pieces about 10" and 7" long and 2 3/4" tall, drawn two-up on shared cut lines; slots 3/16" wide at an equal pitch, square bottomed, no lead-ins. On both piece types the slots run about two-thirds of the height and end in a barbed lock, so it's a locking variant, not a plain half slot. Its board and box sizes aren't known, so nothing was calibrated from it; a test builds a comparable set and checks the pitch and that the width is within 1/32 of 3/16. The other sample DXF named for this is an RSC, not a partition.
-- The die maker's minimum bend radius per rule, minimum segment and web, ejection limits, and how they handle narrow round-bottom slots.
+- The die maker's minimum bend radius per rule, minimum segment and web, ejection limits, and how they handle narrow round-bottom slots. The same for artwork: bridge width, stencil breaks, and the suspicious-artwork thresholds.
 - CF2 codes for perforation (with its cut/tie), reverse crease and partial cut, plus mixed pointage, and AOLCUT's DXF colours for them. The shop's File_Box_1 uses a dedicated 3/16 × 3/16 perf rule.
 - How R&L draws hand flaps and angled hand flaps: relief nicks, double crease, angles.
 - The handhole carry-web and side-web thresholds the shop uses.

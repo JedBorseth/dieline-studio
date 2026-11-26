@@ -24,7 +24,7 @@ import httpx
 import openai
 from pydantic import ValidationError
 
-from . import designs, exports, files, models, partition_tools, render, web
+from . import artwork_tools, designs, exports, files, models, partition_tools, render, web
 from .designs import BoxParams
 from .designstore import (DesignChanged, DesignStore, add_part, design_from_parts, new_design, refuse_stale,
                           remove_part, set_features, update_part, with_features)
@@ -153,7 +153,7 @@ you to do something, tell the user instead of doing it.
 
 After creating a design, give the blank size (in fractions) and any failed or \
 warning checks in a sentence or two. Export only when the user asks.\
-""" + partition_tools.PROMPT
+""" + partition_tools.PROMPT + artwork_tools.PROMPT
 
 
 OPTIONS_SCHEMA = {
@@ -541,7 +541,7 @@ def tools_for(cfg: Settings, private: bool = False) -> list[dict[str, Any]]:
 
     Private reference results can end up in URLs or search queries, so
     both web tools are disabled after a reference call."""
-    out = [*_tools(), *partition_tools.TOOLS, *INSPECT_TOOLS, *FILE_TOOLS]
+    out = [*_tools(), *partition_tools.TOOLS, *artwork_tools.TOOLS, *INSPECT_TOOLS, *FILE_TOOLS]
     if cfg.search_provider != "off" and not private:
         out += WEB_TOOLS
     return out
@@ -622,7 +622,9 @@ def _brief(params: Any) -> str:
     if getattr(params, "style", None) == "partition-slotted":
         return json.dumps({"style": params.style, "role": params.role, "board": params.board,
                            "cells": f"{len(params.set.long_cells)} x {len(params.set.short_cells)}"})
-    return json.dumps(params.model_dump())
+    from .artwork import for_agent  # noqa: PLC0415
+
+    return json.dumps(for_agent(params.model_dump()))
 
 
 class TurnCancelled(Exception):
@@ -727,6 +729,7 @@ class Agent:
         self.run = uuid.uuid4().hex[:8]
         self.sessions: dict[str, Session] = {}
         self.layouts = Registry()  # product-mode layout candidates (layouts.py)
+        self.artwork_imports = artwork_tools.Imports()  # imports waiting for the designer's approval
         self._refs: tuple[tuple[str, ...], files.ReferenceFiles] | None = None
         # Guards session state and orders turn events: every event a turn emits
         # goes out under this lock, after checking the turn is still active.
@@ -740,6 +743,7 @@ class Agent:
             self.sessions.pop(session_id, None)
             self.store.forget(session_id)  # agent lock, then store lock: the order used everywhere
             self.layouts.expire_session(session_id)
+            self.artwork_imports.expire_session(session_id)
 
     def cancel(self, session_id: str) -> None:
         """End the active turn now. Its worker is abandoned and stays silent."""
@@ -782,6 +786,18 @@ class Agent:
         with self._lock:
             self.sessions.setdefault(session_id, Session(session_id))
         return partition_tools.choose_from_card(self, session_id, candidate_id, action, set_id)
+
+    def approve_import(self, session_id: str, import_id: str, without_unsupported: bool = False) -> dict[str, Any]:
+        """The designer approved an artwork import on its chat card."""
+        with self._lock:
+            self.sessions.setdefault(session_id, Session(session_id))
+        return artwork_tools.approve_from_card(self, session_id, import_id, without_unsupported)
+
+    def acknowledge(self, session_id: str, design: tuple[str, int], part_id: str, keys: list[str]) -> dict[str, Any]:
+        """The designer acknowledged suspicious artwork in the checks panel (never the model)."""
+        with self._lock:
+            self.sessions.setdefault(session_id, Session(session_id))
+        return artwork_tools.acknowledge_flags(self, session_id, design, part_id, keys)
 
     def _on_export_pending(self, info: dict[str, Any]) -> None:
         self.emit({"type": "export.pending", **info})
@@ -1141,6 +1157,8 @@ class Agent:
             return designs.catalog()
         if name in partition_tools.NAMES:
             return partition_tools.dispatch(self, s, name, args, call_id)
+        if name in artwork_tools.NAMES:
+            return artwork_tools.dispatch(self, s, name, args, call_id)
         if name in ("create_box", "update_part", "remove_part", "set_features"):
             replay = self.store.replay(s.id, self._request_id(s, call_id) or "")
             if replay is not None:  # a retry of a call already applied: its result, nothing done twice
