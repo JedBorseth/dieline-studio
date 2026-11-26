@@ -38,8 +38,9 @@ TOL = 1e-6
 
 # Defaults. The handhole is File_Box_1's (a shop file): 3 5/8 x 1 3/8, full-radius 11/16 ends, long
 # side horizontal; and the perforation is its dedicated 3/16 x 3/16 rule. Everything else is provisional.
-HANDHOLE = {"shape": "obround", "width": "3 5/8", "height": "1 3/8"}
-VENT_DIAMETER = "1/2"
+# Defaults carry their unit, so they mean the same on a millimetre part.
+HANDHOLE = {"shape": "obround", "width": "3 5/8 in", "height": "1 3/8 in"}
+VENT_DIAMETER = "1/2 in"
 CLEARANCE_IN = 0.25
 TAB_LENGTH_IN = 0.5
 TEAR_WIDTH_IN = 0.75
@@ -190,15 +191,15 @@ def normalize(item: Any, fid: str | None = None) -> dict[str, Any]:
         if kind == "score":
             out["side"] = _str_enum(item, "side", ("normal", "reverse"), "normal", what)
         elif kind == "perforation":
-            out["cut"] = _length(item, "cut", "3/16", what)
-            out["tie"] = _length(item, "tie", "3/16", what)
+            out["cut"] = _length(item, "cut", "3/16 in", what)
+            out["tie"] = _length(item, "tie", "3/16 in", what)
             out["phase"] = _length(item, "phase", 0, what)
             out["crossing"] = _str_enum(item, "crossing", ("tie_at_creases", "continuous"), "tie_at_creases", what)
         else:
-            out["width"] = _length(item, "width", "3/4", what)
+            out["width"] = _length(item, "width", "3/4 in", what)
             out["start"] = _str_enum(item, "start", ("start", "end"), "start", what)
             out["tab"] = _str_enum(item, "tab", ("edge_tab", "angled_tab", "thumb_hole"), "edge_tab", what)
-            out["tab_length"] = _length(item, "tab_length", "1/2", what)
+            out["tab_length"] = _length(item, "tab_length", "1/2 in", what)
             out["rails"] = _str_enum(item, "rails", ("perf", "cut_score"), "perf", what)
             out["glue_joint"] = _str_enum(item, "glue_joint", ("cross", "stop"), "cross", what)
     elif kind == "notch":

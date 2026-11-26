@@ -153,7 +153,7 @@ def test_features_need_a_kind_known_fields_and_an_explicit_to():
     with pytest.raises(FeatureError, match="faces must be"):
         normalize({"kind": "score", "route": {"direction": "horizontal", "at": {"from": "top", "distance": 1}}})
     hh = normalize(HH)
-    assert (hh["shape"], hh["width"], hh["height"]) == ("obround", "3 5/8", "1 3/8")  # File_Box_1's
+    assert (hh["shape"], hh["width"], hh["height"]) == ("obround", "3 5/8 in", "1 3/8 in")  # File_Box_1's
 
 
 def test_batch_upsert_by_id_merges_and_removes():
@@ -681,3 +681,12 @@ def test_the_scene_tags_feature_segments_with_feature_and_face():
     assert hh and {s["face_id"] for s in hh} == {"P1", "P3"} and all(s["provenance"] == "feature" for s in hh)
     assert all(s["op"] == "outline" for s in sc if s.get("feature_id") == "f2")
     assert any(s.get("face_id") == "P2" and s["op"] == "hinge_P1_P2" for s in sc)
+
+
+def test_inch_defaults_mean_the_same_on_a_millimetre_part():
+    mm = build([{**HH, "placement": {**HH["placement"], "y": {"from": "top_score", "to": "near_edge",
+                                                                "distance": "50mm"}}}],
+               units="mm", length=356, width=254, depth=305)
+    fb = face_box(mm, "f1", "P1")
+    assert (fb[2] - fb[0], fb[3] - fb[1]) == pytest.approx((3.625, 1.375))
+    assert mm.faces.faces["P1"].height - fb[3] == pytest.approx(50 / 25.4)
