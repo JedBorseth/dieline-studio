@@ -3,7 +3,7 @@
 // docs/DESIGN-SYSTEM.md, "UI".
 
 import { type Primitive, toSvgPath } from "./cf2.ts";
-import { type CheckResult, type Design, isPartitionParams, type SceneSegment } from "./protocol.ts";
+import { type BoxParams, type CheckResult, type Design, isPartitionParams, type SceneSegment } from "./protocol.ts";
 
 const MM_PER_IN = 25.4;
 
@@ -104,6 +104,22 @@ export function replaceLoses(design: Design | null | undefined): string | null {
   return `Replace the current design? Its features, overrides and extra parts will be lost (${lost.join(", ")}).`;
 }
 
+/** The form's Replace starts a clean standard part: only the plain standard parameters, never the
+ *  design's features, artwork or acknowledgements (nor anything else the form doesn't edit). */
+export function plainStandard(params: BoxParams, boardIds: readonly string[] = []): BoxParams {
+  const normalized = params.board.trim().toUpperCase().replace(/\s+/g, " ");
+  const out: BoxParams = {
+    style: params.style,
+    length: params.length,
+    width: params.width,
+    depth: params.depth,
+    units: params.units,
+    board: boardIds.find((b) => b === normalized) ?? params.board,
+  };
+  if (params.options) out.options = { ...params.options };
+  return out;
+}
+
 // A feature link clicked in the chat asks the preview to show that feature.
 const EVENT = "dieline:focus-feature";
 export interface FocusFeature {
@@ -142,9 +158,17 @@ export function agentSketches(scene: SceneSegment[] | undefined, units?: string)
     const k = scale(units);
     const pts: [number, number][] = [s.start, s.end];
     if (s.arc && s.center) {
-      // The arc's whole circle bounds it (a frame a little generous is fine).
-      const r = Math.hypot(s.start[0] - s.center[0], s.start[1] - s.center[1]);
-      pts.push([s.center[0] - r, s.center[1] - r], [s.center[0] + r, s.center[1] + r]);
+      const [cx, cy] = s.center;
+      const r = Math.hypot(s.start[0] - cx, s.start[1] - cy);
+      const a = Math.atan2(s.start[1] - cy, s.start[0] - cx);
+      const b = Math.atan2(s.end[1] - cy, s.end[0] - cx);
+      const turn = 2 * Math.PI;
+      const along = (angle: number) => (((s.clockwise ? a - angle : angle - a) % turn) + turn) % turn;
+      const sweep = s.full_circle ? turn : along(b);
+      const extrema: [number, number][] = [[cx + r, cy], [cx, cy + r], [cx - r, cy], [cx, cy - r]];
+      extrema.forEach((point, i) => {
+        if (along(i * Math.PI / 2) <= sweep) pts.push(point);
+      });
     }
     const b = boxes.get(s.feature_id) ?? { xmin: Infinity, ymin: Infinity, xmax: -Infinity, ymax: -Infinity };
     for (const [x, y] of pts) {

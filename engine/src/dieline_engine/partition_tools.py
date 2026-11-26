@@ -330,7 +330,7 @@ def _choose(ag: Any, s: Any, args: dict[str, Any], call_id: str | None) -> dict[
     action, set_id, contained_in, label = _action({"contained_in": cand.contained_in, **args})
     spec = cand.spec.model_copy(update={"chosen": {"candidate": cid, "via": "chat", "message_id": mid}})
     container = _container(ag.store.current(s.id), contained_in)
-    if container is not None and spec.depth is None:
+    if container is not None:  # the box it goes in now, which may not be the one it was offered for
         spec = spec.model_copy(update={"depth": container.depth})
     gid = set_id if action == "replace_set" else f"set_{uuid.uuid4().hex[:6]}"
     payload = ag._mutate(s, _change(action, set_id, spec, label or cand.label, contained_in, gid), call_id,
@@ -353,7 +353,7 @@ def choose_from_card(ag: Any, session_id: str, cid: str, action: str | None = No
         action_, set_id_, contained_in, label = _action(args)
         spec = cand.spec.model_copy(update={"chosen": {"candidate": cid, "via": "card"}})
         container = _container(cur, contained_in)
-        if container is not None and spec.depth is None:
+        if container is not None:
             spec = spec.model_copy(update={"depth": container.depth})
         gid = set_id_ if action_ == "replace_set" else f"set_{uuid.uuid4().hex[:6]}"
         payload = ag.store.mutate(session_id, _change(action_, set_id_, spec, cand.label, contained_in, gid),

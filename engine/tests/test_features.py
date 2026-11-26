@@ -69,6 +69,8 @@ def test_expressions_types_fractions_units_and_names():
     assert evaluate("W/2 - 1/4", env) == 4.75
     assert evaluate("1 1/2", env) == 1.5
     assert evaluate("2:12", env) == 2.75
+    with pytest.raises(ExpressionError, match="already specify inches"):
+        evaluate("2:12mm", env)
     assert evaluate("2 * CAL", env) == pytest.approx(2 * get_board("32 B KR").cal)
     assert evaluate("50mm", env) == pytest.approx(50 / 25.4)
     assert evaluate("round(W/3, 1/16in)", env) == pytest.approx(3.3125)
@@ -420,6 +422,17 @@ def test_notches_on_creases_corners_and_each_other_are_refused():
                    "pattern": {"kind": "row", "count": 2, "pitch": "1 1/16"}, "along": "centred"}])
 
 
+def test_notch_pitch_and_clearance_against_an_interior_cut():
+    notch = {"kind": "notch", "on": "P1", "edge": "free_edge", "width": 1, "along": "centred"}
+    with pytest.raises(ValueError, match="pitch must be positive"):
+        _refused([{**notch, "pattern": {"kind": "row", "count": 2, "pitch": -2}}])
+    vent = {"kind": "vent", "diameter": 0.25,
+            "placement": {"on": "P1", "x": {"from": "free_edge", "to": "near_edge", "distance": "9/16"},
+                          "y": "centred"}}
+    result = payload([notch, vent])
+    assert any(c["status"] == "warn" and c["id"].endswith("_near") for c in result["checks"])
+
+
 def test_an_extra_score_ends_on_the_outline_and_crosses_the_panel_scores():
     score = {"kind": "score", "route": {"faces": "body_panels", "direction": "horizontal",
                                         "at": {"from": "bottom_score", "distance": 3}}}
@@ -707,3 +720,86 @@ def test_short_ties_on_thick_board_and_the_tear_strip_tab_checks():
     near = checks(payload([{"kind": "tear_strip", "tab": "angled_tab", "start": "end", "route": {
         "faces": ["P3", "P2"], "direction": "horizontal", "at": {"from": "bottom_score", "distance": 3}}}]))
     assert "feature_f1_tab_score" in near  # the tab sits at the P1/P2 score end of P2
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+@pytest.mark.parametrize("tab", ["edge_tab", "angled_tab", "thumb_hole"])
+def test_the_expanded_perforation_keeps_a_tear_strips_tab_contacts(tab):
+    """Review finding 5: the dashed rails must still be what the pull tab's cuts end on."""
+    ts = {"kind": "tear_strip", "tab": tab, "route": {"faces": "body_panels", "direction": "horizontal",
+                                                      "at": {"from": "bottom_score", "distance": 3}}}
+    d = build([ts])
+    expanded = rules.expand_perforations(d)
+    r = validate(expanded)
+    assert r.ok, r.invalid and r.invalid[0].message
+    assert not r.islands and not any(s.type == T.PERFORATION for s in expanded.segments)
+    designs.check_outputs(d, {"dxf": write_dxf(d, expand_perfs=True)}, expand_perfs=True)
+    if tab != "thumb_hole":
+        tabs = [op for op in expanded.ops.values() if op.kind == "tab_cut"]
+        assert tabs and all("f1.rail_a" not in op.ends_on and "f1.rail_b" not in op.ends_on for op in tabs)
+        assert any("f1.rail_a.cuts" in op.ends_on or "f1.rail_b.cuts" in op.ends_on for op in tabs)
+    # still an unverified representation: the target stays blocked
+    assert any("unverified" in w for w in rules.blocks(d, "dxf", expand_perfs=True))
+
+
+def test_a_curved_perforation_expands_into_dashed_arcs():
+    """Review finding 5: an arc perforation (curved artwork) used to stay a perforation and crash the DXF writer."""
+    art = {"kind": "shape", "shape": "circle", "diameter": 2, "rule": "perforation",
+           "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    d = designs.build(BoxParams.model_validate({**BOX, "artwork": [art]}))
+    expanded = rules.expand_perforations(d)
+    assert not any(s.type == T.PERFORATION for s in expanded.segments)
+    dashes = [s for s in expanded.segments if s.op and s.op.endswith(".cuts")]
+    assert dashes and all(isinstance(s, Arc) and s.radius == pytest.approx(1.0, abs=1e-4) for s in dashes)
+    assert sum(s.length for s in dashes) == pytest.approx(math.pi, abs=0.2)  # 3/16 cut, 3/16 tie: about half
+    r = validate(expanded)
+    assert r.ok and not r.islands
+    text = write_dxf(d, expand_perfs=True)
+    designs.check_outputs(d, {"dxf": text}, expand_perfs=True)
+    assert any("unverified" in w for w in rules.blocks(d, "dxf", expand_perfs=True))
+
+
+def test_an_arc_perforation_puts_a_tie_on_a_crease_it_crosses():
+    from dieline_engine.geometry import Dieline, Operation
+
+    d = Dieline("t", units="in")
+    d.add_op(Operation("c", "hinge", open_ends="free"))
+    d.add_op(Operation("p", "perf", open_ends="free"))
+    d.add_line((0.0, -2.0), (0.0, 2.0), T.CREASE, "c")
+    d.add_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), False, T.PERFORATION, op="p")  # crosses x = 0 at the top
+    assert rules.crease_stations(d, d.segments[1]) == pytest.approx([math.pi / 2])
+    expanded = rules.expand_perforations(d)
+    for s in expanded.segments:
+        if s.op == "p.cuts":
+            assert min(math.dist(s.start, (0, 1)), math.dist(s.end, (0, 1))) >= 3 / 32 - 1e-6
+
+
+@pytest.mark.parametrize(("faces", "start"), [
+    ("body_panels", "end"),
+    (["P4", "P3", "P2", "P1"], "start"),
+])
+def test_reversed_tear_strip_keeps_the_rail_contacts_at_the_tapered_lug(faces, start):
+    ts = {"kind": "tear_strip", "start": start, "tab": "edge_tab", "pointage": 3, "width": 1,
+          "tab_length": 0.25, "route": {"faces": faces, "direction": "horizontal",
+                                        "at": {"from": "bottom_score", "distance": 0.8}}}
+    d = build([ts])
+    strip = d.extras["features"][0]
+    assert strip.status == "ok", strip.reason
+    assert strip.copies[0].faces[0] == "glue_lug"
+    assert all(d.ops[s.op].rule.pointage == 3 for s in strip.copies[0].segs)
+    expanded = validate(rules.expand_perforations(d))
+    assert expanded.ok and not expanded.islands, expanded.invalid
+    stopped = payload([{**ts, "glue_joint": "stop", "tab": "thumb_hole"}])
+    assert "feature_f1_joint" in checks(stopped)
+
+
+def test_tear_strip_thumb_hole_checks_its_actual_centre():
+    ts = {"kind": "tear_strip", "tab": "thumb_hole", "width": 1, "tab_length": 0.25,
+          "route": {"faces": "body_panels", "direction": "horizontal",
+                    "at": {"from": "bottom_score", "distance": 3}}}
+    d = build([ts])
+    copy = d.extras["features"][0].copies[0]
+    hole = next(s for s in copy.segs if isinstance(s, Arc))
+    assert copy.extra["tab_at"] == hole.center

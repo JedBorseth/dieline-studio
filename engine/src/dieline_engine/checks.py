@@ -142,15 +142,14 @@ def check_topology(d: Dieline, report: Report | None = None) -> list[CheckResult
             out.append(CheckResult(cid, "unavailable", "not checked until the segments above are valid"))
         else:
             out.append(CheckResult(cid, "pass", ok))
-    # Islands the artwork makes are reported (with their fixes) by the artwork checks.
-    art_isl = d.extras.get("artwork_islands") or []
-    if art_isl:
+    # An island the artwork checks own (unhandled, so they fail it, or an accepted drop-out) is reported
+    # there, with its fix. Only that exact island: its board's boundary must be the recorded loop. A
+    # split, an island the artwork says it bridged or cut round, or one nothing recorded stays here.
+    owned = {frozenset(rec.get("segs") or ()) for rec in d.extras.get("artwork_islands") or []  # type: ignore[union-attr]
+             if rec.get("status") in ("open", "failed", "drop_out") and rec.get("segs")}
+    if owned:
         def mine(i: Issue) -> bool:
-            if i.point is None:
-                return False
-            return any(rec["region"][0] - 1e-5 <= i.point[0] <= rec["region"][2] + 1e-5 and  # type: ignore[index]
-                       rec["region"][1] - 1e-5 <= i.point[1] <= rec["region"][3] + 1e-5  # type: ignore[index]
-                       for rec in art_isl)
+            return i.kind == "island" and frozenset(i.segs) in owned
         r = Report(r.invalid, [i for i in r.islands if not mine(i)], r.near_misses, r.material_faces)
     off = [i for i in r.invalid if i.kind == "off_board"]
     if off:

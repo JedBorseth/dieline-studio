@@ -201,7 +201,10 @@ export interface LayoutCandidate {
   cells_long: number;
   cells_short: number;
   spare_cells: number;
+  /** Whether the set's own grid is 1 x n (plain dividers, no slots). */
   degenerate: boolean;
+  /** The set's grid when an air-cell ring surrounds the item cells ("5 x 3" around "3 x 1"). */
+  grid_cells?: string;
   item_along_long_in: number;
   cell_in: { long: number; short: number };
   set_outside_in: { long: number; short: number; height: number };

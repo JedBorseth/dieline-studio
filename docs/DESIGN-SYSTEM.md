@@ -1148,7 +1148,7 @@ Where this spec left a choice open, phase 4 took the safest reading:
 - Long straight: 1" or longer, within 3° of parallel and within 1" of any edge or crease of its face.
 - Slot-like: a closed cut no more than 1/2" wide and at least 3:1, mostly straight, within 1" of the face's edge. Standards have no mates yet.
 - Span: over 80% of the face's width or height.
-- Rule: a crease or perforation whose **path length** is over half the face's width (the literal reading: a large creased circle is flagged too).
+- Rule: a crease or perforation whose **path length** is over half the face's shorter dimension (a large creased circle is flagged too).
 - One flag per artwork and kind. Its acknowledgement key is the artwork id, the kind and a fingerprint of the artwork as drawn, so moving, resizing or resizing the box asks again. Acknowledgements are stored on the part (`acknowledged`). The store refuses any chat change that adds one (dry runs too, and through any tool); the RPC needs the design id and revision on screen and accepts only keys the checks offer.
 
 **UI and picture**

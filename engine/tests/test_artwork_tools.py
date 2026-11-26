@@ -176,3 +176,13 @@ def test_the_job_record_keeps_artwork_provenance_and_its_drawn_outlines(tmp_path
     assert art["islands"][0]["status"] == "bridged" and len(art["outlines"]) == 2
     assert record["parts"][0]["params"]["artwork"][0]["sketch"]["shapes"]
     assert out
+
+
+def test_an_unplaceable_import_does_not_request_approval(tmp_path):
+    (tmp_path / "logo.svg").write_bytes(SVG)
+    ag, t = agent(tmp_path, refs=[tmp_path])
+    ag._dispatch(t, "create_box", BOX, "c1")
+    with pytest.raises(ValueError, match="can't be placed"):
+        ag._dispatch(t, "set_artwork", {"items": [{"kind": "import", "path": str(tmp_path / "logo.svg"),
+                                                   "width": 30, "placement": MID}]}, "c2")
+    assert ag.store.current("s1").revision == 1

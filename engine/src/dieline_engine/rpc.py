@@ -155,7 +155,7 @@ class Server:
         if "expected" in p:  # what the form showed when the designer pressed Generate (null: nothing)
             e = p["expected"]
             if e is not None and not (isinstance(e, dict) and isinstance(e.get("design_id"), str)
-                                      and isinstance(e.get("revision"), int)):
+                                      and type(e.get("revision")) is int):
                 raise RpcError(INVALID_PARAMS, "expected must be {design_id, revision} or null")
             expected = None if e is None else (e["design_id"], e["revision"])
         if p.get("parts") is not None:
@@ -175,13 +175,16 @@ class Server:
     def _export_target(self, p: dict[str, Any]) -> tuple[list[exports.ExportPart], dict[str, Any]]:
         """The parts an export (or its plan) is for, and what the manifest records about the design."""
         if "design_id" in p:  # the export bar: exactly the snapshot it showed
-            snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), p.get("revision"))
+            revision = p.get("revision")
+            if type(revision) is not int:
+                raise RpcError(INVALID_PARAMS, "revision must be an integer")
+            snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), revision)
             checks = self.store.check_exportable(snap)  # the design's own checks block it too
             payload = self.store.payload(snap)
             return self.store.export_parts(snap), {
                 "design_id": snap.id, "revision": snap.revision, "design_checks": checks,
                 "structure": {"groups": payload["groups"], "links": payload["links"]}}
-        params = BoxParams.model_validate(p.get("params") or {})
+        params = designs.parse_params(p.get("params") or {})
         return [exports.ExportPart("p1", params.style, params)], {}
 
     def _export_args(self, p: dict[str, Any]) -> tuple[str | None, list[str]]:
@@ -213,7 +216,7 @@ class Server:
             parts, _ = self._export_target(p)
         except designs.DesignCheckFailed as exc:
             return {"ready": False, "blocking": [str(exc)], "files": [], "job_path": None, "replaces": [],
-                    "pickup": False}
+                    "pickup": False, "formats": {}}
         filename, formats = self._export_args(p)
         cfg = self.settings.settings
         return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir(),
@@ -266,7 +269,7 @@ class Server:
         if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
             raise RpcError(INVALID_PARAMS, "keys must be a list of acknowledgement keys")
         rev = p.get("revision")
-        if not isinstance(rev, int):
+        if type(rev) is not int:
             raise RpcError(INVALID_PARAMS, "revision must be the revision shown")
         return self.agent.acknowledge(_str(p, "session_id"), (_str(p, "design_id"), rev), _str(p, "part_id"), keys)
 

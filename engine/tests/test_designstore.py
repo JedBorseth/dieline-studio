@@ -207,6 +207,22 @@ def test_agent_is_refused_after_an_outside_edit_until_it_looks_again(tmp_path):
     assert out["parts"][0]["name"].startswith("REG-GLIO-NX 18x8x7")
 
 
+def test_list_faces_doesnt_rebind_the_turn_after_an_outside_edit(tmp_path):
+    """Review finding 15: the face map doesn't show the changed design, so it mustn't unlock changes to it."""
+    ag, t, _ = _agent(tmp_path)
+    ag._dispatch(t, "create_box", BOX, "c1")
+    seen = t.binding
+    ag.set_design("s1", params(length=20, depth=4))  # the designer replaced it in the form
+    with pytest.raises(DesignChanged, match="view_design"):
+        ag._dispatch(t, "list_faces", {}, "c2")
+    assert t.binding == seen
+    with pytest.raises(DesignChanged):
+        ag._dispatch(t, "update_part", {"width": 12}, "c3")
+    ag._dispatch(t, "view_design", {}, "c4")
+    assert ag._dispatch(t, "list_faces", {}, "c5")["faces"]  # once seen, the face map is fine
+    assert ag._dispatch(t, "update_part", {"width": 12}, "c6")["revision"] == 2
+
+
 def test_agent_retry_with_the_same_call_id_adds_one_part(tmp_path):
     ag, t, _ = _agent(tmp_path)
     ag._dispatch(t, "create_box", BOX, "c1")
@@ -257,7 +273,7 @@ def test_turn_note_tells_the_model_about_outside_changes(tmp_path):
 def test_rpc_replace_get_and_export_by_snapshot(tmp_path):
     import io
 
-    from dieline_engine.rpc import Server
+    from dieline_engine.rpc import RpcError, Server
 
     store = SettingsStore(tmp_path / "settings.json")
     store.update({"output_dir": str(tmp_path / "out")})
@@ -267,6 +283,11 @@ def test_rpc_replace_get_and_export_by_snapshot(tmp_path):
     res = server.methods["box.export"]({"session_id": "s1", "design_id": shown["design_id"], "revision": 1,
                                         "filename": "job"})
     assert res["paths"][0].endswith("job.cf2")
+    with pytest.raises(RpcError, match="expected must be"):
+        server.methods["design.replace"]({"session_id": "s1", "params": BOX,
+                                          "expected": {"design_id": shown["design_id"], "revision": True}})
+    with pytest.raises(RpcError, match="revision must be an integer"):
+        server.methods["export.plan"]({"session_id": "s1", "design_id": shown["design_id"], "revision": True})
     # The chat changed the design after the export bar showed it: that bar's export is refused.
     server.store.mutate("s1", lambda cur: update_part(cur, None, params(length=16)))
     with pytest.raises(DesignChanged):
@@ -377,6 +398,9 @@ def test_a_stale_link_blocks_export_everywhere(tmp_path):
     with pytest.raises(designs.DesignCheckFailed, match="fit link"):
         server.methods["box.export"]({"session_id": "s1", "design_id": out["design_id"],
                                       "revision": out["revision"], "filename": "x"})
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": out["design_id"],
+                                          "revision": out["revision"], "filename": "x"})
+    assert plan["ready"] is False and plan["formats"] == {}
     t = agent_mod.Turn("s1", 1, [], (out["design_id"], out["revision"]), out["seq"])
     server.agent.sessions["s1"] = agent_mod.Session("s1", active=t)
     with pytest.raises(designs.DesignCheckFailed):

@@ -252,12 +252,15 @@ def _import(ag: Any, s: Any, cur: Any, part_id: str, raw: dict[str, Any], call_i
     view = ag._design_view(payload, part_id)
     new = [f for p in payload["parts"] if p["part_id"] == part_id for f in p.get("features", [])
            if f["id"] not in {a["id"] for a in cur.part(part_id).params.artwork} and f.get("kind") == "artwork"]
+    if len(new) != 1:
+        raise ValueError("could not identify the artwork to approve")
+    refuse_stale(payload, part_id, [new[0]["id"]])
     iid = ag.artwork_imports.add(s.id, (cur.id, cur.revision), part_id, item, parsed.unsupported, real.name)
     view["import"] = {
         "id": iid, "file": real.name, "format": parsed.format, "sha256": item["source"]["sha256"][:16],
         "units": "from the file" if parsed.units_in else "none in the file (a size is needed)",
         "outlines": len(parsed.subs), "unsupported": parsed.unsupported, "notes": parsed.notes,
-        "artwork": new[0] if new else None,
+        "artwork": new[0],
         "status": "waiting for the designer: they approve it with the card under this tool result. You can't.",
     }
     view["dry_run"] = "nothing was changed: the import waits for the designer's approval"

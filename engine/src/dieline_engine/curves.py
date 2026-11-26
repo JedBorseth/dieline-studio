@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass, field
 
 from .shapes import Prim
+from .topology import MAX_COORD_IN
 
 Point = tuple[float, float]
 FIT_TOL_IN = 0.002
@@ -352,6 +353,9 @@ def arc_through(p: Point, t: Point, q: Point) -> Prim:
         return Prim(p, q)
     r = L2 / (2 * nw)
     c = (p[0] + n[0] * r, p[1] + n[1] * r)
+    # Leave headroom for placement on the blank. The fitter still checks chord error.
+    if max(abs(c[0]), abs(c[1])) > MAX_COORD_IN / 2:
+        return Prim(p, q)
     return Prim(p, q, c, r < 0)
 
 
@@ -451,26 +455,35 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
 
     def chords(ta: float, tb: float, depth: int = 0) -> None:
         a, b = curve.point(ta), curve.point(tb)
-        mid = curve.point((ta + tb) / 2)
         seg = Prim(a, b)
         dev = max(prim_point_dist(seg, curve.point(ta + (tb - ta) * i / 8)) for i in range(1, 8))
-        if (dev <= tol or depth >= 20) and math.dist(a, b) > 1e-12:
+        span = math.dist(a, b)
+        if span <= 1e-12 and dev <= 1e-12:
+            return
+        if dev <= tol and span > 1e-12:
             out.prims.append(seg)
             out.kinds.append("fallback")
             out.fallback += 1
             out.max_dev = max(out.max_dev, dev)
             return
-        if math.dist(a, b) <= 1e-12 and math.dist(a, mid) <= 1e-12:
-            return
+        if depth >= 20:
+            raise CurveError("could not fit the artwork curve within tolerance")
         chords(ta, (ta + tb) / 2, depth + 1)
         chords((ta + tb) / 2, tb, depth + 1)
 
     def go(ta: float, tb: float, depth: int) -> None:
         p0, p1 = curve.point(ta), curve.point(tb)
         if math.dist(p0, p1) <= 1e-9:
-            if depth == 0:  # a closed curve: split it
-                go(ta, (ta + tb) / 2, depth + 1)
-                go((ta + tb) / 2, tb, depth + 1)
+            mid = (ta + tb) / 2
+            # Coincident endpoints can enclose a complete loop, even when the midpoint
+            # coincides with them as well. Look inside the interval before discarding it.
+            if all(math.dist(p0, curve.point(ta + (tb - ta) * i / 8)) <= 1e-12 for i in range(1, 8)):
+                return
+            if depth >= MAX_DEPTH:
+                chords(ta, tb)
+            else:
+                go(ta, mid, depth + 1)
+                go(mid, tb, depth + 1)
             return
         t0, t1 = curve.tangent(ta, True), curve.tangent(tb, False)
         arcs = biarc(p0, t0, p1, t1) if t0 is not None and t1 is not None else None
@@ -478,8 +491,7 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
             dev = _deviation(curve, ta, tb, arcs)
             if dev <= tol:
                 for pr in arcs:
-                    if (pr.center is None and math.dist(pr.start, pr.end) > 1e-12) or \
-                            (pr.center is not None and math.dist(pr.start, pr.end) > 1e-12):
+                    if math.dist(pr.start, pr.end) > 1e-12:
                         out.prims.append(pr)
                         out.kinds.append("fit")
                 out.max_dev = max(out.max_dev, dev)

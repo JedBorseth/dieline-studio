@@ -7,6 +7,7 @@ import {
   hasAgentDrawn,
   isActionable,
   pendingFlags,
+  plainStandard,
   keepFeatureLinks,
   parseFeatureHref,
   regionToMm,
@@ -127,4 +128,51 @@ test("the header pill and the flags waiting for the designer", () => {
     { id: "material", status: "fail", message: "" },
   ]);
   assert.deepEqual(flags.map((c) => c.id), ["artwork_a1_flag_slot"]);
+});
+
+test("the form's Replace starts a clean standard part: no features, artwork or acknowledgements", () => {
+  // Review finding 4: the form used to spread the design's params, so Replace kept them.
+  const initial = {
+    style: "reg-glio-nx",
+    length: 14,
+    width: 10,
+    depth: 12,
+    units: "in" as const,
+    board: " 32  b kr",
+    options: { top_flaps: "standard" },
+    features: [{ id: "f1", kind: "handhole" }],
+    artwork: [{ id: "a1", kind: "shape" }],
+    acknowledged: ["a1:parallel:abc"],
+    overrides: [{ id: "o1" }],
+  } as unknown as Parameters<typeof plainStandard>[0];
+  const clean = plainStandard(initial, ["32 B KR", "32 C KR"]);
+  assert.deepEqual(clean, {
+    style: "reg-glio-nx",
+    length: 14,
+    width: 10,
+    depth: 12,
+    units: "in",
+    board: "32 B KR",
+    options: { top_flaps: "standard" },
+  });
+  assert.ok(!("features" in clean) && !("artwork" in clean) && !("acknowledged" in clean));
+  // the options are a copy, so editing the form never edits the design on screen
+  clean.options!.top_flaps = "gap_lap";
+  assert.equal(initial.options!.top_flaps, "standard");
+});
+
+
+test("a short sketch arc frames only its swept bounds", () => {
+  const x = Math.sqrt(100 ** 2 - 1);
+  const arc = {
+    ...artScene[1],
+    center: [0, 0],
+    start: [x, -1],
+    end: [x, 1],
+    clockwise: false,
+    full_circle: false,
+  } satisfies SceneSegment;
+  assert.deepEqual(agentSketches([arc], "mm").frames[0].box, {
+    xmin: x, ymin: -1, xmax: Math.hypot(x, 1), ymax: 1,
+  });
 });

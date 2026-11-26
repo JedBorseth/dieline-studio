@@ -27,6 +27,7 @@ import {
   isActionable,
   type MmBox,
   onFocusFeature,
+  plainStandard,
   regionToMm,
   replaceLoses,
 } from "../lib/features";
@@ -1483,11 +1484,8 @@ function QuickBox(props: {
   const [error, setError] = useState<string | null>(null);
   const { info } = props;
   const [p, setP] = useState<BoxParams>(() => {
-    if (props.initial) {
-      const normalizedBoard = props.initial.board.trim().toUpperCase().replace(/\s+/g, " ");
-      const matchedBoard = info.boards.find((b) => b.id === normalizedBoard)?.id ?? props.initial.board;
-      return { ...props.initial, board: matchedBoard };
-    }
+    // A clean standard part: the design's features, artwork and acknowledgements never carry over.
+    if (props.initial) return plainStandard(props.initial, info.boards.map((b) => b.id));
     const style = info.styles[0];
     return {
       style: style?.id ?? "",
@@ -1533,7 +1531,7 @@ function QuickBox(props: {
   };
 
   const parsed = (): BoxParams | string => {
-    const out: BoxParams = { ...p, options: { ...options } };
+    const out: BoxParams = { ...plainStandard(p), options: { ...options } };
     for (const k of ["length", "width", "depth"] as const) {
       const v = parseLength(dims[k]);
       if (!Number.isFinite(v) || v <= 0)

@@ -671,3 +671,116 @@ def test_partition_and_fit_checks_carry_their_category():
     assert CheckResult("stack_g1", "pass", "x").to_dict()["category"] == "fit"
     assert CheckResult("link_l1", "stale", "x").to_dict()["category"] == "geometry"
     assert CheckResult("calibration", "warn", "x").to_dict()["category"] == "calibration"
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+@pytest.mark.parametrize("mouth", ["square", "lead_in"])
+def test_a_shallow_wide_slot_gets_a_square_bottom_not_a_round_one_past_the_edge(mouth):
+    """Review finding 3: a slot shallower than its radius can't take a full round bottom;
+    it used to draw its walls back past the piece's edge and overlap itself."""
+    sp = spec(length=10, width=8, depth=0.4, cells_long=2, cells_short=2, board="32 B KR", slot_width=0.5,
+              mouth=mouth)
+    pl = P.plan_set(sp)
+    for piece in pl.pieces:
+        s = piece.slots[0]
+        assert s.bottom == "square" and s.depth == pytest.approx(s.usable)
+        d = designs.build(P.PartitionParams(board=piece.board, role=piece.role, set=sp))
+        assert validate(d).ok
+        ys = [y for seg in d.segments for y in (seg.start[1], seg.end[1])]
+        assert min(ys) >= -1e-9 and max(ys) <= piece.height + 1e-9
+        c = {x.id: x for x in P.piece_checks(pl, piece)}
+        assert c["partition_slot_bottom"].status == "info" and "too shallow" in c["partition_slot_bottom"].message
+    # the interlock still counts the usable depths
+    assert pl.play == pytest.approx(2 * (0.2 + 1 / 32) - 0.4)
+    # a deep enough wide slot keeps its round bottom and no note
+    deep = P.plan_set(spec(length=16, width=12, depth=10, cells_long=3, cells_short=2, board="48 BC KR"))
+    assert all(s.bottom == "round" for p in deep.pieces for s in p.slots)
+    assert all("partition_slot_bottom" not in {x.id for x in P.piece_checks(deep, p)} for p in deep.pieces)
+
+
+def test_product_candidates_with_air_cells_boards_lists_and_either_box_orientation():
+    """Review finding 11."""
+    # (a) an air-cell ring makes a 1 x n item layout a slotted 3 x (n + 2) grid: not "no slots"
+    ring = P.candidates({"count": 3, "item": {"diameter": 2}, "item_height": 4, "perimeter": {"air_cells": 1}})
+    one_row = [c for c in ring if c["cells"] in ("3 x 1", "1 x 3")]
+    assert one_row and all(not c["degenerate"] and c["grid_cells"] in ("5 x 3", "3 x 5") for c in one_row)
+    assert all({p["role"] for p in c["pieces"]} >= {"long", "short"} for c in one_row)
+    plain = P.candidates({"count": 3, "item": {"diameter": 2}, "item_height": 4})
+    assert all(c["degenerate"] and "grid_cells" not in c for c in plain if c["cells"] in ("3 x 1", "1 x 3"))
+    # (b) a boards list fits only some grids; the others are skipped, not the whole search
+    one = P.candidates({"count": 6, "item": {"diameter": 2}, "item_height": 4, "boards_long": ["32 C KR"]})
+    assert one and all(c["cells"] == "3 x 2" for c in one)  # 1 x 6 has no long piece to take the board
+    assert all(p["board"] == "32 C KR" for c in one for p in c["pieces"] if p["role"] == "long")
+    with pytest.raises(P.Refused, match="board"):
+        P.candidates({"count": 6, "item": {"diameter": 2}, "item_height": 4, "boards_long": ["nope", "nope"]})
+    # (c) the box's longer side bounds the set's long axis, whichever way round it's named
+    a = P.candidates({"count": 6, "item": {"diameter": 2}, "item_height": 4, "max_box": {"length": 10, "width": 5}})
+    b = P.candidates({"count": 6, "item": {"diameter": 2}, "item_height": 4, "max_box": {"length": 5, "width": 10}})
+    assert a and [c["cells"] for c in a] == [c["cells"] for c in b]
+
+
+def test_choose_layout_checks_the_height_against_the_box_it_goes_in(tmp_path):
+    """Review finding 13: choosing into another box used to keep the first box's depth."""
+    ag, t = _agent(tmp_path)
+    ag._dispatch(t, "create_box", {**BOX, "length": 16, "width": 12, "depth": 10, "label": "tall"}, "a1")
+    ag._dispatch(t, "create_box", {**BOX, "length": 16, "width": 12, "depth": 4, "label": "short",
+                                   "action": "add"}, "a2")
+    out = ag._dispatch(t, "create_partition", {"input_mode": "product", "count": 6, "item": {"diameter": 3},
+                                               "item_height": 5, "contained_in": "tall"}, "a3")
+    cid = out["candidates"][0]["id"]
+    t2 = _next_turn(ag, t, f"use {cid} in the short box")
+    done = ag._dispatch(t2, "choose_layout", {"candidate_id": cid, "message_id": "m2", "contained_in": "short"},
+                        "b1")
+    piece = next(p for p in ag.store.current("s1").parts if p.params.style == "partition-slotted")
+    assert piece.params.set.depth == pytest.approx(4)
+    assert done["links"][0]["container"] == ag.store.current("s1").part("short").id
+    height = [c for p in done["pieces"] for c in p.get("warnings", []) if c["id"] == "partition_height"]
+    assert height and "4 in deep box" in height[0]["message"]
+
+
+def test_malformed_and_cyclic_stacks_are_unavailable_or_refused_and_depth_warns_once():
+    """Review finding 14."""
+    from dieline_engine.designstore import Member, design_from_parts
+
+    d = new_design(BoxParams.model_validate({**BOX, "depth": 10}), "carton")
+    d, g1 = partsets.add_set(d, spec(depth=5.5, height=6), "tier1")
+    d, g2 = partsets.add_set(d, spec(depth=5.5, height=6), "tier2")
+    d, sid = partsets.add_stack(d, [g1, g2], pads=2, pad_board="32 B KR", contained_in="carton")
+    c = _design_checks(d)
+    lk = d.links[0].id
+    # an over-tall stack warns once, from the stack's own check
+    assert c[f"stack_{sid}"]["status"] == "warn" and f"{lk}_depth" not in c
+    # a hand-edited stack with pads but no pad board
+    bad = replace(d, groups=tuple(replace(g, extra=(("pads", 2),)) if g.id == sid else g for g in d.groups))
+    c = _design_checks(bad)
+    assert c[lk]["status"] == "unavailable" and "pad board" in c[lk]["message"]
+    # a stack that holds itself
+    loop = replace(d, groups=tuple(replace(g, members=(Member(sid, "tier", 1),)) if g.id == sid else g
+                                   for g in d.groups))
+    c = _design_checks(loop)
+    assert c[lk]["status"] == "unavailable" and "contains itself" in c[lk]["message"]
+    # and a job file with one is refused when it's opened
+    parts = [{"part_id": p.id, "label": p.label, "quantity": p.quantity, "params": p.params} for p in d.parts]
+    groups = [{"id": "g1", "kind": "stack", "members": [{"ref": "g2", "role": "tier"}]},
+              {"id": "g2", "kind": "stack", "members": [{"ref": "g1", "role": "tier"}]}]
+    with pytest.raises(ValueError, match="contains itself"):
+        design_from_parts(parts, groups, [])
+
+
+def test_stateless_rpc_can_plan_and_export_a_partition_piece(tmp_path):
+    import io
+
+    from dieline_engine.rpc import Server
+    from dieline_engine.settings import SettingsStore
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    sp = spec()
+    part = piece_params(sp, P.plan_set(sp).pieces[0].role)
+    request = {"params": part.model_dump(mode="json"), "filename": "divider"}
+    assert server.methods["export.plan"](request)["ready"]
+    assert server.methods["box.export"](request)["paths"][0].endswith("divider.cf2")
+    server._pool.shutdown()

@@ -115,10 +115,15 @@ class BoxParams(BaseModel):
             raise ValueError("artwork must be a list")
         if len(v) > MAX_ARTWORK:
             raise ValueError(f"a part can have at most {MAX_ARTWORK} artwork items")
-        out, seen = [], set()
-        for n, item in enumerate(v, 1):
+        out, seen, n = [], set(), 0
+        reserved = [item.get("id") for item in v if isinstance(item, dict)]
+        for item in v:
             aid = item.get("id") if isinstance(item, dict) else None
-            aid = aid or f"a{n}"
+            if aid is None:
+                n += 1
+                while f"a{n}" in reserved:
+                    n += 1
+                aid = f"a{n}"
             if not isinstance(aid, str) or not (len(aid) > 1 and aid[0] == "a" and aid[1:].isdigit()):
                 raise ValueError(f"artwork id {aid!r} isn't an artwork id (a1, a2, ...)")
             if aid in seen:

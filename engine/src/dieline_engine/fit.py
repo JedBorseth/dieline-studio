@@ -85,7 +85,9 @@ def inside(state: Any, ref: str) -> Envelope | str:
     return f"a {kind} group as a container isn't modelled yet; link the box itself"
 
 
-def outside(state: Any, ref: str) -> Envelope | str:
+def outside(state: Any, ref: str, _visiting: frozenset[str] = frozenset()) -> Envelope | str:
+    if ref in _visiting:
+        return f"{ref} contains itself (a group that's its own member); remove it from the group"
     p = _part(state, ref)
     if p is not None:
         if _is_partition(p.params):
@@ -107,13 +109,20 @@ def outside(state: Any, ref: str) -> Envelope | str:
         a, b = sorted((lo, so), reverse=True)
         return Envelope(a, b, ho, f"set {g.id} {fmt_in(lo)} x {fmt_in(so)} x {fmt_in(ho)} in")
     if g.kind == "stack":
-        tiers = [outside(state, m.ref) for m in g.members]
+        if not g.members:
+            return f"stack {g.id} has no tiers"
+        tiers = [outside(state, m.ref, _visiting | {ref}) for m in g.members]
         bad = [t for t in tiers if isinstance(t, str)]
         if bad:
             return bad[0]
         extra = dict(g.extra)
-        pads = int(extra.get("pads", 0))
-        pad_cal = get_board(extra["pad_board"]).cal if pads else 0.0
+        pads = extra.get("pads", 0)
+        if isinstance(pads, bool) or not isinstance(pads, int) or pads < 0:
+            return f"stack {g.id}'s pad count isn't a whole number"
+        try:
+            pad_cal = get_board(extra["pad_board"]).cal if pads else 0.0
+        except (KeyError, TypeError, ValueError):
+            return f"stack {g.id} has {pads} pads but no known pad board"
         h = sum(t.height for t in tiers) + pads * pad_cal  # type: ignore[union-attr]
         a = max(t.a for t in tiers)  # type: ignore[union-attr]
         b = max(t.b for t in tiers)  # type: ignore[union-attr]
@@ -149,16 +158,18 @@ def link_checks(state: Any, lk: Any) -> list[CheckResult]:
         msg += "; it doesn't go in"
     out.append(CheckResult(cid, worst, msg))
     g = _group(state, lk.contained)
-    if held.height > box.height + EPS:
+    if g is not None and g.kind == "stack":  # the stack's own check reports its height, once
+        if held.height > box.height + EPS:
+            out.append(CheckResult(f"stack_{g.id}", "warn", f"stack {g.id}: tiers and pads come to "
+                                                            f"{fmt_in(held.height)} in, over the "
+                                                            f"{fmt_in(box.height)} in inside depth: the lid won't "
+                                                            "close"))
+        else:
+            out.append(CheckResult(f"stack_{g.id}", "pass", f"stack {g.id}: tiers and pads {fmt_in(held.height)} "
+                                                            f"in, inside the {fmt_in(box.height)} in depth"))
+    elif held.height > box.height + EPS:
         out.append(CheckResult(f"{cid}_depth", "warn", f"fit {lk.id}: {fmt_in(held.height)} in high in a "
                                                        f"{fmt_in(box.height)} in deep box: the lid won't close"))
-    elif g is not None and g.kind == "stack":
-        out.append(CheckResult(f"stack_{g.id}", "pass", f"stack {g.id}: tiers and pads {fmt_in(held.height)} in, "
-                                                        f"inside the {fmt_in(box.height)} in depth"))
-    if g is not None and g.kind == "stack" and held.height > box.height + EPS:
-        out.append(CheckResult(f"stack_{g.id}", "warn", f"stack {g.id}: tiers and pads come to "
-                                                        f"{fmt_in(held.height)} in, over the {fmt_in(box.height)} in "
-                                                        "inside depth"))
     return out
 
 

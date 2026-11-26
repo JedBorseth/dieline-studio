@@ -15,7 +15,7 @@ stale after a resize). These are the checks on a committed design.
 - **Suspicious artwork** (artwork is untrusted): a long straight parallel to a
   nearby hinge or edge, a slot-like rectangle near an edge, a path spanning
   more than 80% of its face, crease or perforation artwork longer than half the
-  face's width. Each is `fail` until the **designer** acknowledges it in the
+  face's shorter dimension. Each is `fail` until the **designer** acknowledges it in the
   checks panel (`ack` names what to acknowledge). The agent has no way to.
 - Agent-drawn artwork is an info note everywhere it appears.
 """
@@ -23,6 +23,7 @@ stale after a resize). These are the checks on a committed design.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any
 
 from .artwork import EDGE_CLEARANCE_IN, PROVISIONAL, Art, Drawn, _bridge_min, _web_min
@@ -320,11 +321,55 @@ def _thin_webs(d: Dieline, live: list[Art], fm: FaceMap, cal: float) -> CheckRes
                 samples, "in", f"max(1/8, 2 x CAL) = {fmt_in(_r(lim))} in")
 
 
+def _join_straights(loop: list[Segment], dr: Drawn) -> list[Line]:
+    """Measure each uninterrupted straight even when its source splits it into lines."""
+    def join(a: Segment, b: Segment) -> Line | None:
+        if not isinstance(a, Line) or not isinstance(b, Line) or a.end != b.start:
+            return None
+        u, v = _tangent(a, True), _tangent(b, True)
+        if u[0] * v[0] + u[1] * v[1] <= 0 or abs(u[0] * v[1] - u[1] * v[0]) > TOL:
+            return None
+        return Line(a.start, b.end, a.type)
+
+    runs: list[Segment] = []
+    for s in loop:
+        if dr.kinds.get(s) == "bridge":
+            continue
+        merged = join(runs[-1], s) if runs else None
+        if merged is None:
+            runs.append(s)
+        else:
+            runs[-1] = merged
+    if dr.closed and len(runs) > 1:
+        merged = join(runs[-1], runs[0])
+        if merged is not None:
+            runs[0] = merged
+            runs.pop()
+    return [s for s in runs if isinstance(s, Line)]
+
+
+def _slot_size(loop: list[Segment], axis: Line) -> tuple[float, float]:
+    """Measure the outline along and across the slot's longest straight."""
+    ux, uy = _tangent(axis, True)
+
+    def project(p: Point) -> Point:
+        x, y = p[0] - axis.start[0], p[1] - axis.start[1]
+        return (x * ux + y * uy, y * ux - x * uy)
+
+    rotated = [
+        replace(s, start=project(s.start), end=project(s.end), center=project(s.center))
+        if isinstance(s, Arc) else replace(s, start=project(s.start), end=project(s.end))
+        for s in loop
+    ]
+    x0, y0, x1, y1 = _bounds(rotated)
+    return x1 - x0, y1 - y0
+
+
 def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
     f = fm.faces.get(a.face or "")
     if f is None:
         return []
-    fp = a.fingerprint()
+    fp = a.fingerprint((f.width, f.height))
     found: dict[str, list[tuple[str, tuple[float, float, float, float]]]] = {}
 
     def flag(kind: str, msg: str, region: tuple[float, float, float, float]) -> None:
@@ -335,8 +380,9 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
     for dr in a.live():
         for loop in dr.loops:
             # 1. a long straight parallel to a nearby hinge or edge
-            for s in loop:
-                if not isinstance(s, Line) or s.length < LONG_STRAIGHT - TOL or dr.kinds.get(s) == "bridge":
+            straights = _join_straights(loop, dr)
+            for s in straights:
+                if s.length < LONG_STRAIGHT - TOL:
                     continue
                 p0, p1 = f.from_flat(s.start), f.from_flat(s.end)
                 u = ((p1[0] - p0[0]) / s.length, (p1[1] - p0[1]) / s.length)
@@ -357,31 +403,29 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
                                          f"parallel to {f.id}'s {what} (it looks like a fold or a slot)",
                              _bounds([s]))
                         break
-            if not dr.closed:
-                bx = _bounds(loop)
-            else:
-                bx = _bounds(loop)
+            bx = _bounds(loop)
             fb = _face_box(f, bx)
             w, h = fb[2] - fb[0], fb[3] - fb[1]
-            # 2. a slot-like rectangle near an edge
-            if dr.closed and dr.rule in ("cut",) and min(w, h) <= SLOT_WIDTH + TOL and \
-                    max(w, h) >= SLOT_RATIO * max(min(w, h), 1e-9):
-                gap = min(fb[0], fb[1], f.width - fb[2], f.height - fb[3])
-                straight = sum(s.length for s in loop if isinstance(s, Line))
+            # 2. a slot-like rectangle near an edge, at any rotation
+            gap = min(fb[0], fb[1], f.width - fb[2], f.height - fb[3])
+            if dr.closed and dr.rule == "cut" and gap <= NEAR and straights:
+                straight = sum(s.length for s in straights)
                 total = sum(s.length for s in loop)
-                if gap <= NEAR and straight >= 0.5 * total:
-                    flag("slot", f"a slot-like {fmt_in(_r(w))} x {fmt_in(_r(h))} in cut {fmt_in(_r(gap))} in from "
-                                 f"{f.id}'s edge (it looks like a slot)", bx)
+                if straight >= 0.5 * total:
+                    length, width = sorted(_slot_size(loop, max(straights, key=lambda s: s.length)), reverse=True)
+                    if width <= SLOT_WIDTH + TOL and length >= SLOT_RATIO * max(width, 1e-9):
+                        flag("slot", f"a slot-like {fmt_in(_r(length))} x {fmt_in(_r(width))} in cut "
+                                     f"{fmt_in(_r(gap))} in from {f.id}'s edge (it looks like a slot)", bx)
             # 3. spanning most of the face
             if w > SPAN * f.width + TOL or h > SPAN * f.height + TOL:
                 flag("span", f"an outline {fmt_in(_r(w))} x {fmt_in(_r(h))} in on the {fmt_in(_r(f.width))} x "
                              f"{fmt_in(_r(f.height))} in face {f.id} (over {SPAN:.0%} of it)", bx)
-            # 4. crease or perforation artwork longer than half the face's width
+            # 4. crease or perforation artwork that could act as a fold
             if dr.rule in ("crease", "perforation"):
                 length = sum(s.length for s in loop)
-                if length > RULE_SPAN * f.width + TOL:
+                if length > RULE_SPAN * min(f.width, f.height) + TOL:
                     flag("rule", f"a {dr.rule} {fmt_in(_r(length))} in long on {f.id}, over half its "
-                                 f"{fmt_in(_r(f.width))} in width (it could act as a fold)", bx)
+                                 "shorter dimension (it could act as a fold)", bx)
     out = []
     for kind, items in found.items():
         key = f"{a.id}:{kind}:{fp}"

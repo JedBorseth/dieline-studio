@@ -157,11 +157,33 @@ def design_from_parts(parts: list[dict[str, Any]], groups: Any = (), links: Any 
             extra = g.get("extra") if isinstance(g.get("extra"), dict) else {}
             gs.append(Group(g["id"], str(g.get("kind", "assembly")), members,
                             tuple(sorted((str(k), v) for k, v in extra.items()))))
+    _refuse_group_cycles(gs)
     lks = [FitLink(str(lk["id"]), str(lk["container"]), str(lk["contained"]))
            for lk in (links if isinstance(links, list) else [])
            if isinstance(lk, dict) and all(isinstance(lk.get(k), str) for k in ("id", "container", "contained"))]
     top = max(int(p.id[1:]) for p in built)
     return DesignState(uuid.uuid4().hex[:12], 1, tuple(built), tuple(gs), tuple(lks), next_part=top + 1)
+
+
+def _refuse_group_cycles(groups: list[Group]) -> None:
+    """A group may hold parts and other groups, but never itself, directly or through another group."""
+    by_id = {g.id: g for g in groups}
+    if len(by_id) != len(groups):
+        raise ValueError("job file lists a group id twice")
+    done: set[str] = set()
+
+    def walk(gid: str, path: tuple[str, ...]) -> None:
+        if gid in path:
+            raise ValueError(f"job file group {gid} contains itself ({' -> '.join((*path, gid))})")
+        if gid in done:
+            return
+        for m in by_id[gid].members:
+            if m.ref in by_id:
+                walk(m.ref, (*path, gid))
+        done.add(gid)
+
+    for g in groups:
+        walk(g.id, ())
 
 
 def _check_label(label: str | None, d: DesignState | None = None) -> None:

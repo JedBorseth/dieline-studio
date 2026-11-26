@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from .geometry import Dieline, Line, LineType, Segment
+from .geometry import Arc, Dieline, Line, LineType, Segment
 
 VERIFIED, UNVERIFIED, UNSUPPORTED = "verified", "unverified", "unsupported"
 TARGETS = {"cf2": "ArtiosCAD import (CF2)", "dxf": "the sample table (DXF)"}
@@ -248,9 +248,12 @@ def expand_line(seg: Line, pieces: list[tuple[float, float]], offset: float) -> 
     return out
 
 
-def crease_stations(d: Dieline, seg: Line, ends: bool = False) -> list[float]:
-    """Where a straight perforation segment crosses creases, as distances from its start.
-    ends: also its ends when they stop on a crease (a tie goes there too, half of it inside)."""
+def crease_stations(d: Dieline, seg: Segment, ends: bool = False) -> list[float]:
+    """Where a perforation segment (straight or an arc) crosses creases, as distances
+    along it from its start. ends: also its ends when they stop on a crease (a tie goes
+    there too, half of it inside)."""
+    if isinstance(seg, Arc):
+        return _arc_crease_stations(d, seg, ends)
     out: list[float] = []
     (ax, ay), (bx, by) = seg.start, seg.end
     rx, ry = bx - ax, by - ay
@@ -271,34 +274,105 @@ def crease_stations(d: Dieline, seg: Line, ends: bool = False) -> list[float]:
     return sorted(out)
 
 
+def _arc_crease_stations(d: Dieline, arc: Arc, ends: bool) -> list[float]:
+    """Where an arc crosses straight creases, as arc lengths from its start."""
+    (ox, oy), r, sweep = arc.center, arc.radius, arc.sweep
+    a0 = math.atan2(arc.start[1] - oy, arc.start[0] - ox)
+    L = abs(sweep) * r
+    out: list[float] = []
+    for s in d.segments:
+        if s.type != LineType.CREASE or not isinstance(s, Line):
+            continue
+        (cx, cy), (ex, ey) = s.start, s.end
+        dx, dy = ex - cx, ey - cy
+        qa = dx * dx + dy * dy
+        if qa < 1e-18:
+            continue
+        fx, fy = cx - ox, cy - oy
+        qb = 2 * (fx * dx + fy * dy)
+        disc = qb * qb - 4 * qa * (fx * fx + fy * fy - r * r)
+        if disc < 0:
+            continue
+        for u in {(-qb - math.sqrt(disc)) / (2 * qa), (-qb + math.sqrt(disc)) / (2 * qa)}:
+            if not -1e-9 <= u <= 1 + 1e-9:
+                continue
+            ang = math.atan2(cy + dy * u - oy, cx + dx * u - ox) - a0
+            ang = ang % math.tau if sweep > 0 else -((-ang) % math.tau)
+            st = abs(ang) * r
+            if arc.full_circle and st > L - 1e-9:
+                st = 0.0
+            lo, hi = (-1e-9, L + 1e-9) if ends else (1e-9, L - 1e-9)
+            if lo < st < hi:
+                out.append(min(max(st, 0.0), L))
+    return sorted(out)
+
+
+def expand_arc(seg: Arc, pieces: list[tuple[float, float]], offset: float) -> list[Arc]:
+    """Cut pieces of a perforation run along one arc that starts at station `offset`."""
+    (ox, oy), r, sweep = seg.center, seg.radius, seg.sweep
+    a0 = math.atan2(seg.start[1] - oy, seg.start[0] - ox)
+    L = abs(sweep) * r
+    k = 1.0 if sweep > 0 else -1.0
+    at = lambda s: (ox + r * math.cos(a0 + k * s / r), oy + r * math.sin(a0 + k * s / r))  # noqa: E731
+    out = []
+    for a, b in pieces:
+        a0_, b0_ = max(a - offset, 0.0), min(b - offset, L)
+        if b0_ - a0_ > 1e-9:
+            p, q = (seg.start if a0_ <= 1e-12 else at(a0_)), (seg.end if b0_ >= L - 1e-12 else at(b0_))
+            out.append(Arc(p, q, seg.center, seg.clockwise, LineType.CUT, False, seg.op))
+    return out
+
+
 def expand_perforations(d: Dieline) -> Dieline:
     """The sample-table representation of a design's perforations: each one as
     its dashed cut pieces (a separate representation, unverified until cut on
     the table). The stationing runs on along each perforation operation, over
-    jumped slots too (the features record each run's station), so the pattern
-    doesn't restart at every panel. The result goes through the topology rules
+    jumped slots too (the features record each run's station; a run they don't
+    record continues from the one before it in the same operation), so the
+    pattern doesn't restart at every panel. Arcs (curved perforation artwork)
+    become dashed arcs. Contacts carry over: each perforation's cuts may end
+    where it ended (a tear strip's tab cuts), and whatever ended on the
+    perforation ends on its cuts. The result goes through the topology rules
     like any output: a cut landing on a crease is a crossing there."""
+    from dataclasses import replace  # noqa: PLC0415
+
     from .geometry import Operation  # noqa: PLC0415
 
     stations: dict[Any, float] = d.extras.get("stations") or {}  # type: ignore[assignment]
-    out = Dieline(d.name, d.units, [], d.meta, dict(d.ops), d.faces)
-    by_op: dict[str | None, list[Line]] = {}
+    out = Dieline(d.name, d.units, [], d.meta, dict(d.ops), d.faces, dict(d.extras))
+    by_op: dict[str | None, list[Segment]] = {}
     for s in d.segments:
-        if s.type == LineType.PERFORATION and isinstance(s, Line):
+        if s.type == LineType.PERFORATION:
             by_op.setdefault(s.op, []).append(s)
         else:
             out.segments.append(s)
+    renamed = {op_id: f"{op_id or 'perf'}.cuts" for op_id in by_op}
     for op_id, segs in by_op.items():
         rule = rule_of(d, segs[0])
-        # Each piece may stop in the board or on the blank's edge or a crease it ends at; crossing a
-        # crease is undeclared, so a cut landing on one is invalid here.
-        cut_op = Operation(f"{op_id or 'perf'}.cuts", "perf_cut", open_ends="free", ends_on=("outline",),
+        old = d.ops.get(op_id) if op_id else None
+        # Preserve contacts with pull-tab cuts. The perforation's generic permission to
+        # end on a hinge does not carry over to individual cuts in the sample-table DXF.
+        carried = tuple(x for x in (old.ends_on if old is not None else ())
+                        if x in d.ops and d.ops[x].kind in ("tab_cut", "hole"))
+        cut_op = Operation(renamed[op_id], "perf_cut", open_ends="free", ends_on=("outline", *carried),
                            rule=RuleSpec("cut", rule.pointage))
         out.ops[cut_op.id] = cut_op
+        run = 0.0
         for seg in segs:
-            st = float(stations.get(seg, 0.0))
+            st = float(stations[seg]) if seg in stations else run
+            run = st + seg.length
             crossings = [st + c for c in crease_stations(d, seg, ends=True)]
             pieces = perf_cuts(seg.length, rule, crossings, start=st)
-            for piece in expand_line(seg, pieces, st):
-                out.segments.append(Line(piece.start, piece.end, LineType.CUT, cut_op.id))
+            if isinstance(seg, Arc):
+                out.segments += [replace(p, op=cut_op.id) for p in expand_arc(seg, pieces, st)]
+            else:
+                out.segments += [Line(p.start, p.end, LineType.CUT, cut_op.id) for p in expand_line(seg, pieces, st)]
+    # Whatever ended on (or crossed) a perforation now meets its cuts.
+    for oid, op in list(out.ops.items()):
+        if oid in renamed.values():
+            continue
+        ends = tuple(renamed.get(x, x) for x in op.ends_on)
+        crosses = tuple(renamed.get(x, x) for x in op.crosses)
+        if ends != op.ends_on or crosses != op.crosses:
+            out.ops[oid] = replace(op, ends_on=ends, crosses=crosses)
     return out
