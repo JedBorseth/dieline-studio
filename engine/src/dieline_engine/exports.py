@@ -49,7 +49,7 @@ __all__ = ["ExportExists", "LockHeld", "OwnedByAnother", "ChangedOnDisk", "Publi
 class ExportPart:
     part_id: str
     label: str
-    params: _d.BoxParams
+    params: Any  # designs.BoxParams, or a partition piece's PartitionParams
     quantity: int = 1
     piece_no: str | None = None
 
@@ -520,7 +520,7 @@ def _part_record(b: _Built, files: list[dict[str, Any]]) -> dict[str, Any]:
         "name": b.dieline.name,
         "units": params.units,
         # Options resolved to their values, so a later default change can't alter a reopened job.
-        "params": {**params.model_dump(), "options": b.dieline.meta.get("options", params.options)},
+        "params": _d.record_params(params, b.dieline),
         "board": {"code": board.id, "cal_in": board.cal, "il_in": board.il, "og_in": board.og,
                   "crrv_in": board.crrv, "source": board.source},
         "summary": b.dieline.meta,
@@ -1004,10 +1004,11 @@ def _fmt_value(v: Any) -> str:
 
 
 _COMPARED = ("panels_in", "glue_lug_in", "lug_extension_in", "slot_in", "body_height_in", "top_depth_in",
-             "bottom_depth_in", "top_flaps_in", "bottom_flaps_in", "blank_in")
+             "bottom_depth_in", "top_flaps_in", "bottom_flaps_in", "blank_in",
+             "piece_in", "slots_in", "end_legs_in")  # the last three: partition pieces
 
 
-def _changes(part: dict[str, Any], params: _d.BoxParams, design: dict[str, Any]) -> list[str]:
+def _changes(part: dict[str, Any], params: Any, design: dict[str, Any]) -> list[str]:
     """What regenerating with today's rules changes, against what the record kept."""
     for fld in ("board", "summary"):
         if fld in part and not isinstance(part[fld], dict):
@@ -1171,7 +1172,7 @@ def open_job(record: Any, mode: str = "regenerate") -> dict:
     first = None
     for p in parts:
         m = _part_meta(p)
-        params = _d.BoxParams.model_validate(p.get("params"))
+        params = _d.parse_params(p.get("params"))
         design = _d.create_box(params)
         first = first or design
         out_parts.append({**m, "params": design["params"], "changes": _changes(p, params, design)})

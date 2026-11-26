@@ -171,7 +171,9 @@ def render_png(d: Dieline, region: Region | None = None, title: str | None = Non
         draw.rectangle([MARGIN, MARGIN, w - MARGIN, h - LEGEND - MARGIN], outline=(200, 200, 200))
 
     show_labels = region is None and not _annotation_only(d)
-    if show_labels:
+    if show_labels and d.meta.get("style") == "partition-slotted":
+        _partition_labels(draw, d, px, small, normal)
+    elif show_labels:
         _labels(draw, d, px, small, normal)
 
     others = sorted({seg.type.value for seg in d.segments} - {"cut", "crease"})
@@ -179,10 +181,14 @@ def render_png(d: Dieline, region: Region | None = None, title: str | None = Non
         ", orange = perforation" if "perforation" in others else "") + (
         ", green = score" if "score" in others else "") + (
         ", grey = annotation" if "annotation" in others else "")
+    if title is None and d.meta.get("quantity_per_set"):
+        title = f"{d.name}   |   x {d.meta['quantity_per_set']} per set, not calibrated"
     line1 = f"{title or d.name}   |   {key}"
     line2 = (f"window x {_fmt(win.x0, units)}..{_fmt(win.x1, units)}, y {_fmt(win.y0, units)}..{_fmt(win.y1, units)} "
              f"{units}   |   {scale:.1f} px/{units}")
-    if show_labels:
+    if show_labels and d.meta.get("style") == "partition-slotted":
+        line2 += "   |   labels: end or slot centre to slot centre; slot width x depth"
+    elif show_labels:
         line2 += "   |   labels: distances between scores and edges"
     draw.text((10, h - LEGEND + 6), _fit(draw, line1, small, w - 20), fill=(60, 60, 60), font=small)
     draw.text((10, h - LEGEND + 26), _fit(draw, line2, small, w - 20), fill=(60, 60, 60), font=small)
@@ -398,3 +404,109 @@ def geometry(d: Dieline, line_type: str | None = None, region: Region | None = N
         "segments": out[:limit],
         "truncated": len(out) > limit,
     }
+
+
+# ------------------------------------------------------------------ partitions
+
+
+def _partition_labels(draw, d: Dieline, px, small, normal, caption: bool = True) -> None:
+    """A partition piece: each slot's width x depth at its mouth, the distances
+    between slot centres and the end legs along the piece, its length and height."""
+    meta = d.meta
+    L, H = meta["piece_in"]["length"], meta["piece_in"]["height"]  # type: ignore[index]
+    slots = meta.get("slots_in") or []
+    scale = px((1, 0))[0] - px((0, 0))[0]
+
+    def text(x: float, y: float, t: str, colour=(150, 60, 0), font=normal) -> None:
+        tw = draw.textlength(t, font=font)
+        draw.text((x - tw / 2, y - 8), t, fill=colour, font=font)
+
+    xs = [0.0, *[s["centre"] for s in slots], L]  # type: ignore[index]
+    for a, b in zip(xs, xs[1:]):
+        if (b - a) * scale > 40:
+            x, y = px(((a + b) / 2, H / 2))
+            text(x, y, _fmt(b - a, "in"))
+    for k, s in enumerate(slots):  # just past each slot's bottom, inside the piece
+        x, _ = px((s["centre"], 0))  # type: ignore[index]
+        y = px((0, H - s["depth"]))[1] + 14 if s["from"] == "top" else px((0, s["depth"]))[1] - 14  # type: ignore[index]
+        text(x, y, f"{k + 1}: {_fmt(s['width'], 'in')} x {_fmt(s['depth'], 'in')}", (30, 90, 220), small)
+    if not caption:
+        return
+    x, y = px((L / 2, 0))
+    label = f"piece {_fmt(L, 'in')} x {_fmt(H, 'in')} in" + (f", {len(slots)} slots from the {slots[0]['from']}"
+                                                              if slots else ", no slots")
+    tw = draw.textlength(label, font=normal)
+    draw.text((x - tw / 2, y + 30), label, fill=(0, 0, 0), font=normal)
+
+
+def render_set_png(plan, pieces: list[Dieline], labels: list[tuple[str, int]]) -> tuple[bytes, dict]:
+    """A partition set: the plan view (box inside, walls, installed cells
+    labelled) above each piece type with its slots, quantity and sizes."""
+    spec = plan.spec
+    gap = 1.25
+    width = max([plan.box_long, *[p.meta["piece_in"]["length"] for p in pieces]])  # type: ignore[index]
+    height = plan.box_short + sum(p.meta["piece_in"]["height"] + gap for p in pieces) + gap  # type: ignore[index]
+    scale = min((MAX_SIDE - 2 * MARGIN) / width, (MAX_SIDE - 2 * MARGIN - LEGEND) / height)
+    w = max(int(width * scale) + 2 * MARGIN, 640)
+    h = int(height * scale) + 2 * MARGIN + LEGEND
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    small, normal = _font(13), _font(16)
+
+    # Plan view: y runs down the picture from the top margin.
+    ox, oy = MARGIN, MARGIN
+
+    def pv(x: float, y: float) -> tuple[float, float]:
+        return (ox + x * scale, oy + y * scale)
+
+    draw.rectangle([*pv(0, 0), *pv(plan.box_long, plan.box_short)], outline=(120, 120, 120), width=1)
+    cl, cs = spec.clearance_long, spec.clearance_short
+    for x, t in zip(plan.positions_long, plan.t_long):  # short pieces cross the long axis
+        draw.rectangle([*pv(x - t / 2, cs / 2), *pv(x + t / 2, plan.box_short - cs / 2)], fill=(30, 30, 30))
+    for y, t in zip(plan.positions_short, plan.t_short):
+        draw.rectangle([*pv(cl / 2, y - t / 2), *pv(plan.box_long - cl / 2, y + t / 2)], fill=(30, 30, 30))
+    edges_l = [0.0, *plan.positions_long, plan.box_long]
+    for k, c in enumerate(spec.long_cells):
+        mid = (edges_l[k] + edges_l[k + 1]) / 2
+        t = _fmt(c, "in")
+        tw = draw.textlength(t, font=small)
+        x, y = pv(mid, 0)
+        if tw + 6 < c * scale:
+            draw.text((x - tw / 2, y - 18), t, fill=(150, 60, 0), font=small)
+    edges_s = [0.0, *plan.positions_short, plan.box_short]
+    for k, c in enumerate(spec.short_cells):
+        mid = (edges_s[k] + edges_s[k + 1]) / 2
+        x, y = pv(0, mid)
+        if 16 < c * scale:
+            t = _fmt(c, "in")
+            draw.text((x - draw.textlength(t, font=small) - 6, y - 7), t, fill=(150, 60, 0), font=small)
+    x, y = pv(plan.box_long / 2, plan.box_short)
+    t = (f"plan: {len(spec.long_cells)} x {len(spec.short_cells)} cells, box inside {_fmt(plan.box_long, 'in')} x "
+         f"{_fmt(plan.box_short, 'in')} in (installed cells labelled)")
+    draw.text((x - draw.textlength(t, font=normal) / 2, y + 6), t, fill=(0, 0, 0), font=normal)
+
+    # The pieces, each in its own band, drawn with y up.
+    top = plan.box_short + gap
+    for d, (label, qty) in zip(pieces, labels):
+        H = d.meta["piece_in"]["height"]  # type: ignore[index]
+        base = top + H
+
+        def px(p: tuple[float, float], base=base) -> tuple[float, float]:
+            return (ox + p[0] * scale, oy + (base - p[1]) * scale)
+
+        for s in d.segments:
+            _draw_segment(draw, s, px, scale)
+        _partition_labels(draw, d, px, small, normal, caption=False)
+        sl = d.meta.get("slots_in") or []
+        cap = (f"{label} x {qty} ({d.meta['board']}): {_fmt(d.meta['piece_in']['length'], 'in')} x "  # type: ignore[index]
+               f"{_fmt(H, 'in')} in, " + (f"{len(sl)} slots from the {sl[0]['from']}" if sl else "no slots"))
+        draw.text((px((0, H))[0], px((0, H))[1] - 24), cap, fill=(0, 0, 0), font=normal)
+        top = base + gap
+    line1 = "partition set (not calibrated)   |   black = cut   |   plan view on top, then each piece"
+    line2 = f"{scale:.1f} px/in   |   slot labels: width x depth; along each piece: end or slot centre to slot centre"
+    draw.text((10, h - LEGEND + 6), _fit(draw, line1, small, w - 20), fill=(60, 60, 60), font=small)
+    draw.text((10, h - LEGEND + 26), _fit(draw, line2, small, w - 20), fill=(60, 60, 60), font=small)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), {"units": "in", "px_per_unit": round(scale, 3), "image_px": [w, h],
+                            "shows": "the set's plan view and each piece type"}
