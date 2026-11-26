@@ -74,7 +74,11 @@ export function formatToolLabel(
       return paths?.length ? `export_files → ${paths.join(", ")}` : "export_files";
     }
     case "list_faces":
-      return "list_faces · panels, flaps and their edges";
+      return `list_faces${str(args.part) ? ` · ${str(args.part)}` : ""} · panels, flaps and their edges`;
+    case "update_part":
+      return `update_part${str(args.part) ? ` · ${str(args.part)}` : ""}`;
+    case "remove_part":
+      return `remove_part${str(args.part) ? ` · ${str(args.part)}` : ""}`;
     case "view_design": {
       const f = file(args.path);
       return `view_design${f ? ` · ${f}` : ""}${region}`;

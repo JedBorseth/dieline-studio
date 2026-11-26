@@ -122,10 +122,11 @@ def test_openai_sdk_stream_is_assembled_and_replayed(tmp_path, monkeypatch):
     assert [(msg["role"], msg["tool_call_id"]) for msg in turn.messages[2:4]] == [
         ("tool", "call_1"), ("tool", "call_2"),
     ]
-    assert [(e["type"], e["tool_use_id"]) for e in events if e["type"].startswith("chat.tool_")] == [
-        ("chat.tool_start", "call_1"), ("chat.tool_result", "call_1"),
-        ("chat.tool_start", "call_2"), ("chat.tool_result", "call_2"),
+    assert [(e["type"], e["tool_use_id"].split(":", 1)[1]) for e in events if e["type"].startswith("chat.tool_")] == [
+        ("chat.tool_start", "1:1:call_1"), ("chat.tool_result", "1:1:call_1"),
+        ("chat.tool_start", "1:1:call_2"), ("chat.tool_result", "1:1:call_2"),
     ]
+    assert len({e["tool_use_id"].split(":", 1)[0] for e in events if e["type"].startswith("chat.tool_")}) == 1  # the UI's row ids carry the model step; the replayed history keeps the provider's ids
     # The second request replays the assistant step unchanged, reasoning included.
     assert requests[1]["messages"][2] == assistant
     assert requests[0]["reasoning"] == {"effort": cfg.effort} and requests[0]["cache_control"]["type"] == "ephemeral"

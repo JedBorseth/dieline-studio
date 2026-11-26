@@ -192,3 +192,57 @@ test("long tool sessions cap retained preview images to bound memory", () => {
   assert.equal(tools[total - 1].image, `data:image/png;base64,IMG_${total - 1}`);
   assert.equal(tools[total - 1].imageCleared, undefined);
 });
+
+function snap(id: string, seq: number, revision = 1): Design {
+  return { ...fakeDesign(id), design_id: `d-${id}`, revision, seq };
+}
+
+test("a reply lands on the session that asked, even after a switch", () => {
+  let state = initialState();
+  const a = state.activeId;
+  state = reducer(state, { type: "new_session" });
+  const b = state.activeId;
+  state = reducer(state, { type: "preview", sessionId: a, source: { kind: "design", design: snap("a", 1), origin: "form" } });
+  assert.equal(state.preview, null); // B is on screen and shows nothing
+  assert.equal(state.sessions.find((s) => s.id === b)?.design, null);
+  assert.equal(state.sessions.find((s) => s.id === a)?.design?.design_id, "d-a");
+});
+
+test("an older design never replaces a newer one", () => {
+  let state = initialState();
+  const s = state.activeId;
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("new", 2) } });
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("old", 1) } });
+  assert.equal(state.sessions[0].design?.design_id, "d-new");
+  state = reducer(state, { type: "preview", sessionId: s, source: { kind: "design", design: snap("old", 1), origin: "form" } });
+  assert.equal(state.preview?.kind === "design" && state.preview.design.design_id, "d-new");
+});
+
+test("the event for a design already shown keeps the job's name and notes", () => {
+  let state = initialState();
+  const s = state.activeId;
+  const d = snap("job", 3);
+  state = reducer(state, { type: "preview", sessionId: s, source: { kind: "design", design: d, origin: "job", stem: "RL26-0001", notes: ["board changed"] } });
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: d } });
+  assert.ok(state.preview?.kind === "design" && state.preview.origin === "job" && state.preview.stem === "RL26-0001");
+});
+
+test("after an engine restart, shown designs save from their parameters", () => {
+  let state = initialState();
+  const s = state.activeId;
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("x", 1) } });
+  state = reducer(state, { type: "engine", event: { type: "engine.exit", code: 1 } });
+  assert.equal(state.sessions[0].design?.design_id, undefined);
+  assert.ok(state.preview?.kind === "design" && state.preview.design.design_id === undefined);
+});
+
+test("the designer's own replacement doesn't take over a raw file from its event", () => {
+  let state = initialState();
+  const s = state.activeId;
+  state = reducer(state, { type: "preview", sessionId: s, source: { kind: "file", name: "sample.cf2", text: "x" } });
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("form", 2), origin: "form" } });
+  assert.equal(state.preview?.kind, "file");
+  assert.equal(state.sessions[0].design?.design_id, "d-form");
+  state = reducer(state, { type: "engine", event: { type: "design", session_id: s, design: snap("chat", 3), origin: "chat" } });
+  assert.equal(state.preview?.kind, "design"); // the chat's new design is shown
+});

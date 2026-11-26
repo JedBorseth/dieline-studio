@@ -53,7 +53,8 @@ export type Action =
   | { type: "select_session"; id: string }
   | { type: "user_message"; sessionId: string; text: string }
   | { type: "send_failed"; sessionId: string; message: string }
-  | { type: "preview"; source: PreviewSource }
+  /** Show a source in a session's preview. sessionId: the session that asked (its reply may land after a switch). */
+  | { type: "preview"; source: PreviewSource; sessionId?: string }
   | { type: "engine_ready"; ready: boolean };
 
 const uid = () => crypto.randomUUID();
@@ -122,6 +123,15 @@ function pruneOldImages(items: ChatItem[], maxImages = MAX_RETAINED_IMAGES): Cha
   return out;
 }
 
+/** Is `incoming` older than the design a session holds? Commits are numbered per session (seq). */
+export function isStale(held: Design | null, incoming: Design): boolean {
+  return held?.seq !== undefined && incoming.seq !== undefined && incoming.seq < held.seq;
+}
+
+function sameSnapshot(a: Design, b: Design): boolean {
+  return a.design_id !== undefined && a.design_id === b.design_id && a.revision === b.revision;
+}
+
 function notice(s: Session, tone: "error" | "info", text: string): Session {
   return { ...s, items: [...s.items, { kind: "notice", id: uid(), tone, text }] };
 }
@@ -151,14 +161,18 @@ export function reducer(state: State, action: Action): State {
     case "send_failed":
       return updateSession(state, action.sessionId, (s) => ({ ...notice(s, "error", action.message), busy: false }));
     case "preview": {
-      // Keep the active session's stored preview/design in sync with what the preview shows,
-      // so switching sessions and coming back never disagrees with the engine's chat.set_design.
-      const next = updateSession(state, state.activeId, (s) => ({
+      // Goes to the session that asked, never to whichever is on screen when the reply lands.
+      const target = action.sessionId ?? state.activeId;
+      const session = state.sessions.find((s) => s.id === target);
+      if (!session) return state;
+      const source = action.source;
+      if (source.kind === "design" && isStale(session.design, source.design)) return state; // a newer one is shown
+      const next = updateSession(state, target, (s) => ({
         ...s,
-        preview: action.source,
-        design: action.source.kind === "design" ? action.source.design : s.design,
+        preview: source,
+        design: source.kind === "design" ? source.design : s.design,
       }));
-      return { ...next, preview: action.source };
+      return target === state.activeId ? { ...next, preview: source } : next;
     }
     case "engine_ready":
       return { ...state, engineReady: action.ready };
@@ -171,14 +185,20 @@ function applyEvent(state: State, e: EngineEvent): State {
   switch (e.type) {
     case "engine.ready":
       return { ...state, engineReady: true };
-    case "engine.exit":
-      return {
-        ...state,
-        engineReady: false,
-        sessions: state.sessions.map((s) =>
-          s.busy ? { ...notice(markUnfinishedTools(s), "error", "The engine stopped during this turn."), busy: false } : s,
-        ),
-      };
+    case "engine.exit": {
+      // A restarted engine holds no designs: what the preview shows saves from its parameters.
+      const forget = (d: Design | null): Design | null =>
+        d && d.design_id !== undefined ? { ...d, design_id: undefined, revision: undefined, seq: undefined } : d;
+      const sessions = state.sessions.map((s) => {
+        const base = s.busy
+          ? { ...notice(markUnfinishedTools(s), "error", "The engine stopped during this turn."), busy: false }
+          : s;
+        const preview = base.preview?.kind === "design" ? { ...base.preview, design: forget(base.preview.design)! } : base.preview;
+        return { ...base, design: forget(base.design), preview };
+      });
+      const active = sessions.find((s) => s.id === state.activeId);
+      return { ...state, engineReady: false, sessions, preview: active?.preview ?? state.preview };
+    }
     case "chat.text":
       return updateSession(state, e.session_id, (s) => appendAssistant(s, "text", e.text));
     case "chat.thinking":
@@ -220,7 +240,18 @@ function applyEvent(state: State, e: EngineEvent): State {
         return ended;
       });
     case "design": {
-      const preview: PreviewSource = { kind: "design", design: e.design, origin: "agent" };
+      const session = e.session_id ? state.sessions.find((s) => s.id === e.session_id) : undefined;
+      if (session && isStale(session.design, e.design)) return state; // arrived after a newer one
+      // The event for a design this session already shows (a form or job reply landed first)
+      // keeps that preview's origin, job name and notes.
+      // The designer's own replacement (form, job) is shown by its reply, in its request order;
+      // its event only updates the session's design underneath a raw file being looked at.
+      if (session && e.origin === "form" && session.preview?.kind === "file") {
+        return updateSession(state, session.id, (s) => ({ ...s, design: e.design }));
+      }
+      const shown = session?.preview?.kind === "design" ? session.preview : null;
+      const same = shown && sameSnapshot(shown.design, e.design);
+      const preview: PreviewSource = same ? { ...shown, design: e.design } : { kind: "design", design: e.design, origin: "agent" };
       const withDesign = e.session_id
         ? updateSession(state, e.session_id, (s) => ({ ...s, design: e.design, preview }))
         : state;

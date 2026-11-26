@@ -66,6 +66,22 @@ export interface Design {
   checks: CheckResult[];
   overall: OverallStatus;
   summary: DesignSummary;
+  /** Set on designs the engine holds for a session (every design except a stateless box.create). */
+  design_id?: string;
+  revision?: number;
+  /** The session's commit order: a design with a lower seq is older, whatever its id. */
+  seq?: number;
+  /** Every part; the top-level fields above are the first part's. */
+  parts?: DesignPart[];
+  /** Checks of the design as a whole (fit links, groups). */
+  design_checks?: CheckResult[];
+}
+
+/** One part of a design: a box with its own id, label and quantity. */
+export interface DesignPart extends Omit<Design, "parts" | "design_checks"> {
+  part_id: string;
+  label: string;
+  quantity: number;
 }
 
 export interface StyleOptionInfo {
@@ -153,6 +169,8 @@ export type ExportFormat = "cf2" | "dxf";
 
 /** Engine error code for an export whose name is already taken; retry with overwrite. */
 export const EXPORT_EXISTS = -32001;
+/** The design changed since the UI showed it; the UI fetches the current one. */
+export const DESIGN_CHANGED = -32002;
 
 export interface JobOpenResult {
   design: Design;
@@ -191,8 +209,22 @@ export interface SettingsUpdate {
 export interface Methods {
   "engine.info": [Record<string, never>, EngineInfo];
   "box.create": [BoxParams, Design];
+  /** The form's Generate and a reopened job: a new design for the session. */
+  "design.replace": [
+    {
+      session_id: string;
+      params: BoxParams;
+      /** The design the designer was looking at when they asked (null: none). Refused if it changed. */
+      expected?: { design_id: string; revision: number } | null;
+    },
+    Design,
+  ];
+  "design.get": [{ session_id: string }, Design | null];
   "box.export": [
-    { params: BoxParams; filename?: string; formats?: ExportFormat[]; overwrite?: boolean },
+    (
+      | { session_id: string; design_id: string; revision: number }
+      | { params: BoxParams }
+    ) & { filename?: string; formats?: ExportFormat[]; overwrite?: boolean },
     ExportResult,
   ];
   "job.open": [{ record: unknown }, JobOpenResult];
@@ -228,4 +260,5 @@ export type EngineEvent =
     }
   | { type: "chat.turn_end"; session_id: string; stop_reason: string }
   | { type: "chat.error"; session_id: string; message: string }
-  | { type: "design"; session_id: string | null; design: Design };
+  /** origin: "chat" for the agent's changes; "form" for the designer's own, whose replies the UI shows. */
+  | { type: "design"; session_id: string | null; design: Design; origin?: "chat" | "form" };

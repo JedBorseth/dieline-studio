@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from pydantic import ValidationError
 
 from . import designs, files, models, render, web
 from .designs import BoxParams
+from .designstore import DesignChanged, DesignStore, add_part, new_design, remove_part, update_part
 from .settings import Settings, SettingsStore
 from .styles import STYLES
 
@@ -99,6 +101,14 @@ it. Before saying a design is done, state what you checked: the inside \
 L x W x D and options against the request, the checks, and the measured \
 value of any size the user specified.
 
+## Designs and parts
+A design can hold several parts (a base and its lid, a box and an insert). \
+create_box replaces the whole design unless action is "add"; update_part and \
+remove_part change one part (name it by id or label when there are several). \
+Any change can be tried first with dry_run. If a change is refused because \
+the design changed outside the chat, the user edited it: call view_design, \
+tell them what you see, and only then carry on.
+
 ## Naming panels and positions
 Describe positions by face, never by blank coordinates: list_faces gives the \
 faces of the current design (P1-P4 with their end/side roles, flaps, glue \
@@ -132,6 +142,16 @@ warning checks in a sentence or two. Export only when the user asks.\
 """
 
 
+OPTIONS_SCHEMA = {
+    "type": "object",
+    "description": "Style options by id (see list_options); omitted options use the standard's defaults. "
+                   "reg-glio-nx: order (eses|sese), closure (inside|outside), top_flaps/bottom_flaps (regular|"
+                   "full_overlap|gap_lap|cssc), top_lap/bottom_lap (inches). reg-gli-ext: order, top_flaps, "
+                   "bottom_flaps, top_lap, bottom_lap. hsc-gl: order, closure, use (tray|lid). tube-glued: order.",
+}
+PART_ARG = {"type": "string", "description": "Part id (p1, p2, ...) or label; needed when the design has several parts"}
+
+
 def _tools() -> list[dict[str, Any]]:
     style_ids = list(STYLES)
     length = {"type": ["number", "string"],
@@ -145,9 +165,10 @@ def _tools() -> list[dict[str, Any]]:
         {
             "name": "create_box",
             "description": (
-                "Generate a dieline from a style, inside dimensions, a board code and style options. "
-                "Replaces the design shown in the preview. Returns panel sizes, flap depths, blank size "
-                "and check results, plus a picture of the generated dieline."
+                "Generate a dieline from a style, inside dimensions, a board code and style options. By "
+                "default it replaces the whole design; action 'add' adds it as another part. Returns the "
+                "design's parts, this part's panel sizes, flap depths, blank size and check results, plus a "
+                "picture of it."
             ),
             "input_schema": {
                 "type": "object",
@@ -158,17 +179,49 @@ def _tools() -> list[dict[str, Any]]:
                     "depth": length,
                     "units": {"type": "string", "enum": ["in", "mm"], "description": "Units of the dimensions"},
                     "board": {"type": "string", "description": "ArtiosCAD board code, e.g. '32 C KR'"},
-                    "options": {
-                        "type": "object",
-                        "description": "Style options by id (see list_options); omitted options use the "
-                                       "standard's defaults. reg-glio-nx: order (eses|sese), closure "
-                                       "(inside|outside), top_flaps/bottom_flaps (regular|full_overlap|"
-                                       "gap_lap|cssc), top_lap/bottom_lap (inches). reg-gli-ext: order, top_flaps, "
-                                       "bottom_flaps, top_lap, bottom_lap. hsc-gl: order, closure, use (tray|lid). "
-                                       "tube-glued: order.",
-                    },
+                    "options": OPTIONS_SCHEMA,
+                    "action": {"type": "string", "enum": ["replace_design", "add"],
+                               "description": "replace_design (default): this box becomes the whole design. add: "
+                                              "add it as another part (a lid for a base, a second piece)."},
+                    "label": {"type": "string", "description": "A short name for the part, e.g. 'base' or 'lid'"},
+                    "quantity": {"type": "integer", "minimum": 1, "description": "How many per design (default 1)"},
+                    "dry_run": {"type": "boolean", "description": "Build and check it without changing the design"},
                 },
                 "required": ["style", "length", "width", "depth", "units", "board"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "update_part",
+            "description": (
+                "Change one part of the current design: any of its style, dimensions, units, board, options, "
+                "label or quantity. Omitted fields keep their values. Give part (its id or label) when the design "
+                "has more than one part."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "part": {"type": "string", "description": "Part id (p1, p2, ...) or label"},
+                    "style": {"type": "string", "enum": style_ids},
+                    "length": length, "width": length, "depth": length,
+                    "units": {"type": "string", "enum": ["in", "mm"]},
+                    "board": {"type": "string"},
+                    "options": OPTIONS_SCHEMA,
+                    "label": {"type": "string"},
+                    "quantity": {"type": "integer", "minimum": 1},
+                    "dry_run": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "remove_part",
+            "description": "Remove a part from a design with several parts.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"part": {"type": "string", "description": "Part id or label"},
+                               "dry_run": {"type": "boolean"}},
+                "required": ["part"],
                 "additionalProperties": False,
             },
         },
@@ -217,7 +270,7 @@ INSPECT_TOOLS: list[dict[str, Any]] = [
             "Also the selectors that apply (end_panels, side_panels, top_flaps, top_outer_flaps, ...). Use these "
             "names to describe positions; never use blank coordinates."
         ),
-        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "input_schema": {"type": "object", "properties": {"part": PART_ARG}, "additionalProperties": False},
     },
     {
         "name": "view_design",
@@ -227,7 +280,7 @@ INSPECT_TOOLS: list[dict[str, Any]] = [
             "glue lug, a flap corner). create_box already returns a full view; use this to look closer or "
             "to see a CF2/DXF reference file."
         ),
-        "input_schema": {"type": "object", "properties": {"region": REGION, "path": PATH},
+        "input_schema": {"type": "object", "properties": {"region": REGION, "path": PATH, "part": PART_ARG},
                          "additionalProperties": False},
     },
     {
@@ -244,6 +297,7 @@ INSPECT_TOOLS: list[dict[str, Any]] = [
                               "description": "Only this line type"},
                 "region": REGION,
                 "path": PATH,
+                "part": PART_ARG,
             },
             "additionalProperties": False,
         },
@@ -345,6 +399,50 @@ def as_functions(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 TOOLS: list[dict[str, Any]] = _tools()
 
 
+INTERRUPTED = "[The previous turn was interrupted; any design change it made is kept.]"
+
+
+TOOL_KEYS = {
+    "create_box": {"style", "length", "width", "depth", "units", "board", "options", "action", "label", "quantity",
+                   "dry_run"},
+    "update_part": {"part", "style", "length", "width", "depth", "units", "board", "options", "label", "quantity",
+                    "dry_run"},
+    "remove_part": {"part", "dry_run"},
+}
+
+
+def _bool_arg(args: dict[str, Any], key: str) -> bool:
+    v = args.get(key, False)
+    if not isinstance(v, bool):
+        raise ValueError(f"{key} must be true or false")
+    return v
+
+
+def _quantity_arg(args: dict[str, Any], default: int | None) -> int | None:
+    if "quantity" not in args:
+        return default
+    v = args["quantity"]
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError("quantity must be a whole number, 1 or more")
+    return v
+
+
+def _label_arg(args: dict[str, Any]) -> str | None:
+    v = args.get("label")
+    if v is not None and not isinstance(v, str):
+        raise ValueError("label must be a string")
+    return v
+
+
+def _part_arg(args: dict[str, Any], required: bool = False) -> str | None:
+    v = args.get("part")
+    if v is None and required:
+        raise ValueError("part is required")
+    if v is not None and not isinstance(v, str):
+        raise ValueError("part must be a string (an id like p2, or a label)")
+    return v
+
+
 class TurnCancelled(Exception):
     pass
 
@@ -363,7 +461,11 @@ class Turn:
     id: str  # the session id (tools and events use it)
     number: int
     messages: list[Any]
-    current: BoxParams | None
+    # The design (id, revision) this turn works from; None before there's a design. Every change
+    # the turn makes is checked against it and moves it on; reading the design rebinds it.
+    binding: tuple[str, int] | None
+    binding_seq: int = 0  # the commit order of the bound design; the binding never moves back
+    step: int = 0  # the model step being run
     cancel: threading.Event = field(default_factory=threading.Event)
     stream: Any = None  # the in-flight SDK stream, closed by cancel()
     private: bool = False  # the history holds private reference content (see tools_for)
@@ -373,7 +475,7 @@ class Turn:
 class Session:
     id: str
     messages: list[Any] = field(default_factory=list)
-    current: BoxParams | None = None
+    seen: tuple[str, int] | None = None  # the design the model last saw, as of its last kept turn
     turns: int = 0
     active: Turn | None = None
     note: str | None = None  # told to the model with the next user message
@@ -431,9 +533,13 @@ class Step:
 
 
 class Agent:
-    def __init__(self, settings: SettingsStore, emit: Emit) -> None:
+    def __init__(self, settings: SettingsStore, emit: Emit, store: DesignStore | None = None) -> None:
         self.settings = settings
         self.emit = emit
+        self.store = store or DesignStore(emit)
+        # The UI's tool row ids must be unique for as long as a chat is on screen, which can
+        # outlive this engine process: a restarted engine numbers its turns from 1 again.
+        self.run = uuid.uuid4().hex[:8]
         self.sessions: dict[str, Session] = {}
         self._refs: tuple[tuple[str, ...], files.ReferenceFiles] | None = None
         # Guards session state and orders turn events: every event a turn emits
@@ -446,6 +552,7 @@ class Agent:
             if s and s.busy:
                 raise RuntimeError("session is busy; stop the turn first")
             self.sessions.pop(session_id, None)
+            self.store.forget(session_id)  # agent lock, then store lock: the order used everywhere
 
     def cancel(self, session_id: str) -> None:
         """End the active turn now. Its worker is abandoned and stays silent."""
@@ -454,9 +561,12 @@ class Agent:
             t = s.active if s else None
             if s is None or t is None:
                 return
-            t.cancel.set()
-            s.active = None
-            self._keep_shown_design(s, t)
+            # At the store's commit boundary: a change of this turn either landed before Stop
+            # (and its design event went out first) or never lands.
+            with self.store.commit_boundary():
+                t.cancel.set()
+                s.active = None
+            s.note = self._interrupted(s)
             self.emit({"type": "chat.turn_end", "session_id": session_id, "stop_reason": "cancelled"})
             stream = t.stream
         if stream is not None:
@@ -465,33 +575,33 @@ class Agent:
             except Exception:
                 pass
 
-    def set_design(self, session_id: str, params: BoxParams) -> None:
-        """The user made or opened a design outside the chat (form, job file).
-        It becomes the session's current design, so 'export this' means what the
-        preview shows, and the model is told before the next message."""
-        designs.build(params)  # validate style, board and style-specific options
+    def set_design(self, session_id: str, params: BoxParams, expected: Any = "any") -> dict[str, Any]:
+        """The user made or opened a design outside the chat (form, job file): it
+        replaces the session's design, so 'export this' means what the preview shows.
+        The model is told before its next message (see _design_note)."""
         with self._lock:
-            s = self.sessions.setdefault(session_id, Session(session_id))
-            if s.busy:
-                raise RuntimeError("the chat is busy; stop the turn first")
-            s.current = params
-            s.note = (
-                "[Outside the chat, the user generated this design, which is now the current one: "
-                f"{json.dumps(params.model_dump())}]"
-            )
+            self.sessions.setdefault(session_id, Session(session_id))
+        return self.store.mutate(session_id, lambda _cur: new_design(params), expected=expected, origin="form")
 
-    @staticmethod
-    def _keep_shown_design(s: Session, t: Turn) -> None:
-        """A dropped turn may already have shown a new design in the preview. Keep
-        it as the current design (what the user sees is what gets exported) and
-        tell the model, since the turn that made it is no longer in the history.
-        Caller holds the lock."""
-        if t.current is not None and t.current != s.current:
-            s.current = t.current
-            s.note = (
-                "[An interrupted earlier turn showed this design, which is now the current one: "
-                f"{json.dumps(t.current.model_dump())}]"
-            )
+    def _interrupted(self, s: Session) -> str | None:
+        """After a dropped turn: say so only if it changed the design (the change is kept)."""
+        cur = self.store.current(s.id)
+        return INTERRUPTED if ((cur.id, cur.revision) if cur else None) != s.seen else s.note
+
+    def _design_note(self, s: Session, cur: Any = "now", why: str = "edited outside the chat, or by an "
+                     "interrupted turn") -> str | None:
+        """Tell the model when the design isn't the one it last saw: changed in the form,
+        reopened from a job, or changed by a turn that was dropped. `cur` is the design state
+        the turn will bind to (read once, so the note and the binding can't disagree)."""
+        if cur == "now":
+            cur = self.store.current(s.id)
+        now = (cur.id, cur.revision) if cur else None
+        if now == s.seen or cur is None:
+            return None
+        parts = "; ".join(f"{p.id} ({p.label}, x{p.quantity}): {json.dumps(p.params.model_dump())}"
+                          for p in cur.parts)
+        return (f"[The design changed since you last saw it ({why}). It is now design {cur.id} revision "
+                f"{cur.revision}: {parts}]")
 
     def start_turn(self, session_id: str, text: str) -> None:
         """Validate and start a turn on a worker thread; progress arrives as events."""
@@ -505,9 +615,11 @@ class Agent:
             if s.model is not None and s.model != cfg.model:
                 raise ValueError("The OpenRouter model changed. Start a new chat or switch back to the previous model.")
             s.turns += 1
-            content = f"{s.note}\n\n{text}" if s.note else text
-            t = Turn(s.id, s.turns, [*s.messages, {"role": "user", "content": content}], s.current,
-                     private=s.private)
+            cur = self.store.current(s.id)  # once: the note and the binding describe the same design
+            notes = [n for n in (s.note, self._design_note(s, cur)) if n]
+            content = "\n\n".join([*notes, text])
+            t = Turn(s.id, s.turns, [*s.messages, {"role": "user", "content": content}],
+                     (cur.id, cur.revision) if cur else None, cur.seq if cur else 0, private=s.private)
             s.active = t
         key = self.settings.api_key()  # may be slow (OS credential store), so outside the lock
         with self._lock:
@@ -543,12 +655,14 @@ class Agent:
                 return  # cancelled or reset meanwhile: say nothing, change nothing
             if ok:  # a failed turn is dropped whole, so the history stays append-only
                 s.messages = t.messages
-                s.current = t.current
+                s.seen = t.binding
                 s.private = t.private
                 s.model = cfg.model
                 s.note = None  # delivered with this turn's message
             else:
-                self._keep_shown_design(s, t)
+                # Its design changes are already committed (the preview shows them); the
+                # model is told next turn, since the turn that made them is gone.
+                s.note = self._interrupted(s)
             s.active = None
             for event in events:
                 self.emit(event)
@@ -566,6 +680,7 @@ class Agent:
                            default_headers=headers, max_retries=2) as client:
             for _ in range(MAX_STEPS):
                 self._check_cancel(s)
+                s.step += 1  # model steps reuse provider call ids; the step tells them apart
                 step = self._step(client, cfg, s)
                 done = self._after_step(s, step, cfg)
                 if done is not None:
@@ -684,7 +799,7 @@ class Agent:
         for _, call in sorted(step.calls.items()):
             self._check_cancel(s)
             self._emit(s, {"type": "chat.tool_start", "session_id": sid,
-                           "tool_use_id": call["id"], "name": call["name"]})
+                           "tool_use_id": self._row_id(s, call["id"]), "name": call["name"]})
             msg, image = self._run_tool(s, call)
             s.messages.append(msg)
             if image is not None:
@@ -716,13 +831,15 @@ class Agent:
             args = None
         else:
             try:
-                result = self._dispatch(s, name, args)
+                result = self._dispatch(s, name, args, cid)
                 is_error = False
             except (ValidationError, ValueError, OSError) as exc:
                 result = {"error": str(exc)}
                 is_error = True
         image = result.pop("_image", None) if isinstance(result, dict) else None
-        event: dict[str, Any] = {"type": "chat.tool_result", "session_id": s.id, "tool_use_id": cid,
+        # The UI's row id: provider ids repeat between steps (the model's history keeps the provider's).
+        event: dict[str, Any] = {"type": "chat.tool_result", "session_id": s.id,
+                                 "tool_use_id": self._row_id(s, cid),
                                  "name": name, "input": args, "result": result, "is_error": is_error}
         if image is not None:
             event["image"] = "data:image/png;base64," + files.b64(image)  # what the model saw
@@ -732,25 +849,143 @@ class Agent:
             content = json.dumps({**result, "picture": "attached in the next message"})
         return {"role": "tool", "tool_call_id": cid, "content": content}, image
 
-    def _dispatch(self, s: Turn, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _row_id(self, s: Turn, call_id: str) -> str:
+        return f"{self.run}:{s.number}:{s.step}:{call_id}"
+
+    def _request_id(self, s: Turn, call_id: str | None) -> str | None:
+        # Provider call ids are only unique within a step: scope them to the turn and the step.
+        # (A reset clears the session's keys in the store, so a new turn 1 can't hit an old one.)
+        return None if call_id is None else f"{s.number}:{s.step}:{call_id}"
+
+    def _advance(self, s: Turn, payload: dict[str, Any]) -> None:
+        if payload.get("seq", 0) >= s.binding_seq:  # a replayed old result never moves the binding back
+            s.binding, s.binding_seq = (payload["design_id"], payload["revision"]), payload["seq"]
+
+    def _check_bound(self, s: Turn) -> None:
+        """Before resolving anything against the design: is it still the one this turn saw?"""
+        cur = self.store.current(s.id)
+        if ((cur.id, cur.revision) if cur else None) != s.binding:
+            raise DesignChanged("the design changed outside the chat (the user edited or replaced it); call "
+                                "view_design to see it, then try again")
+
+    def _mutate(self, s: Turn, change, call_id: str | None, dry_run: bool, focus: str | None = None) -> dict[str, Any]:
+        """Apply a change to the session's design from the turn's binding; on success the
+        binding moves on. A stopped turn never commits."""
+        self._check_cancel(s)
+
+        def guard() -> None:
+            # Runs under the store's lock. An abandoned worker (Stop, then a stalled read that
+            # returns later) is no longer its session's active turn and must not commit. Reading
+            # one attribute needs no agent lock (taking it here would invert the lock order).
+            self._check_cancel(s)
+            session = self.sessions.get(s.id)
+            if session is None or session.active is not s:
+                raise TurnCancelled()
+
+        payload = self.store.mutate(s.id, change, expected=s.binding, request_id=self._request_id(s, call_id),
+                                    dry_run=dry_run, guard=guard, focus=focus, origin="chat")
+        if not dry_run:
+            self._advance(s, payload)
+        return payload
+
+    def _design_view(self, payload: dict[str, Any], part: str | None) -> dict[str, Any]:
+        """What the model sees after a change: the design's parts in brief, the changed part's
+        facts and checks, and a picture of that part."""
+        parts = payload["parts"]
+        part = part or payload.get("focus")
+        chosen = next((p for p in parts if p["part_id"] == part), parts[0])
+        view = designs.agent_view(chosen)
+        out = {
+            "design_id": payload["design_id"], "revision": payload["revision"],
+            "parts": [{"part": p["part_id"], "label": p["label"], "quantity": p["quantity"], "name": p["name"],
+                       "overall": p["overall"]} for p in parts],
+            "part": chosen["part_id"], **view,
+            "design_overall": payload["overall"],
+        }
+        if payload.get("design_checks"):
+            out["design_checks"] = payload["design_checks"]
+        if payload.get("dry_run"):
+            out["dry_run"] = "nothing was changed"
+        png, info = render.render_png(designs.build(BoxParams.model_validate(chosen["params"])))
+        out["view"], out["_image"] = info, png
+        return out
+
+    def _read(self, s: Turn):
+        """The design to read. The turn rebinds to it only once the read has succeeded
+        (`_bind_read`), so a failed read never unlocks changes to a design it didn't show."""
+        cur = self.store.current(s.id)
+        if cur is None:
+            raise ValueError("no design yet; call create_box first")
+        return cur
+
+    def _bind_read(self, s: Turn, cur) -> None:
+        if cur.seq >= s.binding_seq:
+            s.binding, s.binding_seq = (cur.id, cur.revision), cur.seq
+
+    def _dispatch(self, s: Turn, name: str, args: dict[str, Any], call_id: str | None = None) -> dict[str, Any]:
         if name == "list_options":
             return designs.catalog()
+        if name in ("create_box", "update_part", "remove_part"):
+            replay = self.store.replay(s.id, self._request_id(s, call_id) or "")
+            if replay is not None:  # a retry of a call already applied: its result, nothing done twice
+                self._advance(s, replay)
+                return self._design_view(replay, None)
+            allowed = TOOL_KEYS[name]
+            unknown = sorted(set(args) - allowed)
+            if unknown:
+                raise ValueError(f"{name} has no argument(s) {', '.join(unknown)}")
+            if "options" in args and not isinstance(args["options"], dict):
+                raise ValueError("options must be an object of style options")
+            if name != "create_box":
+                self._check_bound(s)
         if name == "create_box":
-            params = BoxParams.model_validate(args)
-            design = designs.create_box(params)
-            with self._lock:
-                session = self.sessions.get(s.id)
-                if session is None or session.active is not s:
-                    raise TurnCancelled()
-                self.emit({"type": "design", "session_id": s.id, "design": design})
-                s.current = params
-            view = designs.agent_view(design)
-            png, info = render.render_png(designs.build(params))
-            return {**view, "view": info, "_image": png}
+            fields = {k: v for k, v in args.items() if k not in ("action", "label", "quantity", "dry_run")}
+            params = BoxParams.model_validate(fields)
+            action = args.get("action", "replace_design")
+            label, quantity, dry = _label_arg(args), _quantity_arg(args, 1), _bool_arg(args, "dry_run")
+            cur = self.store.current(s.id)
+            if action == "add":
+                change = lambda c: (new_design(params, label, quantity) if c is None  # noqa: E731
+                                    else add_part(c, params, label, quantity))
+                focus = f"p{cur.next_part}" if cur is not None else "p1"
+            elif action == "replace_design":
+                change = lambda c: new_design(params, label, quantity)  # noqa: E731
+                focus = "p1"
+            else:
+                raise ValueError("action must be replace_design or add")
+            payload = self._mutate(s, change, call_id, dry, focus)
+            return self._design_view(payload, focus)
+        if name == "update_part":
+            cur = self._read(s)
+            part = cur.part(_part_arg(args))
+            base = part.params.model_dump()
+            fields = {k: v for k, v in args.items() if k in ("style", "length", "width", "depth", "units", "board")}
+            if "style" in fields and fields["style"] != base["style"]:
+                options = args.get("options") or {}  # another style's options don't carry over
+            else:
+                options = {**base.get("options", {}), **(args.get("options") or {})}
+            changed = bool(fields) or "options" in args
+            params = BoxParams.model_validate({**base, **fields, "options": options}) if changed else None
+            label = _label_arg(args)
+            quantity = _quantity_arg(args, None)
+            if params is None and label is None and quantity is None:
+                raise ValueError("update_part needs at least one field to change")
+            payload = self._mutate(s, lambda d: update_part(d, part.id, params, label, quantity), call_id,
+                                   _bool_arg(args, "dry_run"), part.id)
+            return self._design_view(payload, part.id)
+        if name == "remove_part":
+            cur = self._read(s)
+            part = cur.part(_part_arg(args, required=True))
+            payload = self._mutate(s, lambda d: remove_part(d, part.id), call_id, _bool_arg(args, "dry_run"),
+                                   None)
+            return self._design_view(payload, None)
         if name == "list_faces":
-            if s.current is None:
-                raise ValueError("no design yet; call create_box first")
-            return designs.face_map(s.current)
+            cur = self._read(s)
+            part = cur.part(_part_arg(args))
+            out = {"part": part.id, "label": part.label, "design_id": cur.id, "revision": cur.revision,
+                   **designs.face_map(part.params)}
+            self._bind_read(s, cur)
+            return out
         if name in ("view_design", "get_geometry"):
             region = render.Region.parse(args.get("region"))
             if args.get("path") is not None:
@@ -758,17 +993,28 @@ class Agent:
                     raise ValueError("path must be a string")
                 s.private = True
                 d, warnings = self._reference_dieline(args["path"])
-            elif s.current is not None:
-                d, warnings = designs.build(s.current), []
             else:
-                raise ValueError("no design yet; call create_box first (or pass a CF2/DXF path)")
+                cur = self._read(s)
+                d, warnings = self.store.dieline(cur, _part_arg(args)), []
             if name == "get_geometry":
                 line_type = args.get("line_type")
                 if line_type is not None and not isinstance(line_type, str):
                     raise ValueError("line_type must be a string")
-                return {**render.geometry(d, line_type, region), "warnings": warnings}
-            png, info = render.render_png(d, region)
-            return {"view": info, "_image": png, "warnings": warnings}
+                out = {**render.geometry(d, line_type, region), "warnings": warnings}
+            else:
+                png, info = render.render_png(d, region)
+                out = {"view": info, "_image": png, "warnings": warnings}
+            if args.get("path") is None:
+                shown = cur.part(_part_arg(args))
+                built = self.store.payload(cur)
+                part_payload = next(p for p in built["parts"] if p["part_id"] == shown.id)
+                out["design"] = {
+                    "design_id": cur.id, "revision": cur.revision, "design_overall": built["overall"],
+                    "parts": [{"part": p.id, "label": p.label, "quantity": p.quantity} for p in cur.parts],
+                    "part": shown.id, **designs.agent_view(part_payload),
+                }
+                self._bind_read(s, cur)  # only now: the read succeeded and showed this design
+            return out
         if name == "search_files":
             query = args.get("query")
             if not isinstance(query, str):
@@ -801,8 +1047,12 @@ class Agent:
                 out["_image"] = png
             return {"path": str(real), **out}
         if name == "export_files":
-            if s.current is None:
+            if s.binding is None:
+                if self.store.current(s.id) is not None:
+                    self._check_bound(s)
                 raise ValueError("no design yet; call create_box first")
+            snap = self.store.snapshot(s.id, *s.binding)  # exactly the design this turn has seen
+            export_params = self.store.export_params(snap)
             filename = args.get("filename")
             if filename is not None and not isinstance(filename, str):
                 raise ValueError("filename must be a string")
@@ -813,7 +1063,7 @@ class Agent:
             if not isinstance(replace, bool):
                 raise ValueError("replace must be true or false")
             cfg = self.settings.settings
-            return designs.export(s.current, cfg.resolved_output_dir(), filename, formats, replace,
+            return designs.export(export_params, cfg.resolved_output_dir(), filename, formats, replace,
                                   cfg.resolved_dxf_dir(), check_cancel=lambda: self._check_cancel(s))
         if name in ("web_search", "web_fetch") and s.private:
             raise ValueError("Web tools are off in a chat that has accessed reference files. Start a new chat.")

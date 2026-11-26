@@ -32,14 +32,20 @@ Line-delimited JSON-RPC 2.0. TypeScript types are in `app/src/lib/protocol.ts`, 
 | Method | Purpose |
 |---|---|
 | `engine.info` | Version, styles, boards, settings |
-| `box.create` | Parameters → design (CF2 text, checks, summary) |
-| `box.export` | Regenerate from parameters and write `.cf2` and/or `.dxf` (`formats`) plus a `.dieline.json` job record. Refuses an existing name with error `-32001` unless `overwrite`. |
+| `box.create` | Parameters → design (CF2 text, checks, summary), without storing it |
+| `design.replace` | The form's Generate and a reopened job: a new design for the session (`designstore.py`), with an id and revision 1 |
+| `design.get` | The session's current design, or null |
+| `box.export` | Write `.cf2` and/or `.dxf` (`formats`) plus a `.dieline.json` job record, from the session's design at an exact `design_id` and `revision` (refused if it has changed since), or from `params`. Refuses an existing name with error `-32001` unless `overwrite`. |
 | `job.open` | Regenerate a design from a job record, listing what differs from the export |
 | `settings.get` / `settings.update` | Model, effort, export folder, API key (write-only) |
 | `chat.send` / `chat.cancel` / `chat.reset` | Start, stop or clear a chat turn; progress arrives as events |
-| `chat.set_design` | A design made in the form or opened from a job becomes the chat's current design |
+| `chat.set_design` | Older name for `design.replace` |
 
 Notifications use method `event` with a `type`: `engine.ready`, `chat.text`, `chat.thinking`, `chat.tool_start`, `chat.tool_result`, `chat.error`, `chat.turn_end` and `design`. The shell adds `engine.exit`.
+
+## Designs, revisions and parts
+
+The engine holds each chat session's design (`designstore.py`): an id, a revision, its parts (each with a stable id, label, quantity and the standard's parameters), groups and fit links. Every change, from the form, a reopened job or the chat, is built and checked in full outside the lock and committed with a compare-and-swap, so an edit made meanwhile is never overwritten. A chat turn is bound to the design it started from (or last read); a change after an outside edit is refused until the model looks again. A tool call's id makes a retry safe. Exports work from an exact id and revision. Each part also carries a preview scene: its segments tagged with their operation, for highlighting later. Exporting a design with several parts arrives with the export manifest.
 
 ## Styles, boards and units
 
@@ -77,7 +83,8 @@ The model's tools:
 | Tool | What it does |
 |---|---|
 | `list_options` | Styles (with options) and boards |
-| `create_box(style, L, W, D, units, board, options)` | Generate, check and show in the preview. The result includes a picture of the dieline, so every design is looked at. |
+| `create_box(style, L, W, D, units, board, options, action?, label?, quantity?, dry_run?)` | Generate, check and show in the preview. `action: add` adds another part instead of replacing the design. The result includes a picture of the part, so every design is looked at. |
+| `update_part(part?, ...)` / `remove_part(part)` | Change or remove one part; omitted fields keep their values |
 | `export_files(filename?, formats?, replace?)` | Write CF2 and/or DXF plus the job record |
 | `view_design(region?, path?)` | Picture of the current design (or a reference CF2/DXF): inch ruler, score-to-score distances labelled, optional zoom window (`render.py`) |
 | `list_faces()` | The named faces of the current design (`faces.py`): P1–P4 with end/side roles, flaps, glue lug, lug extensions; each with a frame seen from outside the folded box, reference lines, keep-outs (glue landing, overlap bands), hinge, and the selectors that apply |

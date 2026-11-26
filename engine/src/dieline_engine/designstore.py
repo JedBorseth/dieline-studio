@@ -1,0 +1,378 @@
+"""The engine's designs: one per chat session, with an id and a revision
+(docs/DESIGN-SYSTEM.md, "Design and parts" and "Agent tools / Revisions").
+
+Every change, from the form, a reopened job or the chat, goes through
+`DesignStore.mutate`:
+
+- It's atomic. The new design is built and checked in full before anything
+  changes, outside the lock; then it's committed under the lock only if the
+  design is still the one the change was based on (compare-and-swap). An edit
+  made meanwhile is never overwritten; the change is refused instead.
+- A caller may pass the design id and revision it expects (the chat always
+  does). A mismatch is refused with DesignChanged.
+- A request id makes a retry safe: the same id returns the first result and
+  isn't applied twice.
+- dry_run builds and checks the change and returns it without committing.
+
+Exports work from a snapshot taken by id and revision, so the files are
+exactly what was on screen.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import threading
+import uuid
+from contextlib import contextmanager
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+from typing import Any, Callable
+
+from . import designs as _designs
+from .checks import CheckResult, overall
+from .designs import BoxParams
+from .geometry import Arc, Dieline
+
+
+class DesignChanged(ValueError):
+    """The design isn't the one the change was based on: someone else edited it."""
+
+
+@dataclass(frozen=True, slots=True)
+class Part:
+    id: str  # stable, engine-made: p1, p2, ...
+    label: str
+    params: BoxParams
+    quantity: int = 1
+    piece_no: str | None = None  # the shop's number for it, when known
+
+
+@dataclass(frozen=True, slots=True)
+class Member:
+    ref: str  # a part id, or a group id (a stack can hold partition sets)
+    role: str
+    quantity: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Group:
+    id: str
+    kind: str  # partition_set | telescoping | stack | assembly
+    members: tuple[Member, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FitLink:
+    """The container's assembled inside against the contained's assembled outside."""
+
+    id: str
+    container: str  # part or group id
+    contained: str
+
+
+@dataclass(frozen=True, slots=True)
+class DesignState:
+    id: str
+    revision: int
+    parts: tuple[Part, ...]
+    groups: tuple[Group, ...] = ()
+    links: tuple[FitLink, ...] = ()
+    next_part: int = 1
+    seq: int = 0  # the session's commit order, across replacements (ids alone can't order them)
+
+    def part(self, ref: str | None) -> Part:
+        """A part by exact id first, then by label; with no ref, the only part. Errors list the parts."""
+        listing = ", ".join(f"{p.id} ({p.label})" for p in self.parts)
+        if ref is None:
+            if len(self.parts) == 1:
+                return self.parts[0]
+            raise ValueError(f"this design has {len(self.parts)} parts; say which: {listing}")
+        for p in self.parts:
+            if p.id == ref:
+                return p
+        named = [p for p in self.parts if p.label == ref]
+        if len(named) == 1:
+            return named[0]
+        if named:
+            raise ValueError(f"several parts are labelled {ref!r} ({', '.join(p.id for p in named)}); use the id")
+        raise ValueError(f"no part {ref!r}; parts: {listing}")
+
+    def ids(self) -> set[str]:
+        return {p.id for p in self.parts} | {g.id for g in self.groups}
+
+
+# ------------------------------------------------------------------ changes (pure)
+
+
+def new_design(params: BoxParams, label: str | None = None, quantity: int = 1) -> DesignState:
+    _check_label(label)
+    return DesignState(uuid.uuid4().hex[:12], 1, (Part("p1", label or _label(params), params, quantity),), next_part=2)
+
+
+def add_part(d: DesignState, params: BoxParams, label: str | None = None, quantity: int = 1) -> DesignState:
+    _check_label(label, d)
+    pid = f"p{d.next_part}"
+    taken = {p.label for p in d.parts}
+    name = label or _label(params)
+    if not label:  # a default label stays unique: "reg-glio-nx", "reg-glio-nx 2", ...
+        n = 2
+        while name in taken:
+            name, n = f"{_label(params)} {n}", n + 1
+    return replace(d, parts=(*d.parts, Part(pid, name, params, quantity)), next_part=d.next_part + 1)
+
+
+def _check_label(label: str | None, d: DesignState | None = None) -> None:
+    """A label may not look like a part id (p1, p2, ...) or repeat another part's label."""
+    if label is None:
+        return
+    if not label.strip():
+        raise ValueError("a label can't be empty")
+    if len(label) > 1 and label[0] == "p" and label[1:].isdigit():
+        raise ValueError(f"{label!r} looks like a part id; choose another label")
+    if d is not None and any(p.label == label for p in d.parts):
+        raise ValueError(f"another part is already labelled {label!r}")
+
+
+def update_part(d: DesignState, ref: str | None, params: BoxParams | None = None, label: str | None = None,
+                quantity: int | None = None) -> DesignState:
+    """Replace a part's parameters, label or quantity. Its id and its place in its groups stay."""
+    old = d.part(ref)
+    if label is not None and label != old.label:
+        _check_label(label, d)
+    new = replace(old, params=params or old.params, label=label or old.label,
+                  quantity=old.quantity if quantity is None else quantity)
+    return replace(d, parts=tuple(new if p.id == old.id else p for p in d.parts))
+
+
+def remove_part(d: DesignState, ref: str | None) -> DesignState:
+    """Remove a part; it leaves its groups (an empty group goes too). Links to it become stale."""
+    old = d.part(ref)
+    if len(d.parts) == 1:
+        raise ValueError("a design needs at least one part; to start over, create_box replaces the whole design")
+    gone = {old.id}
+    groups = list(d.groups)
+    while True:  # a group left empty goes too, and so does any reference to it, all the way up
+        kept = []
+        for g in groups:
+            members = tuple(m for m in g.members if m.ref not in gone)
+            if members:
+                kept.append(replace(g, members=members))
+            else:
+                gone.add(g.id)
+        if len(kept) == len(groups) and all(a.members == b.members for a, b in zip(kept, groups)):
+            break
+        groups = kept
+    return replace(d, parts=tuple(p for p in d.parts if p.id != old.id), groups=tuple(groups))
+
+
+def _label(params: BoxParams) -> str:
+    return params.style
+
+
+# ------------------------------------------------------------------ the store
+
+
+@dataclass(slots=True)
+class _Built:
+    payload: dict[str, Any]
+    dieline: Dieline
+
+
+class DesignStore:
+    def __init__(self, emit: Callable[[dict[str, Any]], None] | None = None) -> None:
+        self._lock = threading.Lock()
+        self._by_session: dict[str, DesignState] = {}
+        self._done: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._built: OrderedDict[str, _Built] = OrderedDict()
+        self._seq: dict[str, int] = {}  # each session's commit count; it never goes back
+        self._emit = emit
+
+    # ------------------------------------------------------------ reading
+
+    def current(self, session: str) -> DesignState | None:
+        with self._lock:
+            return self._by_session.get(session)
+
+    def snapshot(self, session: str, design_id: str | None = None, revision: int | None = None) -> DesignState:
+        """The session's design, checked against an expected id and revision when given."""
+        with self._lock:
+            cur = self._by_session.get(session)
+        if cur is None:
+            raise ValueError("no design yet")
+        if design_id is not None and (cur.id, cur.revision) != (design_id, revision):
+            raise DesignChanged(_changed_msg())
+        return cur
+
+    def dieline(self, state: DesignState, ref: str | None = None) -> Dieline:
+        return copy.deepcopy(self._build(state.part(ref).params).dieline)
+
+    def export_params(self, state: DesignState) -> BoxParams:
+        """The one part to export, after the design's own checks: a stale or failed design
+        check (a fit link to a removed part) blocks the export like a failed part check."""
+        payload = self.payload(state)
+        blocking = [c for c in payload["design_checks"] if c["status"] in ("fail", "stale")]
+        if blocking:
+            raise _designs.DesignCheckFailed("not exported: " + "; ".join(c["message"] for c in blocking))
+        if len(state.parts) > 1:
+            raise ValueError("exporting a design with several parts comes with the export manifest")
+        return state.parts[0].params
+
+    def replay(self, session: str, request_id: str) -> dict[str, Any] | None:
+        """The result of a request already committed, for a retry."""
+        with self._lock:
+            hit = self._done.get((session, request_id))
+        return copy.deepcopy(hit) if hit is not None else None
+
+    @contextmanager
+    def commit_boundary(self):
+        """Hold off commits: a chat Stop takes this so no change of the stopped turn lands after it."""
+        with self._lock:
+            yield
+
+    def payload(self, state: DesignState) -> dict[str, Any]:
+        """What the UI and the agent see: every part built and checked, plus the design's own checks.
+        The first part's fields also sit at the top level, as a single design always had them."""
+        parts = []
+        for p in state.parts:
+            built = copy.deepcopy(self._build(p.params).payload)  # callers can't reach into the cache
+            # A legacy id unique to this design, part and commit (the UI keys its status by it).
+            built["id"] = f"{state.id}.{p.id}.{state.seq}"
+            parts.append({**built, "part_id": p.id, "label": p.label, "quantity": p.quantity,
+                          "piece_no": p.piece_no})
+        design_checks = self._design_checks(state)
+        statuses = [c for part in parts for c in part["checks"]] + [c.to_dict() for c in design_checks]
+        result = {
+            **parts[0],
+            "design_id": state.id,
+            "revision": state.revision,
+            "seq": state.seq,
+            "parts": parts,
+            "groups": [{"id": g.id, "kind": g.kind,
+                        "members": [{"ref": m.ref, "role": m.role, "quantity": m.quantity} for m in g.members]}
+                       for g in state.groups],
+            "links": [{"id": lk.id, "container": lk.container, "contained": lk.contained} for lk in state.links],
+            "design_checks": [c.to_dict() for c in design_checks],
+            "overall": overall([CheckResult(c["id"], c["status"], c["message"]) for c in statuses]),
+        }
+        return result
+
+    def _design_checks(self, state: DesignState) -> list[CheckResult]:
+        out: list[CheckResult] = []
+        known = state.ids()
+        for lk in state.links:
+            missing = [r for r in (lk.container, lk.contained) if r not in known]
+            if missing:
+                out.append(CheckResult(f"link_{lk.id}", "stale",
+                                       f"fit link {lk.id} points at {', '.join(missing)}, which is no longer in "
+                                       "the design; relink it or remove it"))
+        return out
+
+    def _build(self, params: BoxParams) -> _Built:
+        key = json.dumps(params.model_dump(), sort_keys=True)
+        with self._lock:
+            hit = self._built.get(key)
+            if hit is not None:
+                self._built.move_to_end(key)
+                return hit
+        payload = _designs.create_box(params)  # validates and refuses invalid geometry
+        d = _designs.build(params)
+        payload["scene"] = scene(d)
+        built = _Built(payload, d)
+        with self._lock:
+            self._built[key] = built
+            while len(self._built) > 64:
+                self._built.popitem(last=False)
+        return built
+
+    # ------------------------------------------------------------ changing
+
+    def mutate(self, session: str, change: Callable[[DesignState | None], DesignState], *,
+               expected: tuple[str, int] | None | str = "any", request_id: str | None = None,
+               dry_run: bool = False, guard: Callable[[], None] | None = None,
+               focus: str | None = None, origin: str = "chat") -> dict[str, Any]:
+        """Build `change(current)` and commit it if the design is still `current`.
+
+        expected: "any" (the designer's own form and job open) or the (design id, revision)
+        the caller is working from; None means it expects no design yet.
+        guard: called just before committing, under the lock; raising stops the commit
+        (a chat turn that was stopped while its change was being built).
+        """
+        with self._lock:
+            if request_id is not None and (session, request_id) in self._done:
+                return copy.deepcopy(self._done[(session, request_id)])
+            cur = self._by_session.get(session)
+            seq = self._seq.get(session, 0)
+        _check_expected(cur, expected)
+        proposed = change(cur)
+        if cur is not None and proposed.id == cur.id:
+            proposed = replace(proposed, revision=cur.revision + 1)
+        proposed = replace(proposed, seq=seq + 1)
+        payload = self.payload(proposed)  # builds and checks every part: raises before anything changes
+        if focus is not None:
+            payload["focus"] = focus  # the part the change was about, for a retry's answer
+        if dry_run:
+            return {**payload, "seq": seq, "dry_run": True}
+        with self._lock:
+            if request_id is not None and (session, request_id) in self._done:
+                return copy.deepcopy(self._done[(session, request_id)])  # an overlapping retry won
+            now = self._by_session.get(session)
+            if now is not cur or self._seq.get(session, 0) != seq:  # edited while this change was being built
+                raise DesignChanged(_changed_msg())
+            if guard is not None:
+                guard()
+            self._by_session[session] = proposed
+            self._seq[session] = seq + 1
+            if request_id is not None:
+                self._done[(session, request_id)] = payload
+                while len(self._done) > 256:
+                    self._done.popitem(last=False)
+            # Emitted under the lock, so the UI receives a session's designs in commit order.
+            if self._emit is not None:
+                # origin: "chat" for the agent's changes, "form" for the designer's own (the form,
+                # a reopened job), whose replies the UI shows itself in its own request order.
+                self._emit({"type": "design", "session_id": session, "design": payload, "origin": origin})
+        return copy.deepcopy(payload)
+
+    def forget(self, session: str) -> None:
+        """A chat reset: its design and its retry keys go (the commit order carries on)."""
+        with self._lock:
+            self._by_session.pop(session, None)
+            for key in [k for k in self._done if k[0] == session]:
+                del self._done[key]
+
+
+def _check_expected(cur: DesignState | None, expected: tuple[str, int] | None | str) -> None:
+    if expected == "any":
+        return
+    if expected is None:
+        if cur is not None:
+            raise DesignChanged(_changed_msg())
+        return
+    if cur is None or (cur.id, cur.revision) != tuple(expected):  # type: ignore[arg-type]
+        raise DesignChanged(_changed_msg())
+
+
+def _changed_msg() -> str:
+    return ("the design changed outside the chat (the user edited or replaced it); call view_design to see "
+            "it, then try again")
+
+
+# ------------------------------------------------------------------ preview scene
+
+
+def scene(d: Dieline) -> list[dict[str, Any]]:
+    """Every segment tagged with its operation, for the preview to highlight and
+    label (the CF2 stays clean for ArtiosCAD)."""
+    out = []
+    for s in d.segments:
+        op = d.ops.get(s.op) if s.op else None
+        item: dict[str, Any] = {"type": s.type.value, "op": s.op, "kind": op.kind if op else None,
+                                "provenance": "structure"}
+        if isinstance(s, Arc):
+            item.update(arc=True, start=list(s.start), end=list(s.end), center=list(s.center),
+                        clockwise=s.clockwise, full_circle=s.full_circle)
+        else:
+            item.update(arc=False, start=list(s.start), end=list(s.end))
+        out.append(item)
+    return out

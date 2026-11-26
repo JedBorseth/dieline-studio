@@ -111,7 +111,8 @@ export default function App() {
             source={state.preview}
             info={info}
             sessionId={active.id}
-            onPreview={(source) => dispatch({ type: "preview", source })}
+            sessionDesign={active.design}
+            onPreview={(source, sessionId) => dispatch({ type: "preview", source, sessionId })}
           />
         </main>
         {settingsOpen && info && (

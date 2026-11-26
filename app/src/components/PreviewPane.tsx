@@ -23,8 +23,10 @@ import { EngineError, request } from "../lib/engine";
 import { loadString, saveString } from "../lib/prefs";
 import {
   type BoxParams,
+  type CheckResult,
   type CheckStatus,
   type Design,
+  DESIGN_CHANGED,
   EXPORT_EXISTS,
   type EngineInfo,
   type ExportFormat,
@@ -53,7 +55,10 @@ interface Props {
   info: EngineInfo | null;
   /** The chat session shown; a design made here becomes its current design too. */
   sessionId: string;
-  onPreview: (source: PreviewSource) => void;
+  /** The design the session on screen holds, even while the preview shows a raw file. */
+  sessionDesign?: Design | null;
+  /** Show a source in the preview of the session that asked (sessionId), even if another is now on screen. */
+  onPreview: (source: PreviewSource, sessionId: string) => void;
 }
 
 interface Status {
@@ -64,7 +69,17 @@ interface Status {
 
 const KINDS: LineKind[] = ["cut", "crease", "perforation", "score", "other"];
 
-export function PreviewPane({ width, source, info, sessionId, onPreview }: Props) {
+interface ShowContext {
+  sid: string;
+  base: Design | null;
+  /** Its place in the session's request order, taken when the designer acted: anything
+   *  they did after it (opening a file, another Generate) wins. */
+  seq: number;
+}
+
+export function PreviewPane({ width, source, info, sessionId, sessionDesign, onPreview }: Props) {
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
   const [visible, setVisible] = useState<Record<LineKind, boolean>>({
     cut: true,
     crease: true,
@@ -81,19 +96,40 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const exportingRef = useRef(false);
-  const openSeqRef = useRef(0);
+  // Each session orders its own requests (show, open, refresh): a reply only lands if nothing newer
+  // started in that session. Status messages belong to the session on screen.
+  const seqsRef = useRef(new Map<string, number>());
+  const bump = (sid: string): number => {
+    const n = (seqsRef.current.get(sid) ?? 0) + 1;
+    seqsRef.current.set(sid, n);
+    return n;
+  };
+  const latest = (sid: string, n: number): boolean => seqsRef.current.get(sid) === n;
+  const here = (sid: string): boolean => sid === sessionIdRef.current;
   const fileRef = useRef<HTMLInputElement>(null);
 
   const design = source?.kind === "design" ? source.design : null;
   const designIdRef = useRef<string | null>(design?.id ?? null);
   designIdRef.current = design?.id ?? null;
+  // A design with several parts shows one at a time, chosen by the tabs.
+  type PartView = Design & { part_id?: string; label?: string; quantity?: number };
+  const parts: PartView[] = design?.parts?.length ? design.parts : design ? [design] : [];
+  // The selected part is kept by id, so removing another part doesn't move the selection.
+  const [partId, setPartId] = useState<string | null>(null);
+  const shown: PartView | null = parts.find((p) => p.part_id === partId) ?? parts[0] ?? null;
+  const several = parts.length > 1;
+  // A second part appearing while the export bar is open: that bar can't export it.
+  useEffect(() => {
+    if (several) setExportOpen(false);
+  }, [several]);
 
   // A status message (and reopen-notes dismissal) belongs to the dieline it was about;
   // a message queued for the incoming dieline is shown with it.
-  const pendingStatusRef = useRef<Status | null>(null);
-  const showSeqRef = useRef(0);
+  // A message queued for the next dieline shown in its own session (never another's).
+  const pendingStatusRef = useRef<{ sid: string; status: Status | null } | null>(null);
   useEffect(() => {
-    setStatus(pendingStatusRef.current);
+    const pending = pendingStatusRef.current;
+    setStatus(pending && pending.sid === sessionIdRef.current ? pending.status : null);
     pendingStatusRef.current = null;
     setNotesDismissed(false);
   }, [source]);
@@ -101,60 +137,110 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
   const parsed = useMemo((): { doc: Cf2Doc | null; error: string | null } => {
     if (!source) return { doc: null, error: null };
     try {
-      return { doc: parseCf2(source.kind === "design" ? source.design.cf2 : source.text), error: null };
+      return { doc: parseCf2(source.kind === "design" ? (shown ?? source.design).cf2 : source.text), error: null };
     } catch (err) {
       return { doc: null, error: err instanceof Error ? err.message : String(err) };
     }
-  }, [source]);
+  }, [source, shown]);
   const doc = parsed.doc;
 
-  const title = source ? (source.kind === "design" ? source.design.name : source.name) : "Preview";
+  const title = source ? (source.kind === "design" ? (shown ?? source.design).name : source.name) : "Preview";
   const present = new Set(doc?.primitives.map((p) => p.type));
 
   /** Show a design made outside the chat, and make it the chat's current design too. */
   /** Show a design made outside the chat. The chat's current design is switched
    *  first and the preview only after the engine accepts it, so a chat message sent
    *  meanwhile can never act on a design the preview no longer shows. */
-  const showDesign = async (next: Extract<PreviewSource, { kind: "design" }>): Promise<void> => {
-    const seq = ++showSeqRef.current;
-    let warning: Status | null = null;
+  /** After the engine refused a stale request: show the session's design as it is now. */
+  /** seq: the place in the session's request order of the action that hit the refusal (a Save),
+   *  so anything the designer did after that action wins over this refresh. */
+  const refresh = async (sid: string, text: string, seq: number = bump(sid)): Promise<void> => {
+    if (!latest(sid, seq)) return;
     try {
-      await request("chat.set_design", { session_id: sessionId, params: next.design.params });
+      const current = await request("design.get", { session_id: sid });
+      if (!latest(sid, seq)) return;
+      if (here(sid)) pendingStatusRef.current = { sid, status: { tone: "error", text } };
+      if (current) onPreview({ kind: "design", design: current, origin: "agent" }, sid);
+      else if (here(sid)) setStatus({ tone: "error", text });
     } catch (err) {
-      warning = {
-        tone: "error",
-        text: `The chat wasn't told about this design (${err instanceof Error ? err.message : String(err)}); `
-          + "\"export\" in the chat still means its own last design.",
-      };
+      if (here(sid)) setStatus({ tone: "error", text: err instanceof Error ? err.message : String(err) });
     }
-    if (seq !== showSeqRef.current) return; // a newer design was chosen meanwhile
-    pendingStatusRef.current = warning;
-    onPreview(next);
+  };
+
+  /** Where a request started: its session and the design that session held then (whatever
+   *  the preview showed, a raw CF2 included). Captured when the designer acts. */
+  const context = (): ShowContext => ({ sid: sessionId, base: sessionDesign ?? null, seq: bump(sessionId) });
+
+  const showDesign = async (
+    next: Extract<PreviewSource, { kind: "design" }>,
+    ctx: ShowContext,
+    confirmed = false,
+  ): Promise<void> => {
+    const baseParts = ctx.base?.parts?.length ?? (ctx.base ? 1 : 0);
+    // Replacing a design with several parts loses the others: ask first, and only in the session it
+    // started in. If the designer has moved to another chat meanwhile, the replacement is dropped.
+    if (!latest(ctx.sid, ctx.seq)) return; // the designer did something newer in that session
+    if (!confirmed && baseParts > 1 && next.origin === "form") {
+      if (ctx.sid !== sessionIdRef.current) return;
+      setStatus({
+        tone: "error",
+        text: `Replace the current design? Its ${baseParts - 1} other part${baseParts > 2 ? "s" : ""} will be lost.`,
+        action: { label: "Replace", run: () => void showDesign(next, { ...ctx, seq: bump(ctx.sid) }, true) },
+      });
+      return;
+    }
+    const sid = ctx.sid; // the reply goes to this session even if another is on screen by then
+    const seq = ctx.seq;
+    // What the designer was looking at: the engine refuses the replacement if it changed meanwhile.
+    const expected =
+      ctx.base?.design_id !== undefined && ctx.base.revision !== undefined
+        ? { design_id: ctx.base.design_id, revision: ctx.base.revision }
+        : null;
+    let committed: Design;
+    try {
+      // The engine holds the session's design; the form and a reopened job replace it there.
+      committed = await request("design.replace", { session_id: sid, params: next.design.params, expected });
+    } catch (err) {
+      if (!latest(sid, seq)) return;
+      if (err instanceof EngineError && err.code === DESIGN_CHANGED) {
+        await refresh(sid, "The chat changed the design while you were editing. Here it is now; Generate again to replace it.");
+        return;
+      }
+      // Nothing was replaced: keep showing the design the engine holds.
+      if (here(sid)) setStatus({ tone: "error", text: `Not replaced: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+    if (!latest(sid, seq)) return; // a newer design was chosen meanwhile, in that session
+    if (here(sid)) pendingStatusRef.current = null;
+    onPreview({ ...next, design: committed }, sid);
   };
 
   const openFile = async (file: File) => {
-    const seq = ++openSeqRef.current;
+    const ctx = context();
+    const seq = ctx.seq;
     setStatus(null);
     try {
       const text = await file.text();
-      if (seq !== openSeqRef.current) return;
+      if (!latest(ctx.sid, seq)) return;
       if (!file.name.toLowerCase().endsWith(".json")) {
-        ++showSeqRef.current; // a design still being handed to the chat mustn't replace this file
-        onPreview({ kind: "file", name: file.name, text });
+        onPreview({ kind: "file", name: file.name, text }, ctx.sid);
         return;
       }
       // A job record written next to an export: regenerate it and list what changed since.
       const res = await request("job.open", { record: JSON.parse(text) as unknown });
-      if (seq !== openSeqRef.current) return;
-      await showDesign({
-        kind: "design",
-        design: res.design,
-        origin: "job",
-        stem: res.stem,
-        notes: res.changes.length ? res.changes : undefined,
-      });
+      if (!latest(ctx.sid, seq)) return;
+      await showDesign(
+        {
+          kind: "design",
+          design: res.design,
+          origin: "job",
+          stem: res.stem,
+          notes: res.changes.length ? res.changes : undefined,
+        },
+        ctx,
+      );
     } catch (err) {
-      if (seq !== openSeqRef.current) return;
+      if (!latest(ctx.sid, seq) || !here(ctx.sid)) return;
       setStatus({ tone: "error", text: `Couldn't open ${file.name}: ${err instanceof Error ? err.message : String(err)}` });
     }
   };
@@ -162,21 +248,42 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
   const exportFiles = async (filename: string, formats: ExportFormat[], overwrite = false): Promise<void> => {
     const target = design;
     if (!target || exportingRef.current) return;
+    if (target.design_id === undefined && target.design_checks?.length) {
+      // The engine restarted and no longer holds this design, so its own checks (fit links, groups)
+      // can't be run again: saving from the parameters alone would skip them.
+      setStatus({
+        tone: "error",
+        text: "The engine restarted and this design's own checks can't be run again. Generate it again before saving.",
+      });
+      return;
+    }
+    const sid = sessionId; // the session this export is for
+    const seq = bump(sid); // its place in that session's request order
     exportingRef.current = true;
     setExporting(true);
     try {
+      const which =
+        target.design_id !== undefined && target.revision !== undefined
+          ? { session_id: sid, design_id: target.design_id, revision: target.revision }
+          : { params: target.params };
       const res = await request("box.export", {
-        params: target.params,
+        ...which,
         filename: filename.trim() || undefined,
         formats,
         overwrite,
       });
-      if (designIdRef.current !== target.id) return;
+      if (!here(sid)) return;
       const moved = res.superseded.length ? ` (earlier files moved to superseded)` : "";
       setStatus({ tone: "info", text: `Saved ${[...res.paths, res.job_path].join(", ")}${moved}` });
       setExportOpen(false);
     } catch (err) {
-      if (designIdRef.current !== target.id) return;
+      if (err instanceof EngineError && err.code === DESIGN_CHANGED) {
+        // Even if the new design's event got here first: say so, and show it.
+        if (here(sid)) setExportOpen(false);
+        await refresh(sid, err.message, seq);
+        return;
+      }
+      if (!here(sid)) return;
       if (err instanceof EngineError && err.code === EXPORT_EXISTS) {
         setStatus({
           tone: "error",
@@ -234,7 +341,7 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
           }
           aria-expanded={exportOpen}
           data-pressed={exportOpen && design ? "" : undefined}
-          disabled={!design}
+          disabled={!design || several}
         />
         <input
           ref={fileRef}
@@ -248,6 +355,41 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
           }}
         />
       </header>
+
+      {several && (
+        <div role="tablist" aria-label="Parts" className="flex shrink-0 gap-1 overflow-x-auto border-b px-2 py-1.5">
+          {parts.map((p, i) => {
+            const selected = p === shown;
+            return (
+              <button
+                key={p.part_id ?? i}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                title={`${p.name} · ${p.params.board}`}
+                onClick={() => setPartId(p.part_id ?? null)}
+                className={cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  selected ? "bg-accent font-medium" : "text-muted-foreground hover:bg-accent/50",
+                )}
+              >
+                <span
+                  aria-hidden
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    p.overall === "fail" ? "bg-destructive" : p.overall === "warn" ? "bg-warning" : "bg-success",
+                  )}
+                />
+                {p.label ?? `Part ${i + 1}`}
+                {(p.quantity ?? 1) > 1 && <span className="text-muted-foreground">× {p.quantity}</span>}
+              </button>
+            );
+          })}
+          <span className="ml-auto self-center px-1 text-[11px] text-muted-foreground">
+            Export of several parts comes next
+          </span>
+        </div>
+      )}
 
       {exportOpen && design && (
         <ExportBar
@@ -263,7 +405,8 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
           key={`form-${design?.id ?? "new"}`}
           info={info}
           initial={design?.params}
-          onCreated={(d) => void showDesign({ kind: "design", design: d, origin: "form" })}
+          context={context}
+          onCreated={(d, ctx) => void showDesign({ kind: "design", design: d, origin: "form" }, ctx)}
         />
       )}
 
@@ -343,8 +486,8 @@ export function PreviewPane({ width, source, info, sessionId, onPreview }: Props
           </AlertDescription>
         </Alert>
       )}
-      {design && <Summary design={design} />}
-      {design && <Checks design={design} />}
+      {shown && <Summary design={shown} />}
+      {shown && <Checks design={shown} designChecks={design?.design_checks ?? []} />}
 
       <footer className="flex h-7 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t px-3 text-[11px] text-muted-foreground tabular-nums">
         {doc && (
@@ -559,19 +702,24 @@ const SHOWN_LABEL: ReadonlySet<CheckStatus> = new Set(["stale", "unavailable", "
 /** Statuses that need no attention: they don't count against "n/m pass". */
 const QUIET: ReadonlySet<CheckStatus> = new Set(["pass", "info", "not_applicable"]);
 
-function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind: "design" }>["design"]> }) {
-  const [open, setOpen] = useState(design.overall === "fail");
+function Checks({ design, designChecks }: { design: Design; designChecks: CheckResult[] }) {
+  // The part's checks, then the design's own (fit links, groups), which block export too.
+  const checks = [...designChecks, ...design.checks];
+  const overall: Design["overall"] = designChecks.some((c) => c.status === "fail" || c.status === "stale")
+    ? "fail"
+    : design.overall;
+  const [open, setOpen] = useState(overall === "fail");
   useEffect(() => {
-    if (design.overall === "fail") setOpen(true);
-  }, [design.id, design.overall]);
+    if (overall === "fail") setOpen(true);
+  }, [design.id, overall]);
   // info and not_applicable don't take part; everything else either passed or needs a look.
-  const counted = design.checks.filter((c) => c.status !== "info" && c.status !== "not_applicable");
+  const counted = checks.filter((c) => c.status !== "info" && c.status !== "not_applicable");
   const passed = counted.filter((c) => c.status === "pass").length;
   return (
     <Collapsible className="shrink-0 border-t" open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger className="group flex h-9 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
-        <Badge variant={STATUS_BADGE[design.overall]} className="uppercase tracking-wide">
-          {design.overall}
+        <Badge variant={STATUS_BADGE[overall]} className="uppercase tracking-wide">
+          {overall}
         </Badge>
         <span className="font-medium">Checks</span>
         <span className="text-muted-foreground">
@@ -582,7 +730,7 @@ function Checks({ design }: { design: NonNullable<Extract<PreviewSource, { kind:
       </CollapsibleTrigger>
       <CollapsiblePanel>
         <ul className="scroll-thin flex max-h-56 flex-col gap-1.5 overflow-y-auto px-3 pt-0.5 pb-3">
-          {design.checks.map((c) => (
+          {checks.map((c) => (
             <li key={c.id} className="flex items-start gap-2 text-xs leading-snug">
               <span className="flex h-[1lh] items-center" aria-hidden>
                 {CHECK_ICON[c.status]}
@@ -633,7 +781,9 @@ function defaultOptions(style: StyleInfo | undefined): Record<string, OptionValu
 function QuickBox(props: {
   info: EngineInfo;
   initial?: BoxParams;
-  onCreated: (d: Awaited<ReturnType<typeof request<"box.create">>>) => void;
+  /** Where the form was submitted from: captured when the designer presses Generate. */
+  context: () => ShowContext;
+  onCreated: (d: Awaited<ReturnType<typeof request<"box.create">>>, ctx: ShowContext) => void;
 }) {
   const uid = useId();
   const fid = (name: string) => `${uid}-${name}`;
@@ -735,8 +885,9 @@ function QuickBox(props: {
         setError(null);
         setP(params);
         setBusy(true);
+        const ctx = props.context(); // the session and design the designer is looking at now
         request("box.create", params)
-          .then(props.onCreated)
+          .then((d) => props.onCreated(d, ctx))
           .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
           .finally(() => setBusy(false));
       }}

@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from . import __version__, designs, models
 from .agent import Agent
 from .designs import BoxParams
+from .designstore import DesignChanged, DesignStore, new_design
 from .settings import SettingsStore
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 APP_ERROR = -32000
 EXPORT_EXISTS = -32001  # the UI offers "Replace" for this one
+DESIGN_CHANGED = -32002  # the UI refreshes the design it shows
 
 
 class RpcError(Exception):
@@ -43,11 +45,14 @@ class Server:
         self._out = out
         self._write_lock = threading.Lock()
         self.settings = settings or SettingsStore()
-        self.agent = Agent(self.settings, self.emit)
+        self.store = DesignStore(self.emit)
+        self.agent = Agent(self.settings, self.emit, self.store)
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rpc")
         self.methods: dict[str, Callable[[dict[str, Any]], Any]] = {
             "engine.info": self._info,
             "box.create": lambda p: designs.create_box(BoxParams.model_validate(p)),
+            "design.replace": self._design_replace,
+            "design.get": self._design_get,
             "box.export": self._export,
             "job.open": lambda p: designs.open_job(p.get("record")),
             "settings.get": lambda p: self.settings.public(),
@@ -101,6 +106,11 @@ class Server:
         except ValidationError as exc:
             reply = {"jsonrpc": "2.0", "id": req_id,
                      "error": {"code": INVALID_PARAMS, "message": _validation_message(exc)}}
+        except DesignChanged:
+            reply = {"jsonrpc": "2.0", "id": req_id, "error": {
+                "code": DESIGN_CHANGED,
+                "message": "The design changed since this was shown (the chat updated it). Showing the current "
+                           "design; check it, then try again."}}
         except designs.ExportExists as exc:
             reply = {"jsonrpc": "2.0", "id": req_id,
                      "error": {"code": EXPORT_EXISTS, "message": str(exc), "data": {"files": exc.names}}}
@@ -124,8 +134,29 @@ class Server:
     def _info(self, _: dict[str, Any]) -> dict[str, Any]:
         return {"version": __version__, **designs.catalog(), "settings": self.settings.public()}
 
-    def _export(self, p: dict[str, Any]) -> dict[str, Any]:
+    def _design_replace(self, p: dict[str, Any]) -> dict[str, Any]:
+        """The form's Generate and a reopened job: a new design for the session, made from one
+        standard part. The designer's own action, so it doesn't wait on a revision."""
         params = BoxParams.model_validate(p.get("params") or {})
+        expected: Any = "any"
+        if "expected" in p:  # what the form showed when the designer pressed Generate (null: nothing)
+            e = p["expected"]
+            if e is not None and not (isinstance(e, dict) and isinstance(e.get("design_id"), str)
+                                      and isinstance(e.get("revision"), int)):
+                raise RpcError(INVALID_PARAMS, "expected must be {design_id, revision} or null")
+            expected = None if e is None else (e["design_id"], e["revision"])
+        return self.agent.set_design(_str(p, "session_id"), params, expected)
+
+    def _design_get(self, p: dict[str, Any]) -> dict[str, Any] | None:
+        cur = self.store.current(_str(p, "session_id"))
+        return self.store.payload(cur) if cur else None
+
+    def _export(self, p: dict[str, Any]) -> dict[str, Any]:
+        if "design_id" in p:  # the export bar: exactly the snapshot it showed
+            snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), p.get("revision"))
+            params = self.store.export_params(snap)  # the design's own checks block it too
+        else:
+            params = BoxParams.model_validate(p.get("params") or {})
         filename = p.get("filename")
         if filename is not None and not isinstance(filename, str):
             raise RpcError(INVALID_PARAMS, "filename must be a string")
@@ -149,6 +180,7 @@ class Server:
         return self.settings.public()
 
     def _chat_set_design(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Older name for design.replace."""
         self.agent.set_design(_str(p, "session_id"), BoxParams.model_validate(p.get("params") or {}))
         return {"ok": True}
 

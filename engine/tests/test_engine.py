@@ -12,6 +12,7 @@ from dieline_engine.boards import get_board
 from dieline_engine.cf2 import read_cf2, segments_equal, write_cf2
 from dieline_engine.checks import overall, run_checks
 from dieline_engine.designs import BoxParams
+from dieline_engine.designstore import new_design
 from dieline_engine.geometry import Dieline, LineType
 from dieline_engine.rpc import Server
 from dieline_engine.settings import SettingsStore
@@ -300,7 +301,8 @@ def test_agent_tool_round_trip(monkeypatch, tmp_path):
     assert [m["role"] for m in s.messages] == ["user", "assistant", "tool", "user", "assistant"]
     assert s.messages[2]["tool_call_id"] == "t1"
     assert s.messages[1]["tool_calls"][0]["function"]["name"] == "create_box"
-    assert s.current is not None
+    cur = _.store.current("s1")
+    assert cur is not None and s.seen == (cur.id, cur.revision)
 
 
 def test_agent_refusal_discards_turn_but_keeps_the_shown_design(monkeypatch, tmp_path):
@@ -308,10 +310,11 @@ def test_agent_refusal_discards_turn_but_keeps_the_shown_design(monkeypatch, tmp
         NS(stop_reason="tool_use", content=[_tool_use("t1", "create_box", BOX)]),
         NS(stop_reason="refusal", content=[]),
     ]
-    _, s, events, _ = _run(monkeypatch, tmp_path, responses)
+    ag, s, events, _ = _run(monkeypatch, tmp_path, responses)
     assert s.messages == []
     # The preview already shows the design, so it stays current and the model is told next turn.
-    assert s.current is not None and s.current.length == 14 and "interrupted" in s.note
+    cur = ag.store.current("s1")
+    assert cur is not None and cur.parts[0].params.length == 14 and "interrupted" in s.note
     assert any(e["type"] == "chat.error" and "declined" in e["message"] for e in events)
     assert events[-1] == {"type": "chat.turn_end", "session_id": "s1", "stop_reason": "error"}
 
@@ -379,7 +382,7 @@ def test_stopped_turn_is_abandoned(monkeypatch, tmp_path):
     # The worker finishing later (e.g. after a stalled read) changes nothing and says nothing.
     t.cancel.clear()
     ag._run_turn(s, t, "sk-or-v1-test", ag.settings.settings)
-    assert len(events) == 1 and s.messages == [] and s.current is None
+    assert len(events) == 1 and s.messages == [] and ag.store.current("s1") is None
 
 
 def test_cancel_during_create_does_not_keep_an_unshown_design(monkeypatch, tmp_path):
@@ -396,7 +399,7 @@ def test_cancel_during_create_does_not_keep_an_unshown_design(monkeypatch, tmp_p
     monkeypatch.setattr(designs, "create_box", create_then_cancel)
     with pytest.raises(agent_mod.TurnCancelled):
         ag._dispatch(t, "create_box", BOX)
-    assert s.current is None and s.note is None
+    assert ag.store.current("s1") is None and s.note is None
     assert [event["type"] for event in events] == ["chat.turn_end"]
 
 
@@ -679,7 +682,8 @@ def test_ui_and_agent_exports_compete_for_one_name(tmp_path):
     store.update({"output_dir": str(cad), "dxf_dir": str(samples)})
     server = Server(io.StringIO(), store)
     _, turn = _start(server.agent)
-    turn.current = BoxParams.model_validate(BOX)
+    made = server.store.mutate("s1", lambda cur: new_design(BoxParams.model_validate(BOX)))
+    turn.binding = (made["design_id"], made["revision"])
     gate = Barrier(2)
 
     def attempt(export):
@@ -710,7 +714,8 @@ def test_stopped_agent_export_cannot_publish_after_staging(tmp_path, monkeypatch
     store.update({"output_dir": str(cad)})
     ag = agent_mod.Agent(store, lambda e: None)
     s, t = _start(ag)
-    t.current = BoxParams.model_validate(BOX)
+    made = ag.store.mutate("s1", lambda cur: new_design(BoxParams.model_validate(BOX)))
+    t.binding = (made["design_id"], made["revision"])
     write = Path.write_bytes
 
     def stop_after_stage(path, data):
@@ -759,7 +764,7 @@ def test_set_design_syncs_chat_with_the_preview(tmp_path):
     p = BoxParams(style="hsc-gl", length=20, width=10, depth=8)
     ag.set_design("s9", p)
     s = ag.sessions["s9"]
-    assert s.current == p and "hsc-gl" in s.note
+    assert ag.store.current("s9").parts[0].params == p and "hsc-gl" in ag._design_note(s)
 
 
 def test_preflight_checks():
