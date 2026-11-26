@@ -495,3 +495,30 @@ def test_mm_parts_take_artwork_sizes_in_their_units():
     d = designs.build(p)
     s = d.extras["artwork"][0].segs()[0]
     assert d.units == "in" and s.radius == pytest.approx(1.0, abs=1e-5) and s.type == LineType.CUT
+
+
+def test_dxf_arcs_on_a_mirrored_extrusion_and_the_import_limits():
+    arc = "0\nARC\n10\n2\n20\n0\n40\n1\n50\n0\n51\n90\n210\n0\n220\n0\n230\n-1\n"
+    p = ai.parse_dxf(_dxf(arc))
+    a = p.subs[0].pieces[0]
+    # The extrusion points down Z: x is mirrored, and the counter-clockwise arc runs clockwise.
+    assert a.center == pytest.approx((-2, 0)) and a.clockwise
+    assert a.start == pytest.approx((-3, 0)) and a.end == pytest.approx((-2, 1))
+    with pytest.raises(ai.ImportRefused, match="MB"):
+        ai.parse("big.svg", b" " * (ai.MAX_FILE_BYTES + 1))
+    with pytest.raises(ai.ImportRefused, match="SVG or DXF"):
+        ai.parse("logo.png", b"x")
+    many = "".join(f"0\nLINE\n10\n{i}\n20\n0\n11\n{i}\n21\n1\n" for i in range(ai.MAX_ENTITIES + 1))
+    with pytest.raises(ai.ImportRefused, match="entities"):
+        ai.parse_dxf(_dxf(many))
+    wiggle = asrc.Sub([asrc.Prim((i * 0.01, 0.0), ((i + 1) * 0.01, (i % 2) * 0.01)) for i in range(6000)], False,
+                      "crease")
+    with pytest.raises(asrc.SourceError, match="segments"):
+        asrc.finish([wiggle], 1.0, declared_closed=False)
+
+
+def test_stencil_islands_fix_is_reported_as_stencil_breaks():
+    out, d = made(ring(2, "stencil"))
+    assert out["features"][0]["islands"][0]["status"] == "stencil"
+    assert "stencil breaks" in checks(out)["artwork_a1_islands_handled"]["message"]
+    assert validate(d).islands == []

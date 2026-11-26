@@ -34,6 +34,7 @@ try {
         --name dieline-engine `
         --paths src `
         --collect-submodules keyring.backends `
+        --hidden-import defusedxml.ElementTree `
         --copy-metadata keyring `
         --workpath $WorkDir `
         --specpath $WorkDir `
