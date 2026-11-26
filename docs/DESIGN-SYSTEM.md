@@ -1,6 +1,6 @@
 # Design system: features, partitions, the panel builder and artwork
 
-Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Not built yet. For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
+Status: spec, revision 5 (2026-11-25), after four rounds of Sol 6.2 and Gemini Neon review. Phase 1 (foundations) and phase 3 (partitions, 2026-11-26) are built; see [Phases](#phases) and, for what phase 3 decided where this spec was open, [Partitions as built](#partitions-as-built). For the reasons behind the engine see [CONTEXT.md](CONTEXT.md), for the code see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Today the app draws four R&L standards and nothing else. Designers also need handholes, vents, extra scores, partitions, pads, inserts, trays, wraps and one-off changes to a standard. About half of this year's R&L designs were drawn by hand rather than from a standard, so this is most of the work.
 
@@ -1037,7 +1037,7 @@ If regenerating fails, the as-exported snapshot is still viewable.
    - perforations and tear strips, with rule specs and the capability table
    - **before** perf, reverse score or partial cut can export: an import and cut fixture covering obround and circular arcs, mirrored arcs, perf, reverse score and mixed pointage, checked in ArtiosCAD and on the sample table
    - feature checks, machine capability fields, and the agent tools
-3. **Partitions**
+3. **Partitions** (built 2026-11-26)
    - the crossing model, all four input modes and `choose_layout`
    - the checks, the fit and stack checks plus the tools that set fit links (the links themselves exist from phase 1), and part tabs
 4. **Artwork**
@@ -1053,9 +1053,29 @@ If regenerating fails, the as-exported snapshot is still viewable.
 
 Each phase gets the two-reviewer review (Sol 6.2 and Gemini Neon) before it's committed.
 
+## Partitions as built
+
+Where this spec left a choice open, phase 3 took the safest reading:
+
+- **Slots belong to the outline.** A slot is a boundary operation, like an edge notch: the piece's outline stays one closed cut that runs round each slot, so its mouth joins the outline by construction. A slot drawn as its own cut ending on an unbroken edge would be a declared contact, but its slug would stay as a separate piece of board (a test shows it).
+- **Round bottoms are compensated.** The slot is drawn deeper by what its round bottom loses, so its *usable* depth (as wide as the mating board) is still H/2 + 1/32. The interlock check uses usable depths.
+- **Unequal heights** (pieces mode): slot depths come from the shorter piece's height h. The bottom-slotted piece gets h/2 + 1/32, the top-slotted one H − h/2 + 1/32, so they still overlap by 1/16.
+- **Lead-ins** shrink so neighbouring mouths and the piece ends keep a rim of max(1/4", 2 × CAL), and to at most half the slot's straight wall. If even a square mouth can't keep the rim, it warns.
+- **Facing.** Pieces are drawn from their start end, nearest the box's first wall. Pieces mode says which end its slot positions are measured from (`from: start | end`).
+- **Parts per slot plan.** Pieces on one axis differ only when their boards do (`boards_long` / `boards_short` lists one per piece). The first plan keeps the role `long` (or `short`), the others are `long_2`, `long_3`, … so `replace_set` keeps matching the main pieces.
+- **A part's parameters** are the whole set's grid plus its role, so any part rebuilds alone with today's rules. `update_part` can only relabel a piece; the set changes through `create_partition` with `replace_set`.
+- **Plain strips (1 × n)** come from `box_cells` or `cell_sizes` with `confirm_degenerate`. Pieces mode refuses them: strips have no slot positions to place them by.
+- **Height.** When the box's inside depth isn't known, the height check is `unavailable`.
+- **Product mode.** Piece height defaults to the item height. A layout is listed when it has fewer spare cells than one row; `1 × n` layouts come last and need `confirm_degenerate`. Up to six are offered, by spare cells, then estimated sheet usage.
+- **Candidates** are tied to the whole design's id and revision (stricter than the container part's revision), the board values of every board in them, and `partition-rules-1`. Their ids (`c1`, `c2`, …) are never reused in a chat. Each designer message gets an id (`m<turn>`), shown to the model as `[message m3]`. `choose_layout` needs a message sent after the cards that names the candidate's id as a word. A card click commits as the designer's own change (`layout.choose`), and the model is told on its next turn.
+- **Default action.** `create_partition` adds the set when `contained_in` is given and otherwise replaces the design. `replace_set` takes the box size from the set's existing fit link when no `contained_in` is given.
+- **Fit.** A standard's outside is inside + 2 × CAL. A set's outside is its long and short piece lengths and its height. A stack is its widest tier, with the tiers' heights plus pads × pad CAL. Only "taller than the inside depth" warns upwards. A set that doesn't go in warns rather than fails (draw and warn). A container must be a box part. A group as a container, or a link to one piece of a set, is `unavailable`.
+- **Stacks** keep their pads in the group (`extra: {pads, pad_board}`); pads become parts with the panel builder.
+- **Check results** keep phase 1's `{id, status, message}`; the category is the id's prefix (`partition_`, `fit_`, `stack_`).
+
 ## Open questions
 
-- R&L's real partition allowances: slot width and depth, clearance and height. Needs CF2/DXF exports of two or three real sets.
+- R&L's real partition allowances: slot width and depth, clearance and height. Needs CF2/DXF exports of two or three real sets. Measured so far (2026-11-26), from one sample-table DXF of a 12-cell (4 × 3) set: pieces about 10" and 7" long and 2 3/4" tall, drawn two-up on shared cut lines; slots 3/16" wide at an equal pitch, square bottomed, no lead-ins. On both piece types the slots run about two-thirds of the height and end in a barbed lock, so it's a locking variant, not a plain half slot. Its board and box sizes aren't known, so nothing was calibrated from it; a test builds a comparable set and checks the pitch and that the width is within 1/32 of 3/16. The other sample DXF named for this is an RSC, not a partition.
 - The die maker's minimum bend radius per rule, minimum segment and web, ejection limits, and how they handle narrow round-bottom slots.
 - CF2 codes for perforation (with its cut/tie), reverse crease and partial cut, plus mixed pointage, and AOLCUT's DXF colours for them. The shop's File_Box_1 uses a dedicated 3/16 × 3/16 perf rule.
 - How R&L draws hand flaps and angled hand flaps: relief nicks, double crease, angles.

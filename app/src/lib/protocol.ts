@@ -26,6 +26,98 @@ export interface BoxParams {
   options?: Record<string, OptionValue>;
 }
 
+/** One piece of a slotted partition set: the set's whole spec plus which piece it is (engine partitions.py). */
+export interface PartitionParams {
+  style: "partition-slotted";
+  units: "in" | "mm";
+  board: string;
+  role: string;
+  /** The set's grid, rules and the inputs it came from (inches). */
+  set: Record<string, unknown>;
+}
+
+/** A part's parameters: a standard box or a partition piece. */
+export type PartParams = BoxParams | PartitionParams;
+
+export function isPartitionParams(p: PartParams | null | undefined): p is PartitionParams {
+  return !!p && p.style === "partition-slotted";
+}
+
+export interface PartitionSlot {
+  centre: number;
+  width: number;
+  depth: number;
+  usable_depth: number;
+  from: "top" | "bottom";
+  bottom: "round" | "square";
+  lead_in: number;
+  mating_board: string;
+}
+
+/** Facts about a partition piece (summary of a part whose params are PartitionParams). Inches. */
+export interface PartitionSummary {
+  style: "partition-slotted";
+  board: string;
+  board_source: BoardSource;
+  cal_in: number;
+  calibrated: false;
+  role: string;
+  axis: "long" | "short";
+  quantity_per_set: number;
+  piece_in: { length: number; height: number };
+  end_legs_in: [number, number];
+  slots_in: PartitionSlot[];
+  flute: "vertical" | "horizontal";
+  blank_in: { width: number; height: number };
+  set: {
+    input_mode: string;
+    cells: string;
+    cells_long_in: number[];
+    cells_short_in: number[];
+    box_inside_in: { long: number; short: number };
+    set_outside_in: { long: number; short: number; height: number };
+    depth_in: number | null;
+    pieces: { role: string; axis: string; quantity: number; board: string; length_in: number; height_in: number }[];
+    play_in: number;
+    slot_dir: "long_top" | "short_top";
+  };
+}
+
+export function isPartitionSummary(s: unknown): s is PartitionSummary {
+  return typeof s === "object" && s !== null && (s as { style?: unknown }).style === "partition-slotted";
+}
+
+/** A group of parts: a partition set, a stack of sets, a telescoping pair, an assembly. */
+export interface DesignGroup {
+  id: string;
+  kind: "partition_set" | "telescoping" | "stack" | "assembly" | string;
+  members: { ref: string; role: string; quantity: number }[];
+  extra?: Record<string, unknown>;
+}
+
+/** The container's inside is checked against the contained's outside. */
+export interface FitLinkInfo {
+  id: string;
+  container: string;
+  contained: string;
+}
+
+/** A product-mode layout the designer can choose (create_partition with input_mode product). */
+export interface LayoutCandidate {
+  id: string;
+  cells: string;
+  cells_long: number;
+  cells_short: number;
+  spare_cells: number;
+  degenerate: boolean;
+  item_along_long_in: number;
+  cell_in: { long: number; short: number };
+  set_outside_in: { long: number; short: number; height: number };
+  box_inside_in: { long: number; short: number };
+  pieces: { role: string; quantity: number; length_in: number; height_in: number; board: string }[];
+  sheet_usage_sqft_estimate: number;
+}
+
 /** Facts about a generated design. All lengths in inches. */
 export interface DesignSummary {
   style: string;
@@ -61,7 +153,7 @@ export interface DesignSummary {
 export interface Design {
   id: string;
   name: string;
-  params: BoxParams;
+  params: PartParams;
   cf2: string;
   checks: CheckResult[];
   overall: OverallStatus;
@@ -75,6 +167,8 @@ export interface Design {
   parts?: DesignPart[];
   /** Checks of the design as a whole (fit links, groups). */
   design_checks?: CheckResult[];
+  groups?: DesignGroup[];
+  links?: FitLinkInfo[];
 }
 
 /** One part of a design: a box with its own id, label and quantity. */
@@ -182,7 +276,7 @@ export interface JobPart {
   label: string;
   quantity: number;
   piece_no: string | null;
-  params: BoxParams;
+  params: PartParams;
   /** What regenerating with today's rules changed for this part. */
   changes: string[];
 }
@@ -328,6 +422,11 @@ export interface Methods {
   "export.recover": [Record<string, never>, { notes: string[] }];
   "job.open": [{ record: unknown; mode?: "exported" | "regenerate" }, JobOpenResult];
   "chat.set_design": [{ session_id: string; params: BoxParams }, { ok: true }];
+  /** The designer clicked a layout candidate's card: commit it (refused once it has expired). */
+  "layout.choose": [
+    { session_id: string; candidate_id: string; action?: "add" | "replace_design" | "replace_set"; set_id?: string },
+    Design,
+  ];
   "settings.get": [Record<string, never>, Settings];
   "models.list": [{ refresh?: boolean }, { models: OpenRouterModel[] }];
   "settings.update": [SettingsUpdate, Settings];

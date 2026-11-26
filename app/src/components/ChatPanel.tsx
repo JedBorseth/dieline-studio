@@ -19,7 +19,8 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 
 import { formatToolLabel } from "../lib/chat";
-import type { OverallStatus, Settings } from "../lib/protocol";
+import type { LayoutCandidate, OverallStatus, Settings } from "../lib/protocol";
+import { fmtIn } from "../lib/units";
 import type { ChatItem, Session } from "../lib/store";
 import { cn } from "../lib/utils";
 import { Tip } from "./Tip";
@@ -38,6 +39,8 @@ interface Props {
   onSend: (text: string) => void;
   onStop: () => void;
   onOpenSettings: () => void;
+  /** The designer clicked a layout candidate's card; rejects with the engine's reason (e.g. expired). */
+  onChooseLayout?: (candidateId: string) => Promise<void>;
 }
 
 const SUGGESTIONS = [
@@ -52,7 +55,7 @@ export const STATUS_BADGE: Record<OverallStatus, "success" | "warning" | "error"
   fail: "error",
 };
 
-export function ChatPanel({ session, settings, engineError, onSend, onStop, onOpenSettings }: Props) {
+export function ChatPanel({ session, settings, engineError, onSend, onStop, onOpenSettings, onChooseLayout }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedToBottomRef = useRef(true);
   const [lightbox, setLightbox] = useState<{ src: string; title: string } | null>(null);
@@ -111,7 +114,9 @@ export function ChatPanel({ session, settings, engineError, onSend, onStop, onOp
           {session.items.length === 0 ? (
             <EmptyState busy={session.busy} onSend={handleSend} />
           ) : (
-            session.items.map((item) => <Item key={item.id} item={item} onInspectImage={setLightbox} />)
+            session.items.map((item) => (
+              <Item key={item.id} item={item} onInspectImage={setLightbox} onChooseLayout={onChooseLayout} />
+            ))
           )}
           {session.busy && (
             <div className="flex items-center gap-2 text-muted-foreground text-sm">
@@ -168,9 +173,11 @@ function EmptyState({ busy, onSend }: { busy: boolean; onSend: (text: string) =>
 const Item = memo(function Item({
   item,
   onInspectImage,
+  onChooseLayout,
 }: {
   item: ChatItem;
   onInspectImage: (img: { src: string; title: string }) => void;
+  onChooseLayout?: (candidateId: string) => Promise<void>;
 }) {
   switch (item.kind) {
     case "user":
@@ -204,7 +211,14 @@ const Item = memo(function Item({
         </div>
       );
     case "tool":
-      return <ToolCard item={item} onInspectImage={onInspectImage} />;
+      return (
+        <>
+          <ToolCard item={item} onInspectImage={onInspectImage} />
+          {item.name === "create_partition" && item.status === "done" && onChooseLayout && (
+            <LayoutCards result={item.result} onChoose={onChooseLayout} />
+          )}
+        </>
+      );
     case "notice":
       return (
         <Alert variant={item.tone === "error" ? "error" : "info"} controlAlignment="first-line">
@@ -214,6 +228,82 @@ const Item = memo(function Item({
       );
   }
 });
+
+/** Product-mode layout candidates as cards: the designer's click is the normal way to choose one. */
+function LayoutCards({ result, onChoose }: { result: unknown; onChoose: (candidateId: string) => Promise<void> }) {
+  const candidates = (result as { candidates?: LayoutCandidate[] } | undefined)?.candidates;
+  const [busy, setBusy] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const choose = async (id: string) => {
+    setBusy(id);
+    setError(null);
+    try {
+      await onChoose(id);
+      setChosen(id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <div className="flex flex-col gap-2" role="group" aria-label="Layout candidates">
+      <div className="grid gap-2 sm:grid-cols-2">
+        {candidates.map((c) => (
+          <div
+            key={c.id}
+            className={cn(
+              "flex flex-col gap-1.5 rounded-lg border bg-card p-3 text-xs shadow-xs/5",
+              chosen === c.id && "border-success/60",
+            )}
+          >
+            <div className="flex items-baseline gap-2">
+              <span className="font-mono text-muted-foreground">{c.id}</span>
+              <span className="font-medium text-sm">{c.cells.replace(" x ", " × ")} cells</span>
+              {c.spare_cells > 0 && (
+                <span className="text-muted-foreground">
+                  {c.spare_cells} spare
+                </span>
+              )}
+              {c.degenerate && <Badge variant="warning">no slots</Badge>}
+            </div>
+            <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 tabular-nums">
+              <dt className="text-muted-foreground">Cell</dt>
+              <dd>
+                {fmtIn(c.cell_in.long)} × {fmtIn(c.cell_in.short)} in
+              </dd>
+              <dt className="text-muted-foreground">Box inside</dt>
+              <dd>
+                {fmtIn(c.box_inside_in.long)} × {fmtIn(c.box_inside_in.short)} in
+              </dd>
+              <dt className="text-muted-foreground">Pieces</dt>
+              <dd>
+                {c.pieces.map((p) => `${p.quantity} × ${fmtIn(p.length_in)}`).join(", ")} in
+              </dd>
+              <dt className="text-muted-foreground">Sheet</dt>
+              <dd>≈ {c.sheet_usage_sqft_estimate.toFixed(2)} sq ft (estimate)</dd>
+            </dl>
+            <Button
+              size="xs"
+              variant={chosen === c.id ? "outline" : "secondary"}
+              disabled={busy !== null || chosen !== null}
+              onClick={() => void choose(c.id)}
+            >
+              {busy === c.id ? <Spinner size="sm" /> : null}
+              {chosen === c.id ? "Chosen" : "Use this layout"}
+            </Button>
+          </div>
+        ))}
+      </div>
+      {error && <p className="text-destructive-foreground text-xs wrap-anywhere">{error}</p>}
+      <p className="text-muted-foreground text-[11px]">
+        Not calibrated: partition allowances are industry defaults. Cards expire when the design changes.
+      </p>
+    </div>
+  );
+}
 
 function ToolCard({
   item,

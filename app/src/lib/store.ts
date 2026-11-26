@@ -68,6 +68,8 @@ export type Action =
   | { type: "select_session"; id: string }
   | { type: "user_message"; sessionId: string; text: string }
   | { type: "send_failed"; sessionId: string; message: string }
+  /** A note in a session's chat (e.g. a layout card that couldn't be chosen). */
+  | { type: "notice"; sessionId: string; tone: "error" | "info"; text: string }
   /** Show a source in a session's preview. sessionId: the session that asked (its reply may land after a switch). */
   | { type: "preview"; source: PreviewSource; sessionId?: string }
   | { type: "engine_ready"; ready: boolean };
@@ -175,6 +177,8 @@ export function reducer(state: State, action: Action): State {
       }));
     case "send_failed":
       return updateSession(state, action.sessionId, (s) => ({ ...notice(s, "error", action.message), busy: false }));
+    case "notice":
+      return updateSession(state, action.sessionId, (s) => notice(s, action.tone, action.text));
     case "preview": {
       // Goes to the session that asked, never to whichever is on screen when the reply lands.
       const target = action.sessionId ?? state.activeId;

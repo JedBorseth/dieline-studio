@@ -33,6 +33,8 @@ import {
   type ExportFormat,
   type ExportPlan,
   type ExportResult,
+  isPartitionParams,
+  isPartitionSummary,
   type JobPart,
   type SampleTable,
   type OptionValue,
@@ -218,11 +220,17 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
     // Replacing a design with several parts loses the others: ask first, and only in the session it
     // started in. If the designer has moved to another chat meanwhile, the replacement is dropped.
     if (!latest(ctx.sid, ctx.seq)) return; // the designer did something newer in that session
-    if (!confirmed && baseParts > 1 && next.origin === "form") {
+    // A partition set (or any group) isn't one plain standard part either.
+    const special = (ctx.base?.parts ?? (ctx.base ? [ctx.base] : [])).some((p) => isPartitionParams(p.params)) ||
+      (ctx.base?.groups?.length ?? 0) > 0;
+    if (!confirmed && (baseParts > 1 || special) && next.origin === "form") {
       if (ctx.sid !== sessionIdRef.current) return;
       setStatus({
         tone: "error",
-        text: `Replace the current design? Its ${baseParts - 1} other part${baseParts > 2 ? "s" : ""} will be lost.`,
+        text:
+          baseParts > 1
+            ? `Replace the current design? Its ${baseParts - 1} other part${baseParts > 2 ? "s" : ""} will be lost.`
+            : "Replace the current design? Its partition set will be lost.",
         action: { label: "Replace", run: () => void showDesign(next, { ...ctx, seq: bump(ctx.sid) }, true) },
       });
       return;
@@ -241,7 +249,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         session_id: sid,
         ...(next.job
           ? { parts: next.job.parts, groups: next.job.groups, links: next.job.links }
-          : { params: next.design.params }),
+          : { params: next.design.params as BoxParams }),
         expected,
       });
     } catch (err) {
@@ -325,7 +333,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
   const exportTarget = (target: Design, sid: string) =>
     target.design_id !== undefined && target.revision !== undefined
       ? { session_id: sid, design_id: target.design_id, revision: target.revision }
-      : { params: target.params };
+      : { params: target.params as BoxParams };
 
   /** Why the shown design can't be saved from its parameters alone: the engine restarted and no longer
    *  holds it, and it has more than one part (or quantity) or design checks those parameters would skip. */
@@ -546,6 +554,10 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         />
       </header>
 
+      {design?.design_checks && design.design_checks.length > 0 && (
+        <DesignChecks checks={design.design_checks} />
+      )}
+
       {several && (
         <div role="tablist" aria-label="Parts" className="flex shrink-0 gap-1 overflow-x-auto border-b px-2 py-1.5">
           {parts.map((p, i) => {
@@ -572,6 +584,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
                 />
                 {p.label ?? `Part ${i + 1}`}
                 {(p.quantity ?? 1) > 1 && <span className="text-muted-foreground">× {p.quantity}</span>}
+                <span className="text-muted-foreground">· {p.params.board}</span>
               </button>
             );
           })}
@@ -637,7 +650,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         <QuickBox
           key={`form-${design?.id ?? "new"}`}
           info={info}
-          initial={design?.params}
+          initial={isPartitionParams(design?.params) ? undefined : design?.params}
           context={context}
           onCreated={(d, ctx) => void showDesign({ kind: "design", design: d, origin: "form" }, ctx)}
         />
@@ -720,7 +733,7 @@ export function PreviewPane({ width, source, info, sessionId, sessionDesign, onP
         </Alert>
       )}
       {shown && <Summary design={shown} />}
-      {shown && <Checks design={shown} designChecks={design?.design_checks ?? []} />}
+      {shown && <Checks design={shown} designChecks={[]} />}
 
       <footer className="flex h-7 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t px-3 text-[11px] text-muted-foreground tabular-nums">
         {doc && (
@@ -969,7 +982,114 @@ function ExportBar({
 
 const BOARD_SOURCE_LABEL = { artioscad: "", derived: " (inferred)", nominal: " (nominal)" };
 
+/** The design's own checks (partition sets, fit links, stacks), above the part tabs: they're about
+ *  the parts together, and a failing one blocks the export whichever part is shown. */
+function DesignChecks({ checks }: { checks: CheckResult[] }) {
+  const statuses = new Set(checks.map((c) => c.status));
+  const overall: Design["overall"] =
+    statuses.has("fail") || statuses.has("stale")
+      ? "fail"
+      : statuses.has("warn") || statuses.has("unavailable")
+        ? "warn"
+        : "pass";
+  const [open, setOpen] = useState(overall !== "pass");
+  useEffect(() => {
+    if (overall !== "pass") setOpen(true);
+  }, [overall]);
+  const counted = checks.filter((c) => c.status !== "info" && c.status !== "not_applicable");
+  const passed = counted.filter((c) => c.status === "pass").length;
+  return (
+    <Collapsible className="shrink-0 border-b" open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger className="group flex h-8 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+        <Badge variant={STATUS_BADGE[overall]} className="uppercase tracking-wide">
+          {overall}
+        </Badge>
+        <span className="font-medium">Design checks</span>
+        <span className="text-muted-foreground">
+          {passed}/{counted.length} pass · sets, fit and stacks
+        </span>
+        <span className="flex-1" />
+        <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsiblePanel>
+        <ul className="scroll-thin flex max-h-40 flex-col gap-1.5 overflow-y-auto px-3 pt-0.5 pb-2.5">
+          {checks.map((c) => (
+            <li key={c.id} className="flex items-start gap-2 text-xs leading-snug">
+              <span className="flex h-[1lh] items-center" aria-hidden>
+                {CHECK_ICON[c.status]}
+              </span>
+              <span className="sr-only">{CHECK_LABEL[c.status]}: </span>
+              <span className={cn("min-w-0 wrap-anywhere", QUIET.has(c.status) ? "text-muted-foreground" : "")}>
+                {c.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </CollapsiblePanel>
+    </Collapsible>
+  );
+}
+
+function PartitionSummaryRows({ design }: { design: Design }) {
+  const s = design.summary as unknown;
+  if (!isPartitionSummary(s)) return null;
+  const set = s.set;
+  const cells = (cs: number[]) =>
+    cs.every((c) => Math.abs(c - cs[0]) < 1e-6) ? `${cs.length} × ${fmtIn(cs[0])}` : cs.map(fmtIn).join(" · ");
+  const rows: [string, string][] = [
+    ["Piece", `${s.role} · ${fmtIn(s.piece_in.length)} × ${fmtIn(s.piece_in.height)} · × ${s.quantity_per_set} per set`],
+    ["Board", `${s.board} · CAL ${fmtIn(s.cal_in)}${BOARD_SOURCE_LABEL[s.board_source] ?? ""} · flute ${s.flute}`],
+    [
+      "Slots",
+      s.slots_in.length
+        ? s.slots_in
+            .map((x) => `${fmtIn(x.centre)} (${fmtIn(x.width)} × ${fmtIn(x.depth)}${x.bottom === "round" ? ", round" : ""})`)
+            .join(" · ") + ` from the ${s.slots_in[0].from}`
+        : "none",
+    ],
+    ["End legs", s.end_legs_in.map(fmtIn).join(" · ")],
+    ["Layout", `${set.cells.replace(" x ", " × ")} cells (${set.input_mode})`],
+    ["Cells long", cells(set.cells_long_in)],
+    ["Cells short", cells(set.cells_short_in)],
+    ["Box inside", `${fmtIn(set.box_inside_in.long)} × ${fmtIn(set.box_inside_in.short)}`],
+    [
+      "Set outside",
+      `${fmtIn(set.set_outside_in.long)} × ${fmtIn(set.set_outside_in.short)} × ${fmtIn(set.set_outside_in.height)}`,
+    ],
+    ["Pieces", set.pieces.map((p) => `${p.quantity} × ${p.role} ${fmtIn(p.length_in)}`).join(" · ")],
+  ];
+  return (
+    <Collapsible className="shrink-0 border-t">
+      <CollapsibleTrigger className="group flex h-9 w-full items-center gap-2 px-3 text-left text-xs outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+        <span className="font-medium">Sizes</span>
+        <span className="min-w-0 truncate text-muted-foreground">
+          Partition {s.role} · {fmtIn(s.piece_in.length)} × {fmtIn(s.piece_in.height)} in · not calibrated
+        </span>
+        <span className="flex-1" />
+        <ChevronRightIcon className="size-3.5 text-muted-foreground transition-transform group-data-panel-open:rotate-90" />
+      </CollapsibleTrigger>
+      <CollapsiblePanel>
+        <div className="scroll-thin max-h-52 overflow-y-auto">
+          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 px-3 pt-0.5 pb-3 text-xs tabular-nums">
+            {rows.map(([k, v]) => (
+              <div key={k} className="contents">
+                <dt className="text-muted-foreground">{k}</dt>
+                <dd className="min-w-0 wrap-anywhere">{v}</dd>
+              </div>
+            ))}
+          </dl>
+          <p className="px-3 pb-3 text-[11px] text-muted-foreground">
+            Slot positions from the piece's start end; installed clear cells; inches. Allowances are industry
+            defaults, not calibrated.
+          </p>
+        </div>
+      </CollapsiblePanel>
+    </Collapsible>
+  );
+}
+
 function Summary({ design }: { design: Design }) {
+  if (isPartitionSummary(design.summary as unknown)) return <PartitionSummaryRows design={design} />;
   const s = design.summary;
   if (!s.panels_in) return null;
   const rows: [string, string][] = [

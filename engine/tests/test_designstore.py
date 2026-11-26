@@ -140,7 +140,12 @@ def test_groups_and_stale_links():
                        links=(FitLink("f1", "p2", "p1"),))
 
     out = store.mutate("s", link)
-    assert out["groups"][0]["members"][1]["ref"] == "p2" and not out["design_checks"]
+    assert out["groups"][0]["members"][1]["ref"] == "p2"
+    # Phase 3's fit check runs on the live link: the lid's inside equals the base's outside
+    # (inside + 2 x CAL), so it's tight. Nothing is stale or failed.
+    fit = {c["id"]: c for c in out["design_checks"]}
+    assert fit["fit_f1"]["status"] == "warn" and "tight (0 in clearance)" in fit["fit_f1"]["message"]
+    assert not any(c["status"] in ("fail", "stale") for c in out["design_checks"])
     out = store.mutate("s", lambda cur: remove_part(cur, "lid"))
     assert out["groups"][0]["members"] == [{"ref": "p1", "role": "base", "quantity": 1}]
     assert out["design_checks"][0]["status"] == "stale" and out["overall"] == "fail"

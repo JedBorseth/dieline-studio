@@ -31,6 +31,8 @@
 
 **Next (2026-11-25):** custom designs: features (handholes, hand flaps, vents, perfs, tear strips, scores, notches), slotted partitions, a panel builder for one-offs, and cut-out artwork. Spec and phases: [DESIGN-SYSTEM.md](DESIGN-SYSTEM.md).
 
+**Progress (2026-11-26):** design-system phase 3 is built: slotted partition sets from four input modes (box and cells, cell sizes, pieces, or a product count with layout cards), their checks, fit links and stacks, and part tabs with design-level checks. Every partition is flagged "not calibrated" until real R&L sets are compared.
+
 ## Open questions
 
 - ~~Which box styles does the company use most?~~ From this year's designs: REG-GLIO-NX (RSC) by far, then REG_GLI_EXT, HSC_GL, MEATBOX wing-lock, Tube_Glued, die-cut trays, 5PW.
