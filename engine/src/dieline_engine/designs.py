@@ -98,11 +98,53 @@ class BoxParams(BaseModel):
             out.append(normalize(item, fid))
         return out
 
+    # Artwork (artwork.py): cut-outs and lettering placed on one face, each with a stable id (a1, a2, ...).
+    artwork: list[dict[str, Any]] = Field(default_factory=list, description="Artwork (see set_artwork)")
+    # Suspicious-artwork flags the designer acknowledged in the checks panel (never the agent):
+    # "<artwork id>:<flag>:<fingerprint of the artwork as drawn>".
+    acknowledged: list[str] = Field(default_factory=list, description="Designer acknowledgements")
+
+    @field_validator("artwork", mode="before")
+    @classmethod
+    def _artwork(cls, v: Any) -> list[dict[str, Any]]:
+        from .artwork import MAX_ARTWORK, normalize  # noqa: PLC0415
+
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            raise ValueError("artwork must be a list")
+        if len(v) > MAX_ARTWORK:
+            raise ValueError(f"a part can have at most {MAX_ARTWORK} artwork items")
+        out, seen = [], set()
+        for n, item in enumerate(v, 1):
+            aid = item.get("id") if isinstance(item, dict) else None
+            aid = aid or f"a{n}"
+            if not isinstance(aid, str) or not (len(aid) > 1 and aid[0] == "a" and aid[1:].isdigit()):
+                raise ValueError(f"artwork id {aid!r} isn't an artwork id (a1, a2, ...)")
+            if aid in seen:
+                raise ValueError(f"artwork {aid} is listed twice")
+            seen.add(aid)
+            out.append(normalize(item, aid, trusted=True))
+        return out
+
+    @field_validator("acknowledged", mode="before")
+    @classmethod
+    def _acks(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if not isinstance(v, list) or len(v) > 200 or not all(isinstance(x, str) and 0 < len(x) <= 80 for x in v):
+            raise ValueError("acknowledged must be a list of acknowledgement keys")
+        return sorted(set(v))
+
     @model_serializer(mode="wrap")
     def _dump(self, handler: Any) -> dict[str, Any]:
         out = handler(self)
         if not out.get("features"):
             out.pop("features", None)  # a part without features reads exactly as before
+        if not out.get("artwork"):
+            out.pop("artwork", None)
+        if not out.get("acknowledged"):
+            out.pop("acknowledged", None)
         return out
 
     @field_validator("length", "width", "depth", mode="before")
@@ -133,6 +175,12 @@ def build(params: "BoxParams | PartParams") -> Dieline:
         from . import features  # noqa: PLC0415
 
         features.apply(d, params.features, params, board)
+    if getattr(params, "artwork", None):
+        from . import artwork  # noqa: PLC0415
+
+        artwork.apply(d, params.artwork, params, board)
+        d.meta["acknowledged"] = list(params.acknowledged)
+    if params.features or getattr(params, "artwork", None):
         _feature_meta(d)
     return d
 
@@ -148,9 +196,16 @@ def _feature_meta(d: Dieline) -> None:
     lengths = {t.value: round(sum(x.length for x in d.of_type(t)), 4)
                for t in (LineType.CUT, LineType.CREASE, LineType.PERFORATION, LineType.SCORE)}
     d.meta["rule_length_in"] = {k: v for k, v in lengths.items() if v or k in ("cut", "crease")}
-    # Anything that needs a die: holes, hand flaps, notches, perforations, tear strips (an extra score doesn't).
-    d.meta["die_cut_features"] = sum(1 for b in built if b.status == "ok" and b.kind != "score")
+    # Anything that needs a die: holes, hand flaps, notches, perforations, tear strips (an extra score doesn't),
+    # and artwork that cuts or perforates.
+    arts = d.extras.get("artwork") or []
+    d.meta["die_cut_features"] = sum(1 for b in built if b.status == "ok" and b.kind != "score") + sum(
+        1 for a in arts if a.status == "ok" and any(c.rule in ("cut", "perforation", "partial_cut")
+                                                    for c in a.live()))  # type: ignore[attr-defined]
     d.meta["features"] = [{"id": b.id, "kind": b.kind, "status": b.status} for b in built]
+    if arts:
+        d.meta["artwork"] = [{"id": a.id, "kind": a.kind, "status": a.status,  # type: ignore[attr-defined]
+                              "provenance": a.to_dict()["provenance"]} for a in arts]  # type: ignore[attr-defined]
 
 
 # A part's parameters: a standard box, or one piece of a partition set (partitions.py).
@@ -214,8 +269,9 @@ def create_box(params: Any) -> dict:
         # Each export target's readiness: a target-specific block (an unverified rule) isn't in overall.
         "targets": readiness(dieline),
     }
-    if getattr(params, "features", None):
-        out["features"] = [b.to_dict() for b in dieline.extras.get("features", [])]  # type: ignore[union-attr]
+    if getattr(params, "features", None) or getattr(params, "artwork", None):
+        out["features"] = [b.to_dict() for b in dieline.extras.get("features", [])] + \
+            [a.to_dict() for a in dieline.extras.get("artwork", [])]  # type: ignore[union-attr]
     return out
 
 
@@ -230,9 +286,11 @@ def face_map(params: Any, full: bool = False) -> dict:
 
 def agent_view(design: dict) -> dict:
     """What the model sees about a design: facts and checks, never geometry."""
+    from .artwork import for_agent  # noqa: PLC0415
+
     out = {
         "name": design["name"],
-        "params": design["params"],
+        "params": for_agent(design["params"]),
         "summary": design["summary"],
         "overall": design["overall"],
         "checks": design["checks"],
@@ -240,7 +298,8 @@ def agent_view(design: dict) -> dict:
     if design.get("features"):
         # Compact: what the read-back needs, no coordinates.
         out["features"] = [{k: f[k] for k in ("id", "kind", "label", "status", "faces", "copies", "summary",
-                                              "reason") if k in f} for f in design["features"]]
+                                              "reason", "provenance", "islands", "rules") if k in f}
+                           for f in design["features"]]
     targets = design.get("targets") or {}
     blocked = {fmt: t["blocking"] for fmt, t in targets.items() if not t["ready"]}
     if blocked:

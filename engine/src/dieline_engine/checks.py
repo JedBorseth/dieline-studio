@@ -43,6 +43,9 @@ class CheckResult:
     part_id: str | None = None
     feature_id: str | None = None
     region: tuple[float, float, float, float] | None = None  # in the design's units, flat
+    # Suspicious artwork: the key the designer acknowledges it by (never the agent), and whether they have.
+    ack: str | None = None
+    acknowledged: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         out = asdict(self)
@@ -139,6 +142,16 @@ def check_topology(d: Dieline, report: Report | None = None) -> list[CheckResult
             out.append(CheckResult(cid, "unavailable", "not checked until the segments above are valid"))
         else:
             out.append(CheckResult(cid, "pass", ok))
+    # Islands the artwork makes are reported (with their fixes) by the artwork checks.
+    art_isl = d.extras.get("artwork_islands") or []
+    if art_isl:
+        def mine(i: Issue) -> bool:
+            if i.point is None:
+                return False
+            return any(rec["region"][0] - 1e-5 <= i.point[0] <= rec["region"][2] + 1e-5 and  # type: ignore[index]
+                       rec["region"][1] - 1e-5 <= i.point[1] <= rec["region"][3] + 1e-5  # type: ignore[index]
+                       for rec in art_isl)
+        r = Report(r.invalid, [i for i in r.islands if not mine(i)], r.near_misses, r.material_faces)
     off = [i for i in r.invalid if i.kind == "off_board"]
     if off:
         out.append(CheckResult("material", "fail", _sample(off, d.units)))
@@ -323,6 +336,10 @@ def run_checks(d: Dieline, report: Report | None = None) -> list[CheckResult]:
         from .feature_checks import check_features  # noqa: PLC0415
 
         results += check_features(d)
+    if d.extras.get("artwork"):
+        from .artwork_checks import check_artwork  # noqa: PLC0415
+
+        results += check_artwork(d)
     return results
 
 

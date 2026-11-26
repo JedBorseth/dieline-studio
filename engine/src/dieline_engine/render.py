@@ -153,6 +153,7 @@ def render_png(d: Dieline, region: Region | None = None, title: str | None = Non
     # spills into the rulers.
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ldraw = ImageDraw.Draw(layer)
+    _artwork_fill(ldraw, d, px)
     # Clip to the window (plus a pixel of slack) before drawing, so a tight zoom
     # never walks the off-screen length of long dashed lines.
     slack = 4 / scale
@@ -170,6 +171,7 @@ def render_png(d: Dieline, region: Region | None = None, title: str | None = Non
     if region is not None:
         draw.rectangle([MARGIN, MARGIN, w - MARGIN, h - LEGEND - MARGIN], outline=(200, 200, 200))
 
+    _artwork_marks(draw, d, px, small)
     show_labels = region is None and not _annotation_only(d)
     if show_labels and d.meta.get("style") == "partition-slotted":
         _partition_labels(draw, d, px, small, normal)
@@ -203,6 +205,60 @@ def render_png(d: Dieline, region: Region | None = None, title: str | None = Non
         "origin": "native design coordinates, x right and y up",
     }
     return buf.getvalue(), info
+
+
+def _loop_points(loop) -> list[tuple[float, float]]:
+    pts: list[tuple[float, float]] = []
+    for s in loop:
+        pts += _arc_points(s, 24)[:-1] if isinstance(s, Arc) else [s.start]
+    return pts
+
+
+def _artwork_fill(draw, d: Dieline, px) -> None:
+    """Artwork's discarded board shaded, retained board (islands too) left white, so the
+    picture shows what the cuts will actually remove."""
+    arts = d.extras.get("artwork") or []
+    if not arts:
+        return
+    from .artwork import _face_loops, _nest  # noqa: PLC0415
+
+    faces = {a.face for a in arts if a.status == "ok" and a.face}
+    for face in faces:
+        loops = _face_loops(arts, d, face)
+        _nest(loops)
+        for lp in sorted(loops, key=lambda x: x.depth):
+            if lp.art is None:
+                continue
+            fill = (255, 214, 214, 255) if lp.depth % 2 == 1 else (255, 255, 255, 255)
+            pts = [px(p) for p in _loop_points(lp.segs)]
+            if len(pts) >= 3:
+                draw.polygon(pts, fill=fill)
+
+
+def _artwork_marks(draw, d: Dieline, px, font) -> None:
+    """Agent-drawn artwork in a dashed frame labelled as such; islands nothing holds, circled."""
+    arts = d.extras.get("artwork") or []
+    accent = (200, 60, 0)
+    for a in arts:
+        if a.status != "ok":
+            continue
+        segs = a.segs()
+        if not segs:
+            continue
+        from .features import _bounds  # noqa: PLC0415
+
+        bx = _bounds(segs)
+        if a.agent_drawn:
+            (x0, y0), (x1, y1) = px((bx[0], bx[3])), px((bx[2], bx[1]))
+            x0, y0, x1, y1 = x0 - 8, y0 - 8, x1 + 8, y1 + 8
+            for a_, b_ in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
+                _dashed(draw, a_, b_, accent, 2, 7.0, 5.0)
+            draw.text((x0, y0 - 18), f"agent-drawn sketch {a.id}: verify before cutting", fill=accent, font=font)
+        for isl in a.islands:
+            if isl.status in ("open", "failed"):
+                cx, cy = px(((isl.region[0] + isl.region[2]) / 2, (isl.region[1] + isl.region[3]) / 2))
+                draw.ellipse([cx - 12, cy - 12, cx + 12, cy + 12], outline=(220, 0, 0), width=3)
+                draw.text((cx + 14, cy - 8), f"island {a.id}/{isl.id}", fill=(220, 0, 0), font=font)
 
 
 def _ruler(draw: ImageDraw.ImageDraw, win: Region, scale: float, w: int, h: int, font, units: str) -> None:
