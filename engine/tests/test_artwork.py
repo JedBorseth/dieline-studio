@@ -887,6 +887,9 @@ def test_a_straight_crease_is_measured_across_the_face_in_its_direction():
     diagonal = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 100 100"]}, "width": 3.1, "rule": "crease",
                 "placement": {"on": "P2", "x": "centred", "y": "centred"}}
     assert "rule" in _flags(diagonal, depth=4)
+    # On a tapered glue lug, against the lug's own outline (its bounding rectangle is longer).
+    lug = {**bar, "width": 2.17, "placement": {"on": "glue_lug", "x": "centred", "y": "centred", "rotation_deg": 76}}
+    assert "rule" in _flags(lug, depth=4)
 
 
 def test_a_spline_that_loops_inside_one_short_knot_span_is_kept():
@@ -900,6 +903,30 @@ def test_a_spline_that_loops_inside_one_short_knot_span_is_kept():
                        asrc.Prim((3, 1), (3, 0))], True)
     contours, _ = asrc.finish([asrc.Sub([tri], True), square], 1.0, declared_closed=True)
     assert len(contours) == 2
+    assert asrc.subs_bbox([asrc.Sub([tri], True)]) == pytest.approx((0, 0, 1, 1))  # sized by its loop
+    cubic = curves.Nurbs(3, (0, 0, 0, 0, 0.001, 0.0013, 0.0017, 0.002, 1, 1, 1, 1),
+                         ((0, 0), (0, 0), (0, 0), (1, 1), (1, -1), (0, 0), (0, 0), (0, 0)))
+    x0, _, x1, _ = asrc.subs_bbox([asrc.Sub([cubic], True)])
+    assert x1 - x0 > 0.9 and max(q[0] for p in curves.fit(cubic).prims for q in (p.start, p.end)) > 0.9
+
+
+def test_a_polyline_spline_keeps_its_corners_and_joins_its_straights():
+    """Review of the v0.4.0 fixes: fitting across a knot rounded corners into tiny arcs, and a straight
+    of many points became one line per point."""
+    for tri in (curves.Nurbs(1, (0, 0, 0.01, 0.02, 0.04, 1, 1), ((0, 0), (2, 0), (0, 0.7), (0, 0), (0, 0))),
+                curves.Nurbs(1, (0, 0, 1e-7, 2e-7, 4e-7, 1, 1), ((0, 0), (1, 0), (0, 1), (0, 0), (0, 0)))):
+        f = curves.fit(tri)
+        assert len(f.prims) == 3 and all(p.center is None for p in f.prims)
+    n = 2502
+    line = curves.Nurbs(1, (0, 0, *(i / (n - 1) for i in range(1, n - 1)), 1, 1),
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    f = curves.fit(line)
+    assert len(f.prims) == 1 and f.prims[0].end == pytest.approx((5.002, 0))
+
+
+def test_a_tight_bend_in_a_short_knot_span_is_seen_by_the_radius_check():
+    q = curves.Nurbs(2, (0, 0, 0, 0.005, 0.01, 1, 1, 1), ((0, 0), (0.05, 0.05), (0.1, 0), (0.05, 0), (0, 0)))
+    assert min(r for r, _ in q.radius_samples()) < 0.01
 
 
 def test_the_acknowledgement_fingerprint_covers_arc_direction_and_the_face_frame():

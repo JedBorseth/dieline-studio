@@ -189,6 +189,10 @@ def design_checks(state: Any) -> list[CheckResult]:
         present: dict[str, int] = {}
         for m in g.members:
             p = _part(state, m.ref)
+            if p.quantity != m.quantity:  # the set's count is what's checked, the part's what's made
+                out.append(CheckResult(f"partition_{g.id}_quantity", "fail",
+                                       f"set {g.id} holds {m.quantity} of {p.id} but the part makes {p.quantity}; "
+                                       "replace the set or set the part's quantity back"))
             present[p.params.role] = present.get(p.params.role, 0) + m.quantity  # type: ignore[union-attr]
         try:
             out += set_checks(g.id, _plan(spec), present)
@@ -198,7 +202,7 @@ def design_checks(state: Any) -> list[CheckResult]:
     # replace that kept a piece but not its group) skips the set's crossing, interlock and fit checks.
     grouped = {m.ref for g in state.groups if g.kind == "partition_set" for m in g.members}
     for p in state.parts:
-        if getattr(p.params, "style", None) == "partition-slotted" and p.id not in grouped:
+        if _is_partition(p.params) and p.id not in grouped:
             out.append(CheckResult(f"partition_{p.id}_set", "fail",
                                    f"partition piece {p.id} isn't in a partition set, so its slots aren't checked "
                                    "against the pieces they cross; recreate the set with create_partition"))

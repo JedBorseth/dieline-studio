@@ -251,12 +251,12 @@ def _import(ag: Any, s: Any, cur: Any, part_id: str, raw: dict[str, Any], call_i
     # (outside its face, across a score) is refused now, so the agent fixes its size or position before
     # a card is shown that would fail when the designer clicks it.
     payload = ag._mutate(s, change, call_id, True, part_id)
-    view = ag._design_view(payload, part_id)
     new = [f for p in payload["parts"] if p["part_id"] == part_id for f in p.get("features", [])
            if f["id"] not in {a["id"] for a in cur.part(part_id).params.artwork} and f.get("kind") == "artwork"]
     if len(new) != 1:
         raise ValueError("could not identify the artwork to approve")
     refuse_stale(payload, part_id, [new[0]["id"]])
+    view = ag._design_view(payload, part_id)
     iid = ag.artwork_imports.add(s.id, (cur.id, cur.revision), part_id, item, parsed.unsupported, real.name)
     view["import"] = {
         "id": iid, "file": real.name, "format": parsed.format, "sha256": item["source"]["sha256"][:16],

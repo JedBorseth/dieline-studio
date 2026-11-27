@@ -1187,3 +1187,26 @@ def test_a_held_partition_piece_without_its_set_is_not_exported(tmp_path):
     held = server.store.mutate("s1", lambda cur: d, expected="any")
     full = {"session_id": "s1", "design_id": held["design_id"], "revision": held["revision"]}
     assert server.methods["export.plan"](full)["ready"], server.methods["export.plan"](full)["blocking"]
+
+
+def test_a_set_whose_parts_make_fewer_than_it_holds_is_not_exported(tmp_path):
+    """Review of the v0.4.0 fixes: the set's counts were checked, the parts' quantities exported."""
+    from dataclasses import replace
+
+    from dieline_engine import partitions, partsets
+    from dieline_engine.designstore import new_design
+    from dieline_engine.rpc import Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    d, gid = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    group = next(g for g in d.groups if g.id == gid)
+    short = next(m for m in group.members if m.quantity > 1)
+    d = replace(d, parts=tuple(replace(p, quantity=1) if p.id == short.ref else p for p in d.parts))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"]})
+    assert not plan["ready"] and "but the part makes 1" in plan["blocking"][0]

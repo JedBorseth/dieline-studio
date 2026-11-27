@@ -88,7 +88,9 @@ def _piece_points(p: Any) -> list[Point]:
         from .curves import prim_points  # noqa: PLC0415
 
         return prim_points(p, 16)
-    return [p.point(i / 48) for i in range(49)]
+    from .curves import sample_points  # noqa: PLC0415
+
+    return sample_points(p)
 
 
 def subs_bbox(subs: list[Sub]) -> tuple[float, float, float, float]:

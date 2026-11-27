@@ -15,6 +15,7 @@ Everything here works in one local frame, in inches, y up.
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass, field
 
@@ -68,8 +69,14 @@ class Curve:
         return Mapped(self, f)
 
     def breaks(self) -> list[float]:
-        """Where the curve's pieces join (t in [0, 1]); each piece is fitted on its own."""
+        """Where the curve's spans join (t in [0, 1]). A spline can trace a whole loop inside one short
+        span and sit still in the rest, so sampling looks at every span, not only evenly along t."""
         return [0.0, 1.0]
+
+    def pieces(self) -> list["Curve"]:
+        """The curve cut where it may turn a corner (a spline's C0 knots), each piece its own curve on
+        [0, 1]: differences taken inside a piece never reach across a corner."""
+        return [self]
 
     def tangent(self, t: float, forward: bool = True) -> Point | None:
         """The unit tangent, looking a little further when the derivative vanishes
@@ -88,19 +95,40 @@ class Curve:
     def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
         """(radius of curvature, point) along the curve; a straight stretch has none."""
         out = []
-        for i in range(n + 1):
-            t = i / n
-            h = 1e-4
-            t0, t1 = max(t - h, 0.0), min(t + h, 1.0)
-            d0, d1 = self.deriv(t0), self.deriv(t1)
-            d = self.deriv(t)
-            dd = ((d1[0] - d0[0]) / (t1 - t0), (d1[1] - d0[1]) / (t1 - t0))
-            k = _cross(d, dd)
-            sp = math.hypot(*d)
-            if abs(k) <= 1e-12 or sp <= 1e-12:
-                continue
-            out.append((sp ** 3 / abs(k), self.point(t)))
+        for piece in self.pieces():
+            out += _radii(piece, span_samples(piece, 4) if len(piece.breaks()) > 2 else
+                          [(i / n, 1.0) for i in range(n + 1)])
         return out
+
+
+def span_samples(curve: Curve, per: int = 8) -> list[tuple[float, float]]:
+    """(t, width of its span): `per` samples in each span between the curve's breaks, and its end."""
+    ts = curve.breaks()
+    out = [(a + (b - a) * j / per, b - a) for a, b in zip(ts, ts[1:]) if b > a for j in range(per)]
+    return out + [(1.0, ts[-1] - ts[-2])]
+
+
+def sample_points(curve: Curve, n: int = 48) -> list[Point]:
+    """Points along a curve, every span of it included (for its extent)."""
+    if len(curve.breaks()) <= 2:
+        return [curve.point(i / n) for i in range(n + 1)]
+    return [curve.point(t) for t, _ in span_samples(curve, 8)]
+
+
+def _radii(curve: Curve, samples: list[tuple[float, float]]) -> list[tuple[float, Point]]:
+    out = []
+    for t, width in samples:
+        h = min(1e-4, width / 4) if width > 0 else 1e-4
+        t0, t1 = max(t - h, 0.0), min(t + h, 1.0)
+        d0, d1 = curve.deriv(t0), curve.deriv(t1)
+        d = curve.deriv(t)
+        dd = ((d1[0] - d0[0]) / (t1 - t0), (d1[1] - d0[1]) / (t1 - t0))
+        k = _cross(d, dd)
+        sp = math.hypot(*d)
+        if abs(k) <= 1e-12 or sp <= 1e-12:
+            continue
+        out.append((sp ** 3 / abs(k), curve.point(t)))
+    return out
 
 
 @dataclass(slots=True)
@@ -113,6 +141,26 @@ class Mapped(Curve):
 
     def breaks(self) -> list[float]:
         return self.base.breaks()
+
+    def pieces(self) -> list[Curve]:
+        parts = self.base.pieces()
+        return [self] if len(parts) == 1 else [Mapped(q, self.f) for q in parts]
+
+
+@dataclass(slots=True)
+class Window(Curve):
+    """The part of a curve on [ta, tb], as a curve on [0, 1]."""
+
+    base: Curve
+    ta: float
+    tb: float
+
+    def point(self, t: float) -> Point:
+        return self.base.point(self.ta + (self.tb - self.ta) * min(max(t, 0.0), 1.0))
+
+    def breaks(self) -> list[float]:
+        w = self.tb - self.ta
+        return sorted({0.0, 1.0, *((u - self.ta) / w for u in self.base.breaks() if self.ta < u < self.tb)})
 
 
 @dataclass(slots=True)
@@ -265,16 +313,26 @@ class Nurbs(Curve):
         return Nurbs(self.degree, self.knots, tuple(f(q) for q in self.ctrl), self.weights)
 
     def breaks(self) -> list[float]:
-        """Each distinct knot: a spline can trace a whole loop inside one short span and sit still in
-        the rest, which samples of the whole curve could miss."""
+        """Each distinct knot in the domain."""
         p, k = self.degree, self.knots
         lo, hi = k[p], k[len(self.ctrl)]
         if hi <= lo:
             return [0.0, 1.0]
         return sorted({0.0, 1.0, *((u - lo) / (hi - lo) for u in k[p:len(self.ctrl) + 1])})
 
-    def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
-        return Curve.radius_samples(self, max(n, 8 * len(self.ctrl)))
+    def pieces(self) -> list[Curve]:
+        """Cut at each interior knot repeated degree times or more: only there can it turn a corner
+        (every knot of a degree-1 spline, which is a polyline)."""
+        p, k = self.degree, self.knots
+        lo, hi = k[p], k[len(self.ctrl)]
+        if hi <= lo:
+            return [self]
+        inner = k[p + 1:len(self.ctrl)]
+        cuts = sorted({u for u in inner if lo < u < hi and inner.count(u) >= p})
+        if not cuts:
+            return [self]
+        ts = [0.0, *((u - lo) / (hi - lo) for u in cuts), 1.0]
+        return [Window(self, a, b) for a, b in zip(ts, ts[1:]) if b > a]
 
 
 def check_nurbs(degree: int, knots: list[float], ctrl: list[Point], weights: list[float]) -> None:
@@ -457,12 +515,13 @@ def prim_points(pr: Prim, n: int = 8) -> list[Point]:
     return [(c[0] + r * math.cos(a0 + sweep * i / n), c[1] + r * math.sin(a0 + sweep * i / n)) for i in range(n + 1)]
 
 
-def _deviation(curve: Curve, ta: float, tb: float, prims: list[Prim]) -> float:
-    """Two-way: curve samples to the arcs, and arc samples to a dense polyline of the curve."""
+def _deviation(curve: Curve, ta: float, tb: float, prims: list[Prim], extra: list[float] = ()) -> float:
+    """Two-way: curve samples to the arcs, and arc samples to a dense polyline of the curve. `extra`
+    are more samples (each span of a spline in range, which even spacing can step over)."""
     worst = 0.0
     m = 24
-    for i in range(1, m):
-        p = curve.point(ta + (tb - ta) * i / m)
+    for t in [ta + (tb - ta) * i / m for i in range(1, m)] + list(extra):
+        p = curve.point(t)
         worst = max(worst, min(prim_point_dist(pr, p) for pr in prims))
     dense = [curve.point(ta + (tb - ta) * i / 96) for i in range(97)]
     chords = [Prim(a, b) for a, b in zip(dense, dense[1:]) if math.dist(a, b) > 0]
@@ -474,19 +533,69 @@ def _deviation(curve: Curve, ta: float, tb: float, prims: list[Prim]) -> float:
 
 
 def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
-    """Biarcs within tol of the curve; chords only where arcs can't fit."""
+    """Biarcs within tol of the curve; chords only where arcs can't fit. A spline is fitted piece by
+    piece between the knots where it may turn a corner, and straight runs are joined into one line."""
     out = Fit()
     start = curve.point(0.0)
+    for piece in curve.pieces():
+        _fit_piece(piece, tol, out)
+    _join_lines(out)
+    # Chain exactly: each piece starts where the last ended.
+    fixed: list[Prim] = []
+    cur = start
+    for pr in out.prims:
+        fixed.append(Prim(cur, pr.end, pr.center, pr.clockwise, pr.full))
+        cur = pr.end
+    out.prims = fixed
+    return out
+
+
+def _join_lines(out: Fit) -> None:
+    """Consecutive lines along one straight become one (a polyline spline of many collinear points)."""
+    prims: list[Prim] = []
+    kinds: list[str] = []
+    for pr, kind in zip(out.prims, out.kinds, strict=True):
+        if prims and pr.center is None and prims[-1].center is None and _straight_on(prims[-1], pr):
+            prims[-1] = Prim(prims[-1].start, pr.end)
+            kinds[-1] = "fallback" if "fallback" in (kind, kinds[-1]) else kinds[-1]
+            continue
+        prims.append(pr)
+        kinds.append(kind)
+    out.prims, out.kinds = prims, kinds
+
+
+def _straight_on(a: Prim, b: Prim) -> bool:
+    """b carries on a's line, the same way, from where a ends."""
+    if math.dist(a.end, b.start) > 1e-9:
+        return False
+    u, v = _sub(a.end, a.start), _sub(b.end, b.start)
+    la, lb = math.hypot(*u), math.hypot(*v)
+    if la <= 1e-12 or lb <= 1e-12 or _dot(u, v) <= 0:
+        return False
+    return abs(_cross(u, _sub(b.end, a.start))) / la <= 1e-9
+
+
+def _fit_piece(curve: Curve, tol: float, out: Fit) -> None:
+    brk = curve.breaks()
+    # Probes inside a range besides even steps: each knot and the middle of each span.
+    marks = sorted({*brk, *((a + b) / 2 for a, b in zip(brk, brk[1:]))}) if len(brk) > 2 else []
+
+    def probes(ta: float, tb: float) -> list[float]:
+        if not marks:
+            return []
+        return marks[bisect.bisect_right(marks, ta):bisect.bisect_left(marks, tb)]
 
     def excursion(ta: float, tb: float) -> float:
         """How far the curve goes from where this piece starts (a loop can start and end at one point)."""
         a = curve.point(ta)
-        return max(math.dist(a, curve.point(ta + (tb - ta) * i / 16)) for i in range(1, 17))
+        ts = [ta + (tb - ta) * i / 16 for i in range(1, 17)] + probes(ta, tb)
+        return max(math.dist(a, curve.point(t)) for t in ts)
 
     def chords(ta: float, tb: float, depth: int = 0) -> None:
         a, b = curve.point(ta), curve.point(tb)
         seg = Prim(a, b)
-        dev = max(prim_point_dist(seg, curve.point(ta + (tb - ta) * i / 8)) for i in range(1, 8))
+        dev = max(prim_point_dist(seg, curve.point(t))
+                  for t in [ta + (tb - ta) * i / 8 for i in range(1, 8)] + probes(ta, tb))
         span = math.dist(a, b)
         if span <= 1e-12 and dev <= 1e-12:
             return
@@ -519,7 +628,7 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
         t0, t1 = curve.tangent(ta, True), curve.tangent(tb, False)
         arcs = biarc(p0, t0, p1, t1) if t0 is not None and t1 is not None else None
         if arcs is not None:
-            dev = _deviation(curve, ta, tb, arcs)
+            dev = _deviation(curve, ta, tb, arcs, probes(ta, tb))
             if dev <= tol:
                 for pr in arcs:
                     if math.dist(pr.start, pr.end) > 1e-12:
@@ -533,15 +642,4 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
         go(ta, (ta + tb) / 2, depth + 1)
         go((ta + tb) / 2, tb, depth + 1)
 
-    ts = curve.breaks()
-    for ta, tb in zip(ts, ts[1:]):
-        if tb > ta:
-            go(ta, tb, 0)
-    # Chain exactly: each piece starts where the last ended.
-    fixed: list[Prim] = []
-    cur = start
-    for pr in out.prims:
-        fixed.append(Prim(cur, pr.end, pr.center, pr.clockwise, pr.full))
-        cur = pr.end
-    out.prims = fixed
-    return out
+    go(0.0, 1.0, 0)

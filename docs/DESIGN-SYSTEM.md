@@ -757,7 +757,7 @@ Cut-outs that aren't structure: a smiley, a logo, lettering, a decorative window
 
 **Curves:**
 
-- Béziers, splines and ellipses are fitted with **arcs** (biarcs) within the tolerance (default 0.002" at final size), so dies and the sample table get smooth, bendable curves rather than tiny chords.
+- Béziers, splines and ellipses are fitted with **arcs** (biarcs) within the tolerance (default 0.002" at final size), so dies and the sample table get smooth, bendable curves rather than tiny chords. A spline is cut at its C0 knots (where it can turn a corner, every knot of a degree-1 spline) and each piece fitted on its own, so corners stay sharp; fitting, sizing and the bend-radius check sample every knot span, so a loop inside one short span is kept; consecutive collinear lines join into one.
 - Straight-line fallback is used only where arcs can't fit, and it's reported.
 - The source curves are kept for the tooling checks, so the results don't depend on how the curve was fitted.
 
@@ -1161,7 +1161,7 @@ Where this spec left a choice open, phase 4 took the safest reading:
 - Long straight: 1" or longer, within 3° of parallel and within 1" of any edge or crease of its face. Consecutive collinear pieces (within 1/2° and 0.001" of the first piece's line) count as one straight, so a straight drawn in pieces is still flagged; a many-sided polygon or a zigzag isn't.
 - Slot-like: a closed cut no more than 1/2" wide and at least 3:1, mostly straight, within 1" of the face's edge, measured by its narrowest enclosing rectangle at any angle (a rotated slot is flagged). Standards have no mates yet.
 - Span: over 80% of the face's width or height.
-- Rule: a crease or perforation whose **path length** is over half what it could fold across. A single straight is measured against the face's chord in its own direction (a crease up a shallow panel needs less than one along it, and the limit changes smoothly as it turns); anything else (a curve, a closed outline) against the face's shorter side, so a large creased circle is flagged too.
+- Rule: a crease or perforation whose **path length** is over half what it could fold across. A single straight is measured against the longest straight across the face's outline in its own direction (a tapered glue lug by its taper, not its bounding rectangle) (a crease up a shallow panel needs less than one along it, and the limit changes smoothly as it turns); anything else (a curve, a closed outline) against the face's shorter side, so a large creased circle is flagged too.
 - One flag per artwork and kind. Its acknowledgement key is the artwork id, the kind and a fingerprint of everything that decides what's cut: every segment (rule, ends, centre, direction, full circle), each outline's rule spec (pointage), the face and its frame on the blank (size, origin, axes, outline). So moving, resizing, reversing an arc or resizing the box (even when the artwork's flat coordinates stay put) asks again. Acknowledgements are stored on the part (`acknowledged`). The store refuses any chat change that adds one (dry runs too, and through any tool); the RPC needs the design id and revision on screen and accepts only keys the checks offer.
 
 **UI and picture**

@@ -381,9 +381,7 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
                 length = sum(s.length for s in loop)
                 runs = _straight_runs(loop, dr)
                 if not dr.closed and len(runs) == 1 and abs(runs[0].length - length) <= TOL:
-                    p0, p1 = f.from_flat(runs[0].start), f.from_flat(runs[0].end)
-                    cx, cy = abs(p1[0] - p0[0]) / length, abs(p1[1] - p0[1]) / length
-                    dim = min(f.width / cx if cx > 1e-9 else math.inf, f.height / cy if cy > 1e-9 else math.inf)
+                    dim = _longest_chord(f, runs[0])
                     across = f"the {fmt_in(_r(dim))} in across {f.id} in its direction"
                 else:
                     dim = min(f.width, f.height)
@@ -406,6 +404,31 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
                                    f"suspicious artwork: {a.name}: {listed}. Export is blocked until the designer "
                                    "acknowledges it in the checks panel", "artwork", None, a.id, region, ack=key))
     return out
+
+
+def _longest_chord(f: Face, s: Line) -> float:
+    """The longest straight across the face parallel to s: on its outline (a glue lug tapers), else
+    its rectangle. Inside-length along a line is piecewise linear in its offset, with corners only
+    at the outline's vertices, so the longest is at one of them."""
+    ux, uy = (s.end[0] - s.start[0]) / s.length, (s.end[1] - s.start[1]) / s.length
+    poly = list(f.polygon)
+    if len(poly) < 3:
+        p0, p1 = f.from_flat(s.start), f.from_flat(s.end)
+        cx, cy = abs(p1[0] - p0[0]) / s.length, abs(p1[1] - p0[1]) / s.length
+        return min(f.width / cx if cx > 1e-9 else math.inf, f.height / cy if cy > 1e-9 else math.inf)
+    nx, ny = -uy, ux
+    offs = sorted({q[0] * nx + q[1] * ny for q in poly})
+    best = 0.0
+    for c in [o + e for o in offs for e in (-1e-7, 1e-7)]:
+        hits = []
+        for a, b in zip(poly, poly[1:] + poly[:1]):
+            da, db = a[0] * nx + a[1] * ny - c, b[0] * nx + b[1] * ny - c
+            if (da < 0) != (db < 0):
+                t = da / (da - db)
+                hits.append((a[0] + (b[0] - a[0]) * t) * ux + (a[1] + (b[1] - a[1]) * t) * uy)
+        hits.sort()
+        best = max(best, sum(hits[i + 1] - hits[i] for i in range(0, len(hits) - 1, 2)))
+    return best
 
 
 def _straight_runs(loop: list[Segment], dr: Drawn) -> list[Line]:
