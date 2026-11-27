@@ -1210,3 +1210,15 @@ def test_a_set_whose_parts_make_fewer_than_it_holds_is_not_exported(tmp_path):
     plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
                                           "revision": held["revision"]})
     assert not plan["ready"] and "but the part makes 1" in plan["blocking"][0]
+    # One part listed twice in its set, each at 1: the set counts 2, the job makes 1.
+    d, gid = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    group = next(g for g in d.groups if g.id == gid)
+    short = next(m for m in group.members if m.quantity > 1)
+    twice = replace(group, members=tuple(m for m in group.members if m is not short) +
+                    (replace(short, quantity=1), replace(short, quantity=1)))
+    d = replace(d, groups=tuple(twice if g.id == gid else g for g in d.groups),
+                parts=tuple(replace(p, quantity=1) if p.id == short.ref else p for p in d.parts))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"]})
+    assert not plan["ready"] and "listed 2 times" in " ".join(plan["blocking"])

@@ -927,6 +927,85 @@ def test_a_polyline_spline_keeps_its_corners_and_joins_its_straights():
 def test_a_tight_bend_in_a_short_knot_span_is_seen_by_the_radius_check():
     q = curves.Nurbs(2, (0, 0, 0, 0.005, 0.01, 1, 1, 1), ((0, 0), (0.05, 0.05), (0.1, 0), (0.05, 0), (0, 0)))
     assert min(r for r, _ in q.radius_samples()) < 0.01
+    # A hairpin away from any knot (two spans, knot at 0.5) is still found, below the 1/8 in warning.
+    hairpin = curves.Nurbs(2, (0, 0, 0, 0.5, 1, 1, 1), ((0, 0), (1, 0.01), (0, 0.02), (0, 1)))
+    assert min(r for r, _ in hairpin.radius_samples()) < 0.125
+    # A span one float wide neither crashes the radius check nor the fit.
+    ulp = curves.Nurbs(2, (0, 0, 0, 0.5, math.nextafter(0.5, 1), 1, 1, 1), ((0, 0), (1, 1), (2, 0), (3, 1), (4, 0)))
+    assert ulp.radius_samples() and curves.fit(ulp).prims
+
+
+def test_a_wiggle_inside_one_short_span_is_fitted_not_flattened():
+    """Review of the v0.4.0 fixes: a span whose ends and middle sit on a line, with its quarter points
+    off it, was fitted as one straight line."""
+    class Wiggle(curves.Curve):
+        def point(self, t):
+            u = (t - 0.5) / 0.01
+            return (10 * t, 0.2 * math.sin(math.tau * u) if 0 <= u <= 1 else 0.0)
+
+        def breaks(self):
+            return [0.0, 0.5, 0.51, 1.0]
+
+    c = Wiggle()
+    f = curves.fit(c)
+    ts = [0.5 + 0.01 * j / 200 for j in range(201)]
+    worst = max(min(curves.prim_point_dist(p, c.point(t)) for p in f.prims) for t in ts)
+    assert worst <= curves.FIT_TOL_IN + 1e-6
+
+
+def test_a_short_span_of_a_high_degree_spline_is_fitted_within_tolerance():
+    c = curves.Nurbs(5, (0,) * 6 + (0.5, 0.5005) + (1,) * 6,
+                     ((0, 0), (1, 0), (2, 0), (3, 0), (3.5, 3), (4, -3), (5, 0), (6, 0)))
+    f = curves.fit(c)
+    brk = c.breaks()
+    ts = [a + (b - a) * j / 400 for a, b in zip(brk, brk[1:]) for j in range(400)]
+    worst = max(min(curves.prim_point_dist(p, c.point(t)) for p in f.prims) for t in ts)
+    assert worst <= curves.FIT_TOL_IN + 1e-6
+
+
+def test_large_splines_are_quick_capped_and_refused_early():
+    import time
+
+    n = 5000
+    line = curves.Nurbs(1, (0, 0, *(i / (n - 1) for i in range(1, n - 1)), 1, 1),
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    t = time.perf_counter()
+    assert len(curves.fit(line).prims) == 1 and line.radius_samples() == []
+    assert len(curves.sample_points(line)) == n
+    assert time.perf_counter() - t < 5
+    with pytest.raises(curves.CurveError, match="more than 5000 control points"):
+        curves.check_nurbs(1, [0, *(i / n for i in range(n + 1)), 1], [(i, 0) for i in range(n + 1)], [])
+    with pytest.raises(curves.CurveError, match="breaks apart"):
+        curves.check_nurbs(1, [0, 0, 0.5, 0.5, 1, 1], [(0, 0), (1, 0), (2, 1), (3, 1)], [])
+    # Fitting stops once past its segment budget, rather than fitting the whole spline first.
+    arches, ctrl, kn = 200, [(0, 0)], [0, 0, 0, 0]
+    for i in range(arches):
+        ctrl += [(i + 0.3, 1), (i + 0.7, 1), (i + 1, 0)]
+        kn += [(i + 1) / arches] * 3
+    many = curves.Nurbs(3, tuple(kn[:-3] + [1, 1, 1, 1]), tuple(ctrl))
+    with pytest.raises(curves.TooManySegments):
+        curves.fit(many, limit=50)
+
+
+def test_joined_fallback_chords_are_counted_once():
+    out = curves.Fit([curves.Prim((0, 0), (1, 0)), curves.Prim((1, 0), (2, 0)), curves.Prim((2, 0), (3, 0))],
+                     ["fallback"] * 3, 3)
+    curves._join_lines(out)
+    assert len(out.prims) == 1 and out.fallback == 1
+
+
+def test_the_longest_chord_is_one_stretch_across_the_outline():
+    from types import SimpleNamespace
+
+    from dieline_engine.artwork_checks import _longest_chord
+    from dieline_engine.geometry import Line, LineType
+
+    # A V: across its two arms a horizontal line meets the outline twice over, 1 in each.
+    v = SimpleNamespace(polygon=[(0, 0), (1, 0), (2, 3), (3, 0), (4, 0), (2, 4)], width=4, height=4)
+    assert _longest_chord(v, Line((0, 0.5), (1, 0.5), LineType.CREASE)) == pytest.approx(1, abs=1e-3)
+    rect = SimpleNamespace(polygon=[(0, 0), (14, 0), (14, 4), (0, 4)], width=14, height=4)
+    assert _longest_chord(rect, Line((0, 1), (1, 1), LineType.CREASE)) == pytest.approx(14)
+    assert _longest_chord(rect, Line((0, 0), (1, 1), LineType.CREASE)) == pytest.approx(4 * 2 ** 0.5)
 
 
 def test_the_acknowledgement_fingerprint_covers_arc_direction_and_the_face_frame():

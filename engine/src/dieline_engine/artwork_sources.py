@@ -17,7 +17,8 @@ from typing import Any
 
 from . import glyphs
 from .curves import (ARC_CORRECTION_MAX, FIT_TOL_IN, Bezier, Curve, CurveError, EllipseArc, Nurbs, arc_prim,
-                     axis_ellipse, check_nurbs, fit, svg_arc)
+                     axis_ellipse, check_nurbs, fit, svg_arc,
+                     TooManySegments)
 from .shapes import Prim, bbox as prim_bbox, circle as sh_circle, rounded_rect, transform
 
 Point = tuple[float, float]
@@ -153,7 +154,11 @@ def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT
                 kinds.append("arc" if p.center is not None else "line")
                 continue
             curve = p.map(f)
-            ft = fit(curve, tol)
+            try:
+                ft = fit(curve, tol, MAX_SEGMENTS - total - len(prims))
+            except TooManySegments:
+                raise SourceError(f"{what} has more than {MAX_SEGMENTS} segments after fitting; simplify it") \
+                    from None
             prims += ft.prims
             kinds += ft.kinds
             fallback += ft.fallback

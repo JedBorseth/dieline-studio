@@ -419,7 +419,9 @@ def _longest_chord(f: Face, s: Line) -> float:
     nx, ny = -uy, ux
     offs = sorted({q[0] * nx + q[1] * ny for q in poly})
     best = 0.0
-    for c in [o + e for o in offs for e in (-1e-7, 1e-7)]:
+    # Just inside each end of every band between vertex offsets (the longest is at one of them).
+    probes = [c for o0, o1 in zip(offs, offs[1:]) for e in (min(1e-7, (o1 - o0) / 4),) for c in (o0 + e, o1 - e)]
+    for c in probes:
         hits = []
         for a, b in zip(poly, poly[1:] + poly[:1]):
             da, db = a[0] * nx + a[1] * ny - c, b[0] * nx + b[1] * ny - c
@@ -427,7 +429,8 @@ def _longest_chord(f: Face, s: Line) -> float:
                 t = da / (da - db)
                 hits.append((a[0] + (b[0] - a[0]) * t) * ux + (a[1] + (b[1] - a[1]) * t) * uy)
         hits.sort()
-        best = max(best, sum(hits[i + 1] - hits[i] for i in range(0, len(hits) - 1, 2)))
+        # The longest stretch inside, not the sum: a straight across a gap isn't one fold.
+        best = max([best, *(hits[i + 1] - hits[i] for i in range(0, len(hits) - 1, 2))])
     return best
 
 
