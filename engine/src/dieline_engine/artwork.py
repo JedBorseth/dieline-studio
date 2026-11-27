@@ -47,6 +47,7 @@ from .expressions import ExpressionError
 from .faces import Face, FaceMap
 from .features import Ctx, FeatureError, _env, _flat_prims, _inside_face, _retype, friendly
 from .geometry import PRECISION, Arc, Dieline, Line, LineType, Operation, Point, Segment, _round_pt
+from .curves import FIT_TOL_IN
 from .rules import PERF_CUT, PERF_TIE, RuleSpec
 from .shapes import Prim, bbox as prim_bbox, transform
 
@@ -536,8 +537,8 @@ _FITTED_LOCK = threading.Lock()
 def _fitted(geometry: Any, sz: dict[str, Any], natural: float | None, closed: bool, what: str) -> tuple:
     from .artwork_import import from_json  # noqa: PLC0415
 
-    key = hashlib.sha256(json.dumps([geometry, sz, natural, closed, what], sort_keys=True,
-                                    default=str).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps([geometry, sz, natural, closed, FIT_TOL_IN], sort_keys=True,
+                                    default=str).encode()).hexdigest()  # `what` only words errors
     with _FITTED_LOCK:
         hit = _FITTED.get(key)
         if hit is not None:
@@ -546,7 +547,7 @@ def _fitted(geometry: Any, sz: dict[str, Any], natural: float | None, closed: bo
     subs = from_json(geometry)
     box = src.subs_bbox(subs)
     k = src.scale_for(box, sz, natural, what)
-    cs, fallback = src.finish(subs, k, declared_closed=closed, what=what)
+    cs, fallback = src.finish(subs, k, declared_closed=closed, what=what, box=box, tol=FIT_TOL_IN)
     got = (box, k, cs, fallback)
     with _FITTED_LOCK:
         _FITTED[key] = copy.deepcopy(got)

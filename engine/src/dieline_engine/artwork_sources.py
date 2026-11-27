@@ -132,10 +132,10 @@ def scale_for(box: tuple[float, float, float, float], size: dict[str, float], na
 
 
 def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT_TOL_IN,
-           what: str = "the artwork") -> tuple[list[Contour], int]:
+           what: str = "the artwork", box: tuple[float, float, float, float] | None = None) -> tuple[list[Contour], int]:
     """Scale by k about the outline's centre, fit the curves at final size, close what may be closed.
-    Returns the contours and how many chords stand in for arcs."""
-    x0, y0, x1, y1 = subs_bbox(subs)
+    Returns the contours and how many chords stand in for arcs. `box` is subs_bbox(subs), if known."""
+    x0, y0, x1, y1 = box if box is not None else subs_bbox(subs)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
 
     def f(p: Point) -> Point:

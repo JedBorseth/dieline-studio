@@ -27,6 +27,7 @@ Point = tuple[float, float]
 FIT_TOL_IN = 0.002
 MAX_DEPTH = 14
 MAX_SPLINE_POINTS = 5000  # control points in one spline, as stored geometry allows
+MAX_IMPORT_SPLINE_POINTS = 10000  # in all of one import's splines: keeps a cold build well inside a minute
 ARC_CORRECTION_MAX = 0.01  # an SVG arc's radius may be enlarged by at most 1%
 
 
@@ -138,11 +139,29 @@ def sample_ts(curve: Curve, n: int = 48, per: int | None = None) -> list[float]:
 
 
 def sample_points(curve: Curve, n: int = 48) -> list[Point]:
-    """Points along a curve, every span of it included (for its extent)."""
+    """Points along a curve for its extent: every span, as densely as its degree needs, then closer
+    in round the furthest each way (a peak between samples would size the artwork wrong)."""
     pts = curve.polyline()
     if pts is not None:
         return pts
-    return [q.point(t) for q in curve.pieces() for t in sample_ts(q, n, 4)]
+    out: list[Point] = []
+    for q in curve.pieces():
+        ts = sample_ts(q, n)
+        got = [(t, q.point(t)) for t in ts]
+        for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            best = sorted(got, key=lambda x: -sign * x[1][axis])[:3]
+            for t, _ in best:
+                i = bisect.bisect_left(ts, t)
+                lo, hi = ts[max(i - 1, 0)], ts[min(i + 1, len(ts) - 1)]
+                for _ in range(6):
+                    cand = [(lo + (hi - lo) * j / 8, None) for j in range(9)]
+                    cand = [(v, q.point(v)) for v, _p in cand]
+                    v, pv = max(cand, key=lambda x: sign * x[1][axis])
+                    got.append((v, pv))
+                    w = (hi - lo) / 8
+                    lo, hi = max(v - w, 0.0), min(v + w, 1.0)
+        out += [p for _, p in got]
+    return out
 
 
 def _radii(curve: Curve, brk: list[float], ts: list[float]) -> list[tuple[float, Point, float]]:
@@ -375,10 +394,19 @@ class Nurbs(Curve):
 
     def curvature_radius(self, u: float, s: int) -> float | None:
         """The exact radius of curvature at u on span s (rational splines too); None where straight."""
-        p, k = self.degree, self.knots
+        p = self.degree
         if p < 2:
             return None
-        q = self._local(s)
+        # On knots made local to the span (its own [0, 1]): the radius doesn't depend on the
+        # parametrisation, and a span 1e-105 wide no longer overflows its derivatives.
+        a, b = self.knots[s], self.knots[s + 1]
+        h = b - a
+        if not h > 0:
+            return None
+        off = max(0, s - p - 1)
+        k = tuple((x - a) / h for x in self.knots[off:s + p + 3])
+        u, s_full, s = (u - a) / h, s, s - off
+        q = self._local(s_full)
         c = _deboor(q, p, s, u, k, 0)
         d1 = _diff(q, p, s, k, 0)
         c1 = _deboor(d1, p - 1, s - 1, u, k, 1)
@@ -389,12 +417,15 @@ class Nurbs(Curve):
             return None
         pt = (c[0] / w, c[1] / w)
         v = ((c1[0] - w1 * pt[0]) / w, (c1[1] - w1 * pt[1]) / w)
-        a = ((c2[0] - 2 * w1 * v[0] - w2 * pt[0]) / w, (c2[1] - 2 * w1 * v[1] - w2 * pt[1]) / w)
+        acc = ((c2[0] - 2 * w1 * v[0] - w2 * pt[0]) / w, (c2[1] - 2 * w1 * v[1] - w2 * pt[1]) / w)
         sp = math.hypot(*v)
-        cr = abs(_cross(v, a))
-        if sp <= 1e-300 or cr <= 1e-300:
+        cr = abs(_cross(v, acc))
+        if not (sp > 1e-300 and cr > 1e-300 and math.isfinite(sp) and math.isfinite(cr)):
             return None
-        return sp ** 3 / cr
+        try:
+            return sp * (sp / cr) * sp
+        except OverflowError:
+            return None
 
     def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
         """Exact curvature: four samples through each span and evenly along the curve, refined round
@@ -404,13 +435,14 @@ class Nurbs(Curve):
         p, k = self.degree, self.knots
         lo, hi = k[p], k[len(self.ctrl)]
         spans = [s for s in range(p, len(self.ctrl)) if k[s + 1] > k[s]]
-        us: dict[float, int] = {}
+        # (u, span): a knot shared by two spans is measured on each side (a corner of curvature).
+        us: set[tuple[float, int]] = set()
         for s in spans:
             for j in range(5):
-                us.setdefault(k[s] + (k[s + 1] - k[s]) * j / 4, s)
+                us.add((k[s] + (k[s + 1] - k[s]) * j / 4, s))
         for i in range(n + 1):
             u = lo + (hi - lo) * i / n
-            us.setdefault(u, self._span(u))
+            us.add((u, self._span(u)))
 
         def radii(items):
             out = []
@@ -420,20 +452,19 @@ class Nurbs(Curve):
                     out.append((r, u, s))
             return out
 
-        got = radii(us.items())
+        got = radii(sorted(us))
         for _ in range(6):
             if not got:
                 break
-            more: dict[float, int] = {}
+            more: set[tuple[float, int]] = set()
             for _r, u, s in sorted(got)[:4]:
                 a, b = k[s], k[s + 1]
                 width = (b - a) / 4 ** (_ + 1)
                 for j in range(-3, 4):
-                    v = min(max(u + width * j / 4, a), b)
-                    if v not in us:
-                        more[v] = s
-            us.update(more)
-            got += radii(more.items())
+                    more.add((min(max(u + width * j / 4, a), b), s))
+            more -= us
+            us |= more
+            got += radii(sorted(more))
         return [(r, self.at(u, s)) for r, u, s in got]
 
     def point(self, t: float) -> Point:
@@ -533,13 +564,16 @@ def check_nurbs(degree: int, knots: list[float], ctrl: list[Point], weights: lis
     runs = Counter(u for u in knots[degree + 1:len(ctrl)] if lo < u < hi)
     if any(m > degree for m in runs.values()):
         c = Nurbs(degree, tuple(knots), tuple(ctrl), tuple(weights))
-        size = max(max(abs(v) for q in ctrl for v in q), 1.0)
+        xs, ys = [q[0] for q in ctrl], [q[1] for q in ctrl]
+        extent = max(max(xs) - min(xs), max(ys) - min(ys), 1e-12)  # its own size, not where it sits
+        far = max(max(abs(v) for v in xs), max(abs(v) for v in ys))
+        allow = 1e-9 * extent + 64 * math.ulp(far)  # rounding at that distance from the origin
         for u, m in runs.items():
             if m <= degree:
                 continue
             left = c.at(u, bisect.bisect_left(knots, u) - 1)
             right = c.at(u, c._span(u))
-            if math.dist(left, right) > 1e-9 * size:
+            if math.dist(left, right) > allow:
                 raise CurveError("a spline with a gap in it (a knot repeated past its degree, its two sides "
                                  "apart); split it into separate curves")
 
@@ -757,7 +791,7 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN, limit: int | None = None) -> Fit:
         for piece in curve.pieces():
             _fit_piece(piece, tol, out)
     _join_lines(out)
-    if out.limit is not None and len(out.prims) > out.limit:
+    if out.limit is not None and _kept(out.prims) > out.limit:
         raise TooManySegments("too many segments after fitting")
     # Chain exactly: each piece starts where the last ended.
     fixed: list[Prim] = []
@@ -767,6 +801,11 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN, limit: int | None = None) -> Fit:
         cur = pr.end
     out.prims = fixed
     return out
+
+
+def _kept(prims: list[Prim]) -> int:
+    """Segments the artwork keeps (finish() drops anything a billionth of an inch or shorter)."""
+    return sum(1 for p in prims if p.full or math.dist(p.start, p.end) > 1e-9)
 
 
 def _join_lines(out: Fit) -> None:
@@ -811,7 +850,7 @@ def _fit_piece(curve: Curve, tol: float, out: Fit) -> None:
     def budget() -> None:
         if out.limit is not None and len(out.prims) > out.check_at:
             _join_lines(out)
-            if len(out.prims) > out.limit:
+            if _kept(out.prims) > out.limit:
                 raise TooManySegments("too many segments after fitting")
             out.check_at = max(out.limit, 2 * len(out.prims) + 64)
 

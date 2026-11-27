@@ -1056,7 +1056,7 @@ def test_a_large_straight_import_builds_well_inside_the_desktop_deadline(tmp_pat
     n = 5000
     knots = (0.0,) * 11 + tuple(j / 4990 for j in range(1, 4990)) + (1.0,) * 11
     subs = [asrc.Sub([curves.Nurbs(10, knots, tuple((i * .002, float(row)) for i in range(n)))], False, "crease")
-            for row in range(3)]
+            for row in range(2)]
     item = {"id": "a1", "kind": "import", "path": "x.dxf", "width": 3, "placement": MID,
             "source": {"geometry": ai.to_json(subs), "units_in": 1.0, "name": "x.dxf", "format": "dxf"}}
     store = SettingsStore(tmp_path / "settings.json")
@@ -1067,6 +1067,39 @@ def test_a_large_straight_import_builds_well_inside_the_desktop_deadline(tmp_pat
     assert shown["parts"][0]["features"][0]["status"] == "ok"
     assert time.perf_counter() - t < 20
     server._pool.shutdown()
+    # More spline points than an import can take are refused, whether read from a file or stored.
+    third = asrc.Sub([curves.Nurbs(10, knots, tuple((i * .002, 2.0) for i in range(n)))], False, "crease")
+    with pytest.raises(asrc.SourceError, match="control points in all"):
+        ai.from_json(ai.to_json([*subs, third]))
+
+
+def test_round_five_spline_cases():
+    """Review of the v0.4.0 fixes, round 5."""
+    # Both sides of a shared knot are measured: 0.140 in on the left, 0.025 in on the right.
+    c = curves.Nurbs(2, (0, 0, 0, .5, .5, 1, 1, 1), ((-.14, .14), (-.14, 0), (0, 0), (.05, 0), (2, .2)),
+                     (1, math.sqrt(.5), 1, 1, 1))
+    assert min(r for r, _ in c.radius_samples()) == pytest.approx(0.025, abs=1e-4)
+    # A peak between samples still sizes the artwork: 3 in tall means 3 in.
+    peak = curves.Nurbs(2, (0, 0, 0, .493, .493, .512, .531, 1, 1, 1),
+                        ((-1, 0), (-.5, 0), (0, 0), (.1, 1), (.2, -17 / 7), (.5, 0), (1, 0)))
+    subs = [asrc.Sub([peak], False, "crease"), asrc.Sub([asrc.Prim((-1, -3), (1, -3))], False, "crease")]
+    box = asrc.subs_bbox(subs)
+    cs, _ = asrc.finish(subs, 3 / (box[3] - box[1]), declared_closed=False, box=box)
+    ys = [q[1] for c_ in cs for p in c_.prims for q in curves.prim_points(p, 16)]
+    assert max(ys) - min(ys) == pytest.approx(3, abs=1e-3)
+    # A gap far from the origin is still a gap; a join there isn't.
+    with pytest.raises(curves.CurveError, match="gap"):
+        curves.check_nurbs(1, [0, 0, .5, .5, 1, 1], [(1e8, 0), (1e8 + 1, 0), (1e8 + 1, .05), (1e8 + 2, .05)], [])
+    curves.check_nurbs(1, [0, 0, .5, .5, 1, 1], [(1e8, 0), (1e8 + 1, 0), (1e8 + 1, 0), (1e8 + 2, .05)], [])
+    # Rescaling the knots doesn't change the curve or its radius.
+    tiny = curves.Nurbs(2, (0, 0, 0, 1e-105, 1e-105, 1e-105), ((0, 0), (.5, 1), (1, 0)))
+    unit = curves.Nurbs(2, (0, 0, 0, 1, 1, 1), ((0, 0), (.5, 1), (1, 0)))
+    assert min(r for r, _ in tiny.radius_samples()) == pytest.approx(min(r for r, _ in unit.radius_samples()))
+    # Artwork that ends at exactly the segment limit is kept (a sub-nanoinch piece is dropped, not counted).
+    poly = asrc.Sub([asrc.Prim((i % 2, .01 * i), ((i + 1) % 2, .01 * (i + 1))) for i in range(4999)], False, "crease")
+    spline = asrc.Sub([curves.Nurbs(1, (0, 0, .5, 1, 1), ((0, 60), (1, 60), (1, 60 + 1e-8)))], False, "crease")
+    cs, _ = asrc.finish([poly, spline], 1 / 25.4, declared_closed=False)
+    assert [len(c_.prims) for c_ in cs] == [4999, 1]
 
 
 def test_joined_fallback_chords_are_counted_once():

@@ -32,7 +32,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .artwork_sources import Sub, SourceError, parse_path
-from .curves import AxisEllipse, Bezier, CurveError, Nurbs, check_nurbs, reverse_curve
+from .curves import (MAX_IMPORT_SPLINE_POINTS, AxisEllipse, Bezier, CurveError, Nurbs, check_nurbs,
+                     reverse_curve)
 from .shapes import Prim
 
 Point = tuple[float, float]
@@ -831,6 +832,7 @@ def parse_dxf(data: bytes) -> Parsed:
         raise ImportRefused(f"the DXF has geometry out of the drawing plane ({listed}); flatten it to 2D first")
     out.unsupported = [f"{n} x {k}" if n > 1 else k for k, n in unsupported.items()]
     out.subs = chain(pieces)
+    _spline_budget(out.subs, ImportRefused)
     if not out.subs:
         raise ImportRefused("the DXF draws no lines, arcs, circles, polylines, splines or ellipses"
                             + (f"; it has {', '.join(out.unsupported)}" if out.unsupported else ""))
@@ -995,4 +997,14 @@ def from_json(raw: Any) -> list[Sub]:
             raise SourceError("imported geometry has an unknown rule")
         if pieces:
             out.append(Sub(pieces, bool(s.get("closed")), rule))
+    _spline_budget(out, SourceError)
     return out
+
+
+def _spline_budget(subs: list[Sub], error: type[Exception]) -> None:
+    """All of an import's splines together (blocks counted each time they're placed): fitting them is
+    the slow part of building it."""
+    n = sum(len(p.ctrl) for s in subs for p in s.pieces if isinstance(p, Nurbs))
+    if n > MAX_IMPORT_SPLINE_POINTS:
+        raise error(f"the file's splines have {n} control points in all, over the {MAX_IMPORT_SPLINE_POINTS} an "
+                    "import can take; simplify them or import the drawing in parts")
