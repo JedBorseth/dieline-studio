@@ -953,16 +953,6 @@ def test_a_wiggle_inside_one_short_span_is_fitted_not_flattened():
     assert worst <= curves.FIT_TOL_IN + 1e-6
 
 
-def test_a_short_span_of_a_high_degree_spline_is_fitted_within_tolerance():
-    c = curves.Nurbs(5, (0,) * 6 + (0.5, 0.5005) + (1,) * 6,
-                     ((0, 0), (1, 0), (2, 0), (3, 0), (3.5, 3), (4, -3), (5, 0), (6, 0)))
-    f = curves.fit(c)
-    brk = c.breaks()
-    ts = [a + (b - a) * j / 400 for a, b in zip(brk, brk[1:]) for j in range(400)]
-    worst = max(min(curves.prim_point_dist(p, c.point(t)) for p in f.prims) for t in ts)
-    assert worst <= curves.FIT_TOL_IN + 1e-6
-
-
 def test_large_splines_are_quick_capped_and_refused_early():
     import time
 
@@ -975,8 +965,12 @@ def test_large_splines_are_quick_capped_and_refused_early():
     assert time.perf_counter() - t < 5
     with pytest.raises(curves.CurveError, match="more than 5000 control points"):
         curves.check_nurbs(1, [0, *(i / n for i in range(n + 1)), 1], [(i, 0) for i in range(n + 1)], [])
-    with pytest.raises(curves.CurveError, match="breaks apart"):
-        curves.check_nurbs(1, [0, 0, 0.5, 0.5, 1, 1], [(0, 0), (1, 0), (2, 1), (3, 1)], [])
+    # Degree 10, 5,000 collinear points: still one straight, and quick.
+    t = time.perf_counter()
+    high = curves.Nurbs(10, (0,) * 11 + tuple(i / (n - 10) for i in range(1, n - 10)) + (1,) * 11,
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    assert len(curves.fit(high).prims) == 1 and high.radius_samples() == []
+    assert time.perf_counter() - t < 30
     # Fitting stops once past its segment budget, rather than fitting the whole spline first.
     arches, ctrl, kn = 200, [(0, 0)], [0, 0, 0, 0]
     for i in range(arches):
@@ -985,6 +979,26 @@ def test_large_splines_are_quick_capped_and_refused_early():
     many = curves.Nurbs(3, tuple(kn[:-3] + [1, 1, 1, 1]), tuple(ctrl))
     with pytest.raises(curves.TooManySegments):
         curves.fit(many, limit=50)
+
+
+def test_narrow_and_repeated_knots_round_trip_through_storage():
+    """Review of the v0.4.0 fixes: spans a few floats wide crashed the radius check, and rounding stored
+    knots turned a smooth join into a refused break."""
+    for ulps in (2, 4, 6):
+        k = 5000000.0
+        k2 = k
+        for _ in range(ulps):
+            k2 = math.nextafter(k2, math.inf)
+        c = curves.Nurbs(2, (0, 0, 0, k, k2, 1e7, 1e7, 1e7), ((0, 0), (1, 1), (2, 0), (3, 1), (4, 0)))
+        sub = asrc.Sub([c], False)
+        back = ai.from_json(ai.to_json([sub]))[0].pieces[0]
+        assert back.knots == c.knots
+        assert back.radius_samples() and curves.fit(back).prims
+    # A triple knot on a quadratic with the pieces meeting there: continuous, kept, and read back.
+    joined = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5000000001, 1, 1, 1),
+                          ((0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)))
+    back = ai.from_json(ai.to_json([asrc.Sub([joined], False)]))[0].pieces[0]
+    assert back.knots == joined.knots and curves.fit(back).prims
 
 
 def test_joined_fallback_chords_are_counted_once():

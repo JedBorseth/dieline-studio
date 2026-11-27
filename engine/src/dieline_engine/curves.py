@@ -109,18 +109,22 @@ class Curve:
         out = []
         for piece in self.pieces():
             brk = piece.breaks()
-            ts = sample_ts(piece, max(n, 8 * (len(brk) - 1)))
+            # Evenly, and four through each span (a spline of thousands of spans stays quick).
+            ts = sorted({*(i / n for i in range(n + 1)),
+                         *(a + (b - a) * j / 4 for a, b in zip(brk, brk[1:]) if b > a for j in range(4))})
             got = _radii(piece, brk, ts)
             # Refine round the tightest few: a hairpin's peak can sit between samples.
-            for _ in range(2):
-                tight = sorted(got, key=lambda x: x[0])[:3]
-                more = []
-                for _r, _p, t in tight:
+            for _ in range(6):  # each round narrows the bracket round each of the tightest
+                if not got:
+                    break
+                more = set()
+                for _r, _p, t in sorted(got, key=lambda x: x[0])[:4]:
                     i = bisect.bisect_left(ts, t)
                     lo, hi = ts[max(i - 1, 0)], ts[min(i + 1, len(ts) - 1)]
-                    more += [lo + (hi - lo) * j / 8 for j in range(1, 8)]
+                    more |= {lo + (hi - lo) * j / 8 for j in range(1, 8)}
+                more -= set(ts)
+                got += _radii(piece, brk, sorted(more))
                 ts = sorted({*ts, *more})
-                got = _radii(piece, brk, ts)
             out += [(r, q) for r, q, _t in got]
         return out
 
@@ -142,22 +146,26 @@ def sample_points(curve: Curve, n: int = 48) -> list[Point]:
 
 
 def _radii(curve: Curve, brk: list[float], ts: list[float]) -> list[tuple[float, Point, float]]:
+    """The radius at each t: the circle through the curve at t and just either side of it, all three
+    inside t's own span (never across a knot). No parameter step is divided by, so a span a few
+    floats wide is simply skipped when its points coincide."""
     out = []
     for t in ts:
         i = min(max(bisect.bisect_right(brk, t), 1), len(brk) - 1)
-        h = min(1e-4, (brk[i] - brk[i - 1]) / 4)  # differences stay inside the span
-        t0, t1 = max(t - h, 0.0), min(t + h, 1.0)
-        if t1 <= t0:  # a span too short to difference in floating point
-            continue
-        hd = (t1 - t0) / 8
-        d0, d1 = curve.deriv(t0, hd), curve.deriv(t1, hd)
-        d = curve.deriv(t, hd)
-        dd = ((d1[0] - d0[0]) / (t1 - t0), (d1[1] - d0[1]) / (t1 - t0))
-        k = _cross(d, dd)
-        sp = math.hypot(*d)
-        if abs(k) <= 1e-12 or sp <= 1e-12:
-            continue
-        out.append((sp ** 3 / abs(k), curve.point(t), t))
+        a, b = brk[i - 1], brk[i]
+        h = min(1e-4, (b - a) / 4)
+        t0, t1 = max(t - h, a), min(t + h, b)
+        if not t0 < t < t1:
+            t = (t0 + t1) / 2
+            if not t0 < t < t1:
+                continue
+        p0, p, p1 = curve.point(t0), curve.point(t), curve.point(t1)
+        u, v, w = _sub(p, p0), _sub(p1, p), _sub(p1, p0)
+        cr = abs(_cross(u, v))
+        lu, lv, lw = math.hypot(*u), math.hypot(*v), math.hypot(*w)
+        if cr <= 1e-15 * max(lu * lv, 1e-300) or min(lu, lv) <= 1e-12:
+            continue  # straight there, or the points coincide
+        out.append((lu * lv * lw / (2 * cr), p, t))
     return out
 
 
@@ -382,7 +390,7 @@ class Nurbs(Curve):
         return out
 
     def per_span(self) -> int:
-        return max(8, 2 * (self.degree + 1))
+        return max(8, self.degree + 3)
 
     def polyline(self) -> list[Point] | None:
         """A degree-1 spline is straight between its knots (rational ones too), through these points."""
@@ -407,10 +415,6 @@ def check_nurbs(degree: int, knots: list[float], ctrl: list[Point], weights: lis
         raise CurveError("a spline with bad weights")
     if len(ctrl) > MAX_SPLINE_POINTS:
         raise CurveError(f"a spline of more than {MAX_SPLINE_POINTS} control points; simplify it")
-    lo, hi = knots[degree], knots[len(ctrl)]
-    runs = Counter(u for u in knots[degree + 1:len(ctrl)] if lo < u < hi)
-    if any(m > degree for m in runs.values()):
-        raise CurveError("a spline that breaks apart at a knot (repeated more than its degree)")
 
 
 # ------------------------------------------------------------------ SVG arcs
