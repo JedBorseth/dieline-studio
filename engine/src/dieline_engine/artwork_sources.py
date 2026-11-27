@@ -155,7 +155,7 @@ def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT
                 continue
             curve = p.map(f)
             try:
-                ft = fit(curve, tol, MAX_SEGMENTS)  # the exact count is checked below, after clean-up
+                ft = fit(curve, tol, MAX_SEGMENTS - total)  # the exact count is checked below, after clean-up
             except TooManySegments:
                 raise SourceError(f"{what} has more than {MAX_SEGMENTS} segments after fitting; simplify it") \
                     from None

@@ -36,6 +36,8 @@ import copy
 import hashlib
 import json
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -524,14 +526,41 @@ def local(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
         raise ArtworkError(str(exc)) from None
 
 
-def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
+# Fitted imports, by what decides them (geometry, size, closed): a design is built several times a
+# request (store, checks, scene), and a large spline is seconds of fitting each time.
+_FITTED: "OrderedDict[str, tuple]" = OrderedDict()
+_FITTED_MAX = 16
+_FITTED_LOCK = threading.Lock()
+
+
+def _fitted(geometry: Any, sz: dict[str, Any], natural: float | None, closed: bool, what: str) -> tuple:
     from .artwork_import import from_json  # noqa: PLC0415
+
+    key = hashlib.sha256(json.dumps([geometry, sz, natural, closed, what], sort_keys=True,
+                                    default=str).encode()).hexdigest()
+    with _FITTED_LOCK:
+        hit = _FITTED.get(key)
+        if hit is not None:
+            _FITTED.move_to_end(key)
+            return copy.deepcopy(hit)
+    subs = from_json(geometry)
+    box = src.subs_bbox(subs)
+    k = src.scale_for(box, sz, natural, what)
+    cs, fallback = src.finish(subs, k, declared_closed=closed, what=what)
+    got = (box, k, cs, fallback)
+    with _FITTED_LOCK:
+        _FITTED[key] = copy.deepcopy(got)
+        while len(_FITTED) > _FITTED_MAX:
+            _FITTED.popitem(last=False)
+    return got
+
+
+def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
     from .checks import fmt_in  # noqa: PLC0415
 
     source = spec.get("source")
     if not isinstance(source, dict):
         raise ArtworkError(f"{what}: this import hasn't been approved yet, so it has no geometry")
-    subs = from_json(source["geometry"])
     natural = source.get("units_in")
     if natural is None and spec.get("units"):
         natural = UNITS_IN[spec["units"]]
@@ -541,9 +570,7 @@ def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
     for k in ("width", "height"):
         if spec.get(k) is not None:
             sz[k] = ctx.size(spec[k], f"{what} {k}")
-    box = src.subs_bbox(subs)
-    k = src.scale_for(box, sz, natural, what)
-    cs, fallback = src.finish(subs, k, declared_closed=bool(spec.get("closed")), what=what)
+    box, k, cs, fallback = _fitted(source["geometry"], sz, natural, bool(spec.get("closed")), what)
     w, h = (box[2] - box[0]) * k, (box[3] - box[1]) * k
     fmt = str(source.get("format", "file")).upper()
     words = (f"imported {fmt} {source.get('name', '')} (sha256 {str(source.get('sha256', ''))[:12]}), "

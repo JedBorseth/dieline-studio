@@ -129,10 +129,10 @@ class Curve:
         return out
 
 
-def sample_ts(curve: Curve, n: int = 48) -> list[float]:
-    """t values along a curve: n evenly, and the curve's own per-span samples through each span."""
+def sample_ts(curve: Curve, n: int = 48, per: int | None = None) -> list[float]:
+    """t values along a curve: n evenly, and `per` (else the curve's own) through each span."""
     ts = curve.breaks()
-    per = curve.per_span() if len(ts) > 2 else 1
+    per = (per or curve.per_span()) if len(ts) > 2 else 1
     return sorted({*(i / n for i in range(n + 1)),
                    *(a + (b - a) * j / per for a, b in zip(ts, ts[1:]) if b > a for j in range(per)), 1.0})
 
@@ -142,7 +142,7 @@ def sample_points(curve: Curve, n: int = 48) -> list[Point]:
     pts = curve.polyline()
     if pts is not None:
         return pts
-    return [q.point(t) for q in curve.pieces() for t in sample_ts(q, n)]
+    return [q.point(t) for q in curve.pieces() for t in sample_ts(q, n, 4)]
 
 
 def _radii(curve: Curve, brk: list[float], ts: list[float]) -> list[tuple[float, Point, float]]:
@@ -318,6 +318,28 @@ def reverse_curve(c: Curve) -> Curve:
     raise CurveError(f"can't reverse a {type(c).__name__}")
 
 
+def _deboor(pts: list[list[float]], deg: int, s: int, u: float, k: tuple[float, ...], o: int) -> list[float]:
+    """De Boor on span s's deg + 1 local points; knot i is k[i + o] (o shifts it for a derivative)."""
+    d = [list(q) for q in pts]
+    for r in range(1, deg + 1):
+        for j in range(deg, r - 1, -1):
+            i = s - deg + j
+            den = k[i + deg - r + 1 + o] - k[i + o]
+            a = 0.0 if den == 0 else (u - k[i + o]) / den
+            d[j] = [(1 - a) * x + a * y for x, y in zip(d[j - 1], d[j])]
+    return d[deg]
+
+
+def _diff(pts: list[list[float]], deg: int, s: int, k: tuple[float, ...], o: int) -> list[list[float]]:
+    """The derivative's deg local points for the same span (degree deg - 1, knots shifted by one)."""
+    out = []
+    for j in range(deg):
+        i = s - deg + j
+        den = k[i + deg + 1 + o] - k[i + 1 + o]
+        out.append([deg * (y - x) / den if den else 0.0 for x, y in zip(pts[j], pts[j + 1])])
+    return out
+
+
 @dataclass(slots=True)
 class Nurbs(Curve):
     """A (rational) B-spline, as DXF SPLINE stores it: degree, knots, control points, weights."""
@@ -340,6 +362,79 @@ class Nurbs(Curve):
             else:
                 lo = mid
         return lo
+
+    def _local(self, s: int) -> list[list[float]]:
+        w = self.weights
+        return [[self.ctrl[j][0] * (w[j] if w else 1.0), self.ctrl[j][1] * (w[j] if w else 1.0), w[j] if w else 1.0]
+                for j in range(s - self.degree, s + 1)]
+
+    def at(self, u: float, s: int) -> Point:
+        """The point at knot value u, evaluated on span s (s's left end, or a knot's left limit)."""
+        x, y, ww = _deboor(self._local(s), self.degree, s, u, self.knots, 0)
+        return (x / ww, y / ww)
+
+    def curvature_radius(self, u: float, s: int) -> float | None:
+        """The exact radius of curvature at u on span s (rational splines too); None where straight."""
+        p, k = self.degree, self.knots
+        if p < 2:
+            return None
+        q = self._local(s)
+        c = _deboor(q, p, s, u, k, 0)
+        d1 = _diff(q, p, s, k, 0)
+        c1 = _deboor(d1, p - 1, s - 1, u, k, 1)
+        d2 = _diff(d1, p - 1, s - 1, k, 1)
+        c2 = _deboor(d2, p - 2, s - 2, u, k, 2)
+        w, w1, w2 = c[2], c1[2], c2[2]
+        if w <= 0:
+            return None
+        pt = (c[0] / w, c[1] / w)
+        v = ((c1[0] - w1 * pt[0]) / w, (c1[1] - w1 * pt[1]) / w)
+        a = ((c2[0] - 2 * w1 * v[0] - w2 * pt[0]) / w, (c2[1] - 2 * w1 * v[1] - w2 * pt[1]) / w)
+        sp = math.hypot(*v)
+        cr = abs(_cross(v, a))
+        if sp <= 1e-300 or cr <= 1e-300:
+            return None
+        return sp ** 3 / cr
+
+    def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
+        """Exact curvature: four samples through each span and evenly along the curve, refined round
+        the tightest. Each sample is on its own span, so nothing is measured across a knot."""
+        if self.polyline() is not None:
+            return []
+        p, k = self.degree, self.knots
+        lo, hi = k[p], k[len(self.ctrl)]
+        spans = [s for s in range(p, len(self.ctrl)) if k[s + 1] > k[s]]
+        us: dict[float, int] = {}
+        for s in spans:
+            for j in range(5):
+                us.setdefault(k[s] + (k[s + 1] - k[s]) * j / 4, s)
+        for i in range(n + 1):
+            u = lo + (hi - lo) * i / n
+            us.setdefault(u, self._span(u))
+
+        def radii(items):
+            out = []
+            for u, s in items:
+                r = self.curvature_radius(u, s)
+                if r is not None:
+                    out.append((r, u, s))
+            return out
+
+        got = radii(us.items())
+        for _ in range(6):
+            if not got:
+                break
+            more: dict[float, int] = {}
+            for _r, u, s in sorted(got)[:4]:
+                a, b = k[s], k[s + 1]
+                width = (b - a) / 4 ** (_ + 1)
+                for j in range(-3, 4):
+                    v = min(max(u + width * j / 4, a), b)
+                    if v not in us:
+                        more[v] = s
+            us.update(more)
+            got += radii(more.items())
+        return [(r, self.at(u, s)) for r, u, s in got]
 
     def point(self, t: float) -> Point:
         p, k = self.degree, self.knots
@@ -386,17 +481,34 @@ class Nurbs(Curve):
             if b <= a:
                 continue
             inner = brk[bisect.bisect_right(brk, a):bisect.bisect_left(brk, b)]
-            out.append(Window(self, a, b, [0.0, *((u - a) / (b - a) for u in inner), 1.0]))
+            out.append(Window(self, a, b, sorted({0.0, 1.0, *((u - a) / (b - a) for u in inner)})))
         return out
 
     def per_span(self) -> int:
         return max(8, self.degree + 3)
 
     def polyline(self) -> list[Point] | None:
-        """A degree-1 spline is straight between its knots (rational ones too), through these points."""
-        if self.degree != 1:
+        """Exact straights: a degree-1 spline between its knots (rational too), or any spline whose
+        control points run one way along one line (the curve can't leave it or turn back)."""
+        if self.degree == 1:
+            return [self.point(t) for t in self.breaks()]
+        c = self.ctrl
+        a, b = c[0], c[-1]
+        d = _sub(b, a)
+        L = math.hypot(*d)
+        if L <= 1e-12:
             return None
-        return [self.point(t) for t in self.breaks()]
+        ux, uy = d[0] / L, d[1] / L
+        last = -math.inf
+        for q in c:
+            dx, dy = q[0] - a[0], q[1] - a[1]
+            if abs(dx * uy - dy * ux) > 1e-12 * max(L, 1.0):
+                return None
+            along = dx * ux + dy * uy
+            if along < last - 1e-12 * max(L, 1.0):
+                return None
+            last = along
+        return [self.point(0.0), self.point(1.0)]
 
 
 def check_nurbs(degree: int, knots: list[float], ctrl: list[Point], weights: list[float]) -> None:
@@ -415,6 +527,21 @@ def check_nurbs(degree: int, knots: list[float], ctrl: list[Point], weights: lis
         raise CurveError("a spline with bad weights")
     if len(ctrl) > MAX_SPLINE_POINTS:
         raise CurveError(f"a spline of more than {MAX_SPLINE_POINTS} control points; simplify it")
+    # A knot repeated past the degree can split the spline: fine where both sides meet, refused where
+    # there's a gap (it would be drawn across, or a piece dropped).
+    lo, hi = knots[degree], knots[len(ctrl)]
+    runs = Counter(u for u in knots[degree + 1:len(ctrl)] if lo < u < hi)
+    if any(m > degree for m in runs.values()):
+        c = Nurbs(degree, tuple(knots), tuple(ctrl), tuple(weights))
+        size = max(max(abs(v) for q in ctrl for v in q), 1.0)
+        for u, m in runs.items():
+            if m <= degree:
+                continue
+            left = c.at(u, bisect.bisect_left(knots, u) - 1)
+            right = c.at(u, c._span(u))
+            if math.dist(left, right) > 1e-9 * size:
+                raise CurveError("a spline with a gap in it (a knot repeated past its degree, its two sides "
+                                 "apart); split it into separate curves")
 
 
 # ------------------------------------------------------------------ SVG arcs
@@ -583,20 +710,28 @@ def prim_points(pr: Prim, n: int = 8) -> list[Point]:
     return [(c[0] + r * math.cos(a0 + sweep * i / n), c[1] + r * math.sin(a0 + sweep * i / n)) for i in range(n + 1)]
 
 
-def _deviation(curve: Curve, ta: float, tb: float, prims: list[Prim], extra: list[float] = ()) -> float:
+def _deviation(curve: Curve, ta: float, tb: float, prims: list[Prim],
+               extra: list[tuple[float, Point]] = (), tol: float = math.inf) -> float:
     """Two-way: curve samples to the arcs, and arc samples to a dense polyline of the curve. `extra`
-    are more samples (each span of a spline in range, which even spacing can step over)."""
+    are more samples, already evaluated (through each span of a spline, which even spacing can step
+    over). Stops as soon as it's past tol: the caller only needs to know it didn't fit."""
     worst = 0.0
     m = 24
-    for t in [ta + (tb - ta) * i / m for i in range(1, m)] + list(extra):
-        p = curve.point(t)
+    even = [(ta + (tb - ta) * i / m, None) for i in range(1, m)]
+    for t, p in [*even, *extra]:  # even samples first: a poor fit shows there, cheaply
+        p = curve.point(t) if p is None else p
         worst = max(worst, min(prim_point_dist(pr, p) for pr in prims))
-    dense = [curve.point(t) for t in sorted({*(ta + (tb - ta) * i / 96 for i in range(97)), *extra})]
-    chords = [Prim(a, b) for a, b in zip(dense, dense[1:]) if math.dist(a, b) > 0]
+        if worst > tol:
+            return worst
+    dense = sorted([*((ta + (tb - ta) * i / 96, None) for i in range(97)), *extra], key=lambda x: x[0])
+    pts = [curve.point(t) if p is None else p for t, p in dense]
+    chords = [Prim(a, b) for a, b in zip(pts, pts[1:]) if math.dist(a, b) > 0]
     if chords:
         for pr in prims:
             for p in prim_points(pr, 8)[1:-1]:
                 worst = max(worst, min(prim_point_dist(c, p) for c in chords))
+                if worst > tol:
+                    return worst
     return worst
 
 
@@ -622,6 +757,8 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN, limit: int | None = None) -> Fit:
         for piece in curve.pieces():
             _fit_piece(piece, tol, out)
     _join_lines(out)
+    if out.limit is not None and len(out.prims) > out.limit:
+        raise TooManySegments("too many segments after fitting")
     # Chain exactly: each piece starts where the last ended.
     fixed: list[Prim] = []
     cur = start
@@ -663,23 +800,36 @@ def _fit_piece(curve: Curve, tol: float, out: Fit) -> None:
     # Probes inside a range besides even steps: through every span, as densely as its degree needs.
     per = curve.per_span()
     marks = sorted({a + (b - a) * j / per for a, b in zip(brk, brk[1:]) for j in range(per)}) if len(brk) > 2 else []
+    mark_pts = [curve.point(t) for t in marks]  # evaluated once, used at every level
 
-    def probes(ta: float, tb: float) -> list[float]:
+    def probes(ta: float, tb: float) -> list[tuple[float, Point]]:
         if not marks:
             return []
-        return marks[bisect.bisect_right(marks, ta):bisect.bisect_left(marks, tb)]
+        i, j = bisect.bisect_right(marks, ta), bisect.bisect_left(marks, tb)
+        return list(zip(marks[i:j], mark_pts[i:j]))
+
+    def budget() -> None:
+        if out.limit is not None and len(out.prims) > out.check_at:
+            _join_lines(out)
+            if len(out.prims) > out.limit:
+                raise TooManySegments("too many segments after fitting")
+            out.check_at = max(out.limit, 2 * len(out.prims) + 64)
 
     def excursion(ta: float, tb: float) -> float:
         """How far the curve goes from where this piece starts (a loop can start and end at one point)."""
         a = curve.point(ta)
-        ts = [ta + (tb - ta) * i / 16 for i in range(1, 17)] + probes(ta, tb)
-        return max(math.dist(a, curve.point(t)) for t in ts)
+        pts = [curve.point(ta + (tb - ta) * i / 16) for i in range(1, 17)] + [q for _, q in probes(ta, tb)]
+        return max(math.dist(a, q) for q in pts)
 
     def chords(ta: float, tb: float, depth: int = 0) -> None:
+        budget()
         a, b = curve.point(ta), curve.point(tb)
         seg = Prim(a, b)
-        dev = max(prim_point_dist(seg, curve.point(t))
-                  for t in [ta + (tb - ta) * i / 8 for i in range(1, 8)] + probes(ta, tb))
+        dev = 0.0
+        for q in [*(curve.point(ta + (tb - ta) * i / 8) for i in range(1, 8)), *(q for _, q in probes(ta, tb))]:
+            dev = max(dev, prim_point_dist(seg, q))
+            if dev > tol:
+                break
         span = math.dist(a, b)
         if span <= 1e-12 and dev <= 1e-12:
             return
@@ -697,11 +847,7 @@ def _fit_piece(curve: Curve, tol: float, out: Fit) -> None:
         chords((ta + tb) / 2, tb, depth + 1)
 
     def go(ta: float, tb: float, depth: int) -> None:
-        if out.limit is not None and len(out.prims) > out.check_at:
-            _join_lines(out)
-            if len(out.prims) > out.limit:
-                raise TooManySegments("too many segments after fitting")
-            out.check_at = max(out.limit, 2 * len(out.prims) + 64)
+        budget()
         p0, p1 = curve.point(ta), curve.point(tb)
         if math.dist(p0, p1) <= 1e-9:
             # A closed curve, or a loop of one that comes back to where it started: split it. Only a
@@ -717,7 +863,7 @@ def _fit_piece(curve: Curve, tol: float, out: Fit) -> None:
         t0, t1 = curve.tangent(ta, True), curve.tangent(tb, False)
         arcs = biarc(p0, t0, p1, t1) if t0 is not None and t1 is not None else None
         if arcs is not None:
-            dev = _deviation(curve, ta, tb, arcs, probes(ta, tb))
+            dev = _deviation(curve, ta, tb, arcs, probes(ta, tb), tol)
             if dev <= tol:
                 for pr in arcs:
                     if math.dist(pr.start, pr.end) > 1e-12:

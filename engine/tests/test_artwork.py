@@ -994,11 +994,79 @@ def test_narrow_and_repeated_knots_round_trip_through_storage():
         back = ai.from_json(ai.to_json([sub]))[0].pieces[0]
         assert back.knots == c.knots
         assert back.radius_samples() and curves.fit(back).prims
-    # A triple knot on a quadratic with the pieces meeting there: continuous, kept, and read back.
-    joined = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5000000001, 1, 1, 1),
-                          ((0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)))
-    back = ai.from_json(ai.to_json([asrc.Sub([joined], False)]))[0].pieces[0]
-    assert back.knots == joined.knots and curves.fit(back).prims
+    # Close knots on a quadratic (a double and a near one) stay apart through storage.
+    close = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5000000001, 1, 1, 1),
+                         ((0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)))
+    back = ai.from_json(ai.to_json([asrc.Sub([close], False)]))[0].pieces[0]
+    assert back.knots == close.knots and curves.fit(back).prims
+
+
+def test_a_knot_repeated_past_the_degree_is_kept_where_it_joins_and_refused_where_it_gaps():
+    """Review of the v0.4.0 fixes: a gap there was bridged by a straight, or a piece dropped."""
+    # A real triple knot on a quadratic, both sides meeting at (2, 0): continuous, so kept.
+    kn, ctrl = [0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1], [(0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)]
+    curves.check_nurbs(2, kn, ctrl, [])
+    f = curves.fit(curves.Nurbs(2, tuple(kn), tuple(ctrl)))
+    assert f.prims and any(math.dist(q, (2, 0)) < 1e-9 for p in f.prims for q in (p.start, p.end))
+    for degree, kn, ctrl in ((1, [0, 0, .5, .5, 1, 1], [(0, 0), (1, 0), (2, 1), (3, 1)]),
+                             (1, [0, 0, .5, .5, 1, 1], [(0, 0), (2, 5), (5, 0), (7, 0)]),
+                             (2, [0, 0, 0, .5, .5, .5, 1, 1, 1], [(0, 0), (1, 1), (2, 0), (3, 0), (3, 1), (4, 0)])):
+        with pytest.raises(curves.CurveError, match="gap"):
+            curves.check_nurbs(degree, kn, ctrl, [])
+
+
+def test_a_spline_bend_radius_is_exact_even_in_a_tiny_span():
+    """Review of the v0.4.0 fixes: a quarter-span circle read a 0.120 in bend as 0.25 in."""
+    a = .25 / .24
+    q = curves.Nurbs(2, (0, 0, 0, .00001, .00002, 1, 1, 1), ((-.5, a), (0, -a), (1, 3 * a), (1, 3 * a), (1, 3 * a)))
+    assert min(r for r, _ in q.radius_samples()) == pytest.approx(0.120, abs=1e-4)
+    peak = curves.Nurbs(2, (0, 0, 0, 1, 1, 1), ((0, 0), (1, 0), (0.1, 5e-8)))
+    assert min(r for r, _ in peak.radius_samples()) < 0.125
+
+
+def test_a_curvy_high_degree_spline_fits_quickly_and_chords_keep_to_the_budget():
+    """Review of the v0.4.0 fixes: every subdivision re-evaluated every probe, and chords ignored it."""
+    import time
+
+    deg, n = 10, 2000
+    knots = (0.0,) * (deg + 1) + tuple(i / (n - deg) for i in range(1, n - deg)) + (1.0,) * (deg + 1)
+    wave = curves.Nurbs(deg, knots, tuple((10 * i / (n - 1), 0.5 * math.sin(4 * math.tau * i / (n - 1)))
+                                          for i in range(n)))
+    t = time.perf_counter()
+    f = curves.fit(wave, limit=5000)
+    assert f.prims and time.perf_counter() - t < 15
+    m = 2000
+    knots = (0.0,) * 4 + tuple(i / (m - 3) for i in range(1, m - 3)) + (1.0,) * 4
+    coil = [(0.0, 0.0)] + [(3 * math.cos(200 * math.tau * i / (m - 1)), 3 * math.sin(200 * math.tau * i / (m - 1)))
+                           for i in range(1, m - 1)] + [(0.001, 0.0)]
+    with pytest.raises(curves.TooManySegments):
+        curves.fit(curves.Nurbs(3, knots, tuple(coil)), limit=50)
+    with pytest.raises(curves.TooManySegments):  # the exact straights too
+        curves.fit(curves.Nurbs(1, (0, 0, 1 / 3, 2 / 3, 1, 1), ((0, 0), (1, 0), (1, 1), (2, 1))), limit=2)
+
+
+def test_a_large_straight_import_builds_well_inside_the_desktop_deadline(tmp_path):
+    """Review of the v0.4.0 fixes: three 5,000-point degree-10 straight creases took 92 s cold."""
+    import io
+    import time
+
+    from dieline_engine.rpc import Server
+    from dieline_engine.settings import SettingsStore
+
+    n = 5000
+    knots = (0.0,) * 11 + tuple(j / 4990 for j in range(1, 4990)) + (1.0,) * 11
+    subs = [asrc.Sub([curves.Nurbs(10, knots, tuple((i * .002, float(row)) for i in range(n)))], False, "crease")
+            for row in range(3)]
+    item = {"id": "a1", "kind": "import", "path": "x.dxf", "width": 3, "placement": MID,
+            "source": {"geometry": ai.to_json(subs), "units_in": 1.0, "name": "x.dxf", "format": "dxf"}}
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    t = time.perf_counter()
+    shown = server.methods["design.replace"]({"session_id": "s1", "params": {**BOX, "artwork": [item]}})
+    assert shown["parts"][0]["features"][0]["status"] == "ok"
+    assert time.perf_counter() - t < 20
+    server._pool.shutdown()
 
 
 def test_joined_fallback_chords_are_counted_once():
