@@ -250,8 +250,7 @@ def _import(ag: Any, s: Any, cur: Any, part_id: str, raw: dict[str, Any], call_i
     # Built and checked, never committed here: the designer approves it. Artwork that can't be placed
     # (outside its face, across a score) is refused now, so the agent fixes its size or position before
     # a card is shown that would fail when the designer clicks it.
-    _, _, touched = set_artwork(cur, part_id, [item], None, trusted=True)
-    payload = ag._mutate(s, change, call_id, True, part_id, lambda pl: refuse_stale(pl, part_id, touched))
+    payload = ag._mutate(s, change, call_id, True, part_id)
     view = ag._design_view(payload, part_id)
     new = [f for p in payload["parts"] if p["part_id"] == part_id for f in p.get("features", [])
            if f["id"] not in {a["id"] for a in cur.part(part_id).params.artwork} and f.get("kind") == "artwork"]

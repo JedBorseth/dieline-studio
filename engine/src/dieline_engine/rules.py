@@ -352,9 +352,8 @@ def expand_perforations(d: Dieline) -> Dieline:
     for op_id, segs in by_op.items():
         rule = rule_of(d, segs[0])
         old = d.ops.get(op_id) if op_id else None
-        # Each piece may stop in the board or on the blank's edge or a crease it ends at, and on what
-        # the perforation itself may end on; crossing a crease is undeclared, so a cut landing on one
-        # is invalid here.
+        # Each piece may stop in the board or on the blank's edge, and on the named cuts the perforation
+        # itself may end on; a cut landing on a crease is undeclared, so it's invalid here.
         carried = tuple(renamed.get(x, x) for x in (old.ends_on if old is not None else ())
                         if x in renamed or (x in cut_ops and x != "outline"))
         cut_op = Operation(renamed[op_id], "perf_cut", open_ends="free", ends_on=("outline", *carried),

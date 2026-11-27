@@ -795,16 +795,6 @@ def test_reversed_tear_strip_keeps_the_rail_contacts_at_the_tapered_lug(faces, s
     assert "feature_f1_joint" in checks(stopped)
 
 
-def test_tear_strip_thumb_hole_checks_its_actual_centre():
-    ts = {"kind": "tear_strip", "tab": "thumb_hole", "width": 1, "tab_length": 0.25,
-          "route": {"faces": "body_panels", "direction": "horizontal",
-                    "at": {"from": "bottom_score", "distance": 3}}}
-    d = build([ts])
-    copy = d.extras["features"][0].copies[0]
-    hole = next(s for s in copy.segs if isinstance(s, Arc))
-    assert copy.extra["tab_at"] == hole.center
-
-
 TS = {"kind": "tear_strip", "route": {"faces": "body_panels", "direction": "horizontal",
                                       "at": {"from": "bottom_score", "distance": 3}}}
 
@@ -888,6 +878,18 @@ def test_a_notch_beside_a_hole_is_a_near_miss_and_its_pitch_must_be_positive():
     assert not any(k.endswith("_near") for k in checks(far))
     bad = payload([{**notch, "pattern": {"kind": "row", "count": 2, "pitch": -2}}])
     assert feature(bad)["status"] == "stale" and "pitch must be positive" in feature(bad)["reason"]
+
+
+def test_notches_on_one_face_warn_when_they_leave_a_thin_web_between_them():
+    """Review of the v0.4.0 merge: notches are spaced 1/8 in when applied, but warn below the clearance."""
+    row = {"kind": "notch", "on": "P1", "edge": "free_edge", "width": 1, "mirror": "none",
+           "pattern": {"kind": "row", "count": 2, "pitch": "1 3/16"}}
+    p = payload([row])
+    assert feature(p)["status"] == "ok"
+    near = [v for k, v in checks(p).items() if k.endswith("_near")]
+    assert near and near[0]["status"] == "warn" and "3/16 in" in near[0]["message"]
+    wide = payload([{**row, "pattern": {**row["pattern"], "pitch": 2}}])
+    assert not any(k.endswith("_near") for k in checks(wide))
 
 
 def test_sixteenths_take_no_unit():

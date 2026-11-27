@@ -116,10 +116,10 @@ class BoxParams(BaseModel):
         if len(v) > MAX_ARTWORK:
             raise ValueError(f"a part can have at most {MAX_ARTWORK} artwork items")
         out, seen, n = [], set(), 0
-        given = {x.get("id") for x in v if isinstance(x, dict) and x.get("id")}
+        given = {x["id"] for x in v if isinstance(x, dict) and isinstance(x.get("id"), str)}
         for item in v:
             aid = item.get("id") if isinstance(item, dict) else None
-            if not aid:  # given without an id (a hand-written record): the next id nothing else has
+            if aid is None:  # given without an id (a hand-written record): the next id nothing else has
                 n += 1
                 while f"a{n}" in seen or f"a{n}" in given:
                     n += 1

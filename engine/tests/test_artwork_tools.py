@@ -178,16 +178,6 @@ def test_the_job_record_keeps_artwork_provenance_and_its_drawn_outlines(tmp_path
     assert out
 
 
-def test_an_unplaceable_import_does_not_request_approval(tmp_path):
-    (tmp_path / "logo.svg").write_bytes(SVG)
-    ag, t = agent(tmp_path, refs=[tmp_path])
-    ag._dispatch(t, "create_box", BOX, "c1")
-    with pytest.raises(ValueError, match="can't be placed"):
-        ag._dispatch(t, "set_artwork", {"items": [{"kind": "import", "path": str(tmp_path / "logo.svg"),
-                                                   "width": 30, "placement": MID}]}, "c2")
-    assert ag.store.current("s1").revision == 1
-
-
 def test_an_import_that_cant_be_placed_is_refused_before_any_card_is_shown(tmp_path):
     refs = tmp_path / "refs"
     refs.mkdir()

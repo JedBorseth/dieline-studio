@@ -4,6 +4,7 @@ islands and bridges, the aggregated checks and the suspicious-artwork flags."""
 import math
 
 import pytest
+from pydantic import ValidationError
 
 from dieline_engine import artwork_import as ai
 from dieline_engine import artwork_sources as asrc
@@ -101,8 +102,12 @@ def test_every_library_shape_draws_valid_geometry(shape):
     f = out["features"][0]
     assert f["status"] == "ok", f.get("reason")
     assert f["provenance"] == "library artwork" and validate(d).ok
-    # A 2 in creased circle is measured against the face's width, the way it runs: no flag.
-    assert not any(c["status"] == "fail" for c in out["checks"])
+    failures = {c["id"] for c in out["checks"] if c["status"] == "fail"}
+    if shape.get("outline") == "crease":
+        # A creased outline that isn't one straight is measured against the face's shorter side.
+        assert failures == {"artwork_a1_flag_rule"}
+    else:
+        assert not failures
 
 
 def test_smiley_eyes_and_mouth_drop_out_and_its_outline_is_a_crease():
@@ -872,6 +877,31 @@ def test_a_crease_running_up_a_shallow_face_is_measured_against_its_height():
     assert "rule" not in _flags(short, depth=4)
 
 
+def test_a_straight_crease_is_measured_across_the_face_in_its_direction():
+    """Review of the v0.4.0 merge: the limit jumped from half the height to half the width at 45 deg."""
+    bar = {"kind": "sketch", "sketch": {"paths": ["M 0 50 L 100 50"]}, "width": 4, "rule": "crease",
+           "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    for deg in (44, 45, 46):  # 4 in on a 14 x 4 in face: about 5.7 in across it that way
+        assert "rule" in _flags({**bar, "placement": {**bar["placement"], "rotation_deg": deg}}, depth=4), deg
+    assert "rule" not in _flags({**bar, "placement": {**bar["placement"], "rotation_deg": 10}}, depth=4)
+    diagonal = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 100 100"]}, "width": 3.1, "rule": "crease",
+                "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    assert "rule" in _flags(diagonal, depth=4)
+
+
+def test_a_spline_that_loops_inside_one_short_knot_span_is_kept():
+    """Review of the v0.4.0 merge: samples of the whole curve all landed on its start and dropped it."""
+    tri = curves.Nurbs(1, (0, 0, 0.01, 0.02, 0.04, 1, 1), ((0, 0), (1, 0), (0, 1), (0, 0), (0, 0)))
+    f = curves.fit(tri)
+    xs = [q[0] for p in f.prims for q in (p.start, p.end)]
+    ys = [q[1] for p in f.prims for q in (p.start, p.end)]
+    assert f.prims and max(xs) == pytest.approx(1) and max(ys) == pytest.approx(1)
+    square = asrc.Sub([asrc.Prim((3, 0), (4, 0)), asrc.Prim((4, 0), (4, 1)), asrc.Prim((4, 1), (3, 1)),
+                       asrc.Prim((3, 1), (3, 0))], True)
+    contours, _ = asrc.finish([asrc.Sub([tri], True), square], 1.0, declared_closed=True)
+    assert len(contours) == 2
+
+
 def test_the_acknowledgement_fingerprint_covers_arc_direction_and_the_face_frame():
     # The same ends and centre, one arc a quarter turn, the other three quarters the other way: the frame
     # keeps the size the same, and spans the face so there's a flag to acknowledge.
@@ -906,3 +936,7 @@ def test_artwork_given_without_ids_never_takes_an_id_already_listed():
     assert [a["id"] for a in p.artwork] == ["a2", "a1", "a3"]
     with pytest.raises(ValueError, match="listed twice"):
         BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": "a1"}, {**dot, "id": "a1"}]})
+    # An id that isn't a string is refused as invalid parameters, never renumbered or a crash.
+    for bad in (["a1"], "", 0):
+        with pytest.raises(ValidationError, match="isn't an artwork id"):
+            BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": bad}]})

@@ -194,6 +194,14 @@ def design_checks(state: Any) -> list[CheckResult]:
             out += set_checks(g.id, _plan(spec), present)
         except Refused as exc:
             out.append(CheckResult(f"partition_{g.id}_reciprocity", "fail", str(exc)))
+    # A partition piece is made, checked and exported with its set: one on its own (a job file or a
+    # replace that kept a piece but not its group) skips the set's crossing, interlock and fit checks.
+    grouped = {m.ref for g in state.groups if g.kind == "partition_set" for m in g.members}
+    for p in state.parts:
+        if getattr(p.params, "style", None) == "partition-slotted" and p.id not in grouped:
+            out.append(CheckResult(f"partition_{p.id}_set", "fail",
+                                   f"partition piece {p.id} isn't in a partition set, so its slots aren't checked "
+                                   "against the pieces they cross; recreate the set with create_partition"))
     known = state.ids()
     per_container: dict[str, list[str]] = defaultdict(list)
     for lk in state.links:

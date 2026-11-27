@@ -14,8 +14,8 @@ stale after a resize). These are the checks on a committed design.
   made, so they're explicit choices).
 - **Suspicious artwork** (artwork is untrusted): a long straight parallel to a
   nearby hinge or edge, a slot-like rectangle near an edge, a path spanning
-  more than 80% of its face, crease or perforation artwork longer than half the
-  face's shorter dimension. Each is `fail` until the **designer** acknowledges it in the
+  more than 80% of its face, crease or perforation artwork longer than half what
+  it could fold across (a straight: the face's chord in its direction; else the shorter side). Each is `fail` until the **designer** acknowledges it in the
   checks panel (`ack` names what to acknowledge). The agent has no way to.
 - Agent-drawn artwork is an info note everywhere it appears.
 """
@@ -23,7 +23,6 @@ stale after a resize). These are the checks on a committed design.
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from typing import Any
 
 from .artwork import EDGE_CLEARANCE_IN, PROVISIONAL, Art, Drawn, _bridge_min, _web_min
@@ -375,14 +374,23 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
             if w > SPAN * f.width + TOL or h > SPAN * f.height + TOL:
                 flag("span", f"an outline {fmt_in(_r(w))} x {fmt_in(_r(h))} in on the {fmt_in(_r(f.width))} x "
                              f"{fmt_in(_r(f.height))} in face {f.id} (over {SPAN:.0%} of it)", bx)
-            # 4. crease or perforation artwork longer than half the face, measured the way it runs: a
-            # crease running up the face is against its height (a fold there needs less), else its width
+            # 4. crease or perforation artwork longer than half what it could fold across. One straight is
+            # measured against the face's chord in its own direction (up a shallow face that's less than
+            # along it, and it changes smoothly with the angle); anything else against the shorter side.
             if dr.rule in ("crease", "perforation"):
                 length = sum(s.length for s in loop)
-                along, dim = ("height", f.height) if h > w + TOL else ("width", f.width)
+                runs = _straight_runs(loop, dr)
+                if not dr.closed and len(runs) == 1 and abs(runs[0].length - length) <= TOL:
+                    p0, p1 = f.from_flat(runs[0].start), f.from_flat(runs[0].end)
+                    cx, cy = abs(p1[0] - p0[0]) / length, abs(p1[1] - p0[1]) / length
+                    dim = min(f.width / cx if cx > 1e-9 else math.inf, f.height / cy if cy > 1e-9 else math.inf)
+                    across = f"the {fmt_in(_r(dim))} in across {f.id} in its direction"
+                else:
+                    dim = min(f.width, f.height)
+                    across = f"{f.id}'s {fmt_in(_r(dim))} in shorter side"
                 if length > RULE_SPAN * dim + TOL:
-                    flag("rule", f"a {dr.rule} {fmt_in(_r(length))} in long on {f.id}, over half its "
-                                 f"{fmt_in(_r(dim))} in {along} (it could act as a fold)", bx)
+                    flag("rule", f"a {dr.rule} {fmt_in(_r(length))} in long on {f.id}, over half "
+                                 f"{across} (it could act as a fold)", bx)
     out = []
     for kind, items in found.items():
         key = f"{a.id}:{kind}:{fp}"

@@ -1161,3 +1161,29 @@ def test_rpc_revisions_must_be_whole_numbers_and_partition_pieces_export_with_th
                                           "revision": held["revision"], "formats": ["cf2", "dxf"]})
     assert not plan["ready"] and set(plan["formats"]) == {"cf2", "dxf"}
     assert all(not f["ready"] and f["blocking"] for f in plan["formats"].values())
+
+
+def test_a_held_partition_piece_without_its_set_is_not_exported(tmp_path):
+    """Review of the v0.4.0 merge: a snapshot holding one piece and no group used to export it."""
+    from dieline_engine import designs, partitions, partsets
+    from dieline_engine.designstore import new_design
+    from dieline_engine.rpc import Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    piece = partitions.PartitionParams(board="32 B KR", role="long", set=sp).model_dump()
+    lone = server.methods["design.replace"]({"session_id": "s1", "parts": [{"part_id": "p1", "params": piece}]})
+    target = {"session_id": "s1", "design_id": lone["design_id"], "revision": lone["revision"], "formats": ["cf2"]}
+    plan = server.methods["export.plan"](target)
+    assert not plan["ready"] and "isn't in a partition set" in plan["blocking"][0]
+    assert set(plan["formats"]) == {"cf2", "dxf"}  # both listed, even when only one was asked for
+    with pytest.raises(designs.DesignCheckFailed, match="isn't in a partition set"):
+        server.methods["box.export"]({**target, "filename": "lone"})
+    # The whole set, held with its box, exports.
+    d, _ = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    full = {"session_id": "s1", "design_id": held["design_id"], "revision": held["revision"]}
+    assert server.methods["export.plan"](full)["ready"], server.methods["export.plan"](full)["blocking"]

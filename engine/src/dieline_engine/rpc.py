@@ -222,7 +222,7 @@ class Server:
             parts, _ = self._export_target(p)
         except designs.DesignCheckFailed as exc:
             return {"ready": False, "blocking": [str(exc)], "files": [], "job_path": None, "replaces": [],
-                    "pickup": False, "formats": {f: {"ready": False, "blocking": [str(exc)]} for f in formats}}
+                    "pickup": False, "formats": {f: {"ready": False, "blocking": [str(exc)]} for f in ("cf2", "dxf")}}
         cfg = self.settings.settings
         return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir(),
                             _flag(p, "dxf_expand_perfs"))

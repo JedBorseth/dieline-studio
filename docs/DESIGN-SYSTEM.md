@@ -1082,7 +1082,7 @@ Readings taken where the spec left a choice, each the safer one. Change them her
 - An overlap band's matching cut-out is any feature on the opposite flap.
 - An extra score in the glue zone warns only when the joint is outside (the lug lands on P1's outside); cuts and perforations there always warn.
 - A tear strip's pull tab is in the glue zone only when it's inside the landing both ways (a flap's landing can be short). A strip that wraps P1 and P4 without the lug warns at the joint whichever end it starts from.
-- Edge notches count in the near-miss check against holes, vents, windows and hand flaps on their face (not against other notches: one edge's notches are spaced when applied). A notch pattern's pitch must be above zero.
+- Edge notches count in the near-miss check against holes, vents, windows, hand flaps and other notches on their face: applying them keeps only 1/8 in between notches on one edge, and notches on two edges can meet. A notch pattern's pitch must be above zero.
 - The slotter's die-cutting isn't confirmed, so a part with a die-cut feature isn't listed for it. An extra score alone doesn't count as die-cut.
 
 **Exports**
@@ -1111,7 +1111,7 @@ Where this spec left a choice open, phase 3 took the safest reading:
 - **Default action.** `create_partition` adds the set when `contained_in` is given and otherwise replaces the design. `replace_set` takes the box size from the set's existing fit link when no `contained_in` is given.
 - **Fit.** A standard's outside is inside + 2 × CAL. A set's outside is its long and short piece lengths and its height. A stack is its widest tier, with the tiers' heights plus pads × pad CAL. Only "taller than the inside depth" warns upwards. A set that doesn't go in warns rather than fails (draw and warn). A container must be a box part. A group as a container, or a link to one piece of a set, is `unavailable`.
 - **Stacks** keep their pads in the group (`extra: {pads, pad_board}`); pads become parts with the panel builder. A stack's height is reported once, by `stack_<id>` (no separate `fit_<link>_depth`). A stack with pads but no known pad board, or one that contains itself, makes its fit `unavailable`; a job file with a group cycle is refused when opened.
-- **Exports.** A partition piece is exported with its set, from the design the engine holds: the RPC refuses one piece's parameters alone (they'd skip the set's crossing, interlock and fit checks).
+- **Exports.** A partition piece is exported with its set, from the design the engine holds: the RPC refuses one piece's parameters alone (they'd skip the set's crossing, interlock and fit checks), and a held design with a piece in no partition set fails `partition_<part>_set`, which blocks export.
 - **Check results** take their category from the id's prefix (`partition_` → partition, `fit_` and `stack_` → fit), so the checks panel files them with the actionable checks.
 
 ## Artwork as built
@@ -1161,7 +1161,7 @@ Where this spec left a choice open, phase 4 took the safest reading:
 - Long straight: 1" or longer, within 3° of parallel and within 1" of any edge or crease of its face. Consecutive collinear pieces (within 1/2° and 0.001" of the first piece's line) count as one straight, so a straight drawn in pieces is still flagged; a many-sided polygon or a zigzag isn't.
 - Slot-like: a closed cut no more than 1/2" wide and at least 3:1, mostly straight, within 1" of the face's edge, measured by its narrowest enclosing rectangle at any angle (a rotated slot is flagged). Standards have no mates yet.
 - Span: over 80% of the face's width or height.
-- Rule: a crease or perforation whose **path length** is over half the face, measured the way it runs: against the face's height when its extent is taller than wide (a fold up a shallow panel), otherwise its width (the literal reading: a large creased circle is flagged too).
+- Rule: a crease or perforation whose **path length** is over half what it could fold across. A single straight is measured against the face's chord in its own direction (a crease up a shallow panel needs less than one along it, and the limit changes smoothly as it turns); anything else (a curve, a closed outline) against the face's shorter side, so a large creased circle is flagged too.
 - One flag per artwork and kind. Its acknowledgement key is the artwork id, the kind and a fingerprint of everything that decides what's cut: every segment (rule, ends, centre, direction, full circle), each outline's rule spec (pointage), the face and its frame on the blank (size, origin, axes, outline). So moving, resizing, reversing an arc or resizing the box (even when the artwork's flat coordinates stay put) asks again. Acknowledgements are stored on the part (`acknowledged`). The store refuses any chat change that adds one (dry runs too, and through any tool); the RPC needs the design id and revision on screen and accepts only keys the checks offer.
 
 **UI and picture**

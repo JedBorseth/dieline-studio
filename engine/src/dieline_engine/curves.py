@@ -67,6 +67,10 @@ class Curve:
         """The curve through an affine map f (points only)."""
         return Mapped(self, f)
 
+    def breaks(self) -> list[float]:
+        """Where the curve's pieces join (t in [0, 1]); each piece is fitted on its own."""
+        return [0.0, 1.0]
+
     def tangent(self, t: float, forward: bool = True) -> Point | None:
         """The unit tangent, looking a little further when the derivative vanishes
         (a Bézier whose control point sits on its end)."""
@@ -106,6 +110,9 @@ class Mapped(Curve):
 
     def point(self, t: float) -> Point:
         return self.f(self.base.point(t))  # type: ignore[operator]
+
+    def breaks(self) -> list[float]:
+        return self.base.breaks()
 
 
 @dataclass(slots=True)
@@ -256,6 +263,15 @@ class Nurbs(Curve):
 
     def map(self, f) -> "Curve":
         return Nurbs(self.degree, self.knots, tuple(f(q) for q in self.ctrl), self.weights)
+
+    def breaks(self) -> list[float]:
+        """Each distinct knot: a spline can trace a whole loop inside one short span and sit still in
+        the rest, which samples of the whole curve could miss."""
+        p, k = self.degree, self.knots
+        lo, hi = k[p], k[len(self.ctrl)]
+        if hi <= lo:
+            return [0.0, 1.0]
+        return sorted({0.0, 1.0, *((u - lo) / (hi - lo) for u in k[p:len(self.ctrl) + 1])})
 
     def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
         return Curve.radius_samples(self, max(n, 8 * len(self.ctrl)))
@@ -517,7 +533,10 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
         go(ta, (ta + tb) / 2, depth + 1)
         go((ta + tb) / 2, tb, depth + 1)
 
-    go(0.0, 1.0, 0)
+    ts = curve.breaks()
+    for ta, tb in zip(ts, ts[1:]):
+        if tb > ta:
+            go(ta, tb, 0)
     # Chain exactly: each piece starts where the last ended.
     fixed: list[Prim] = []
     cur = start
