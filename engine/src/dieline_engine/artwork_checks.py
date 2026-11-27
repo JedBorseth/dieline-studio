@@ -321,55 +321,11 @@ def _thin_webs(d: Dieline, live: list[Art], fm: FaceMap, cal: float) -> CheckRes
                 samples, "in", f"max(1/8, 2 x CAL) = {fmt_in(_r(lim))} in")
 
 
-def _join_straights(loop: list[Segment], dr: Drawn) -> list[Line]:
-    """Measure each uninterrupted straight even when its source splits it into lines."""
-    def join(a: Segment, b: Segment) -> Line | None:
-        if not isinstance(a, Line) or not isinstance(b, Line) or a.end != b.start:
-            return None
-        u, v = _tangent(a, True), _tangent(b, True)
-        if u[0] * v[0] + u[1] * v[1] <= 0 or abs(u[0] * v[1] - u[1] * v[0]) > TOL:
-            return None
-        return Line(a.start, b.end, a.type)
-
-    runs: list[Segment] = []
-    for s in loop:
-        if dr.kinds.get(s) == "bridge":
-            continue
-        merged = join(runs[-1], s) if runs else None
-        if merged is None:
-            runs.append(s)
-        else:
-            runs[-1] = merged
-    if dr.closed and len(runs) > 1:
-        merged = join(runs[-1], runs[0])
-        if merged is not None:
-            runs[0] = merged
-            runs.pop()
-    return [s for s in runs if isinstance(s, Line)]
-
-
-def _slot_size(loop: list[Segment], axis: Line) -> tuple[float, float]:
-    """Measure the outline along and across the slot's longest straight."""
-    ux, uy = _tangent(axis, True)
-
-    def project(p: Point) -> Point:
-        x, y = p[0] - axis.start[0], p[1] - axis.start[1]
-        return (x * ux + y * uy, y * ux - x * uy)
-
-    rotated = [
-        replace(s, start=project(s.start), end=project(s.end), center=project(s.center))
-        if isinstance(s, Arc) else replace(s, start=project(s.start), end=project(s.end))
-        for s in loop
-    ]
-    x0, y0, x1, y1 = _bounds(rotated)
-    return x1 - x0, y1 - y0
-
-
 def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
     f = fm.faces.get(a.face or "")
     if f is None:
         return []
-    fp = a.fingerprint((f.width, f.height))
+    fp = a.fingerprint(f)
     found: dict[str, list[tuple[str, tuple[float, float, float, float]]]] = {}
 
     def flag(kind: str, msg: str, region: tuple[float, float, float, float]) -> None:
@@ -379,9 +335,8 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
     edges = [(e.start, e.end, e.kind) for e in f.edges]
     for dr in a.live():
         for loop in dr.loops:
-            # 1. a long straight parallel to a nearby hinge or edge
-            straights = _join_straights(loop, dr)
-            for s in straights:
+            # 1. a long straight parallel to a nearby hinge or edge (collinear pieces count as one)
+            for s in _straight_runs(loop, dr):
                 if s.length < LONG_STRAIGHT - TOL:
                     continue
                 p0, p1 = f.from_flat(s.start), f.from_flat(s.end)
@@ -406,26 +361,28 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
             bx = _bounds(loop)
             fb = _face_box(f, bx)
             w, h = fb[2] - fb[0], fb[3] - fb[1]
-            # 2. a slot-like rectangle near an edge, at any rotation
-            gap = min(fb[0], fb[1], f.width - fb[2], f.height - fb[3])
-            if dr.closed and dr.rule == "cut" and gap <= NEAR and straights:
-                straight = sum(s.length for s in straights)
+            # 2. a slot-like rectangle near an edge, at any angle (its narrowest enclosing rectangle)
+            sw, sl = _oriented_size([f.from_flat(q) for s in loop for q in _seg_points(s)])
+            if dr.closed and dr.rule in ("cut",) and sw <= SLOT_WIDTH + TOL and \
+                    sl >= SLOT_RATIO * max(sw, 1e-9):
+                gap = min(fb[0], fb[1], f.width - fb[2], f.height - fb[3])
+                straight = sum(s.length for s in loop if isinstance(s, Line))
                 total = sum(s.length for s in loop)
-                if straight >= 0.5 * total:
-                    length, width = sorted(_slot_size(loop, max(straights, key=lambda s: s.length)), reverse=True)
-                    if width <= SLOT_WIDTH + TOL and length >= SLOT_RATIO * max(width, 1e-9):
-                        flag("slot", f"a slot-like {fmt_in(_r(length))} x {fmt_in(_r(width))} in cut "
-                                     f"{fmt_in(_r(gap))} in from {f.id}'s edge (it looks like a slot)", bx)
+                if gap <= NEAR and straight >= 0.5 * total:
+                    flag("slot", f"a slot-like {fmt_in(_r(sl))} x {fmt_in(_r(sw))} in cut {fmt_in(_r(gap))} in from "
+                                 f"{f.id}'s edge (it looks like a slot)", bx)
             # 3. spanning most of the face
             if w > SPAN * f.width + TOL or h > SPAN * f.height + TOL:
                 flag("span", f"an outline {fmt_in(_r(w))} x {fmt_in(_r(h))} in on the {fmt_in(_r(f.width))} x "
                              f"{fmt_in(_r(f.height))} in face {f.id} (over {SPAN:.0%} of it)", bx)
-            # 4. crease or perforation artwork that could act as a fold
+            # 4. crease or perforation artwork longer than half the face, measured the way it runs: a
+            # crease running up the face is against its height (a fold there needs less), else its width
             if dr.rule in ("crease", "perforation"):
                 length = sum(s.length for s in loop)
-                if length > RULE_SPAN * min(f.width, f.height) + TOL:
+                along, dim = ("height", f.height) if h > w + TOL else ("width", f.width)
+                if length > RULE_SPAN * dim + TOL:
                     flag("rule", f"a {dr.rule} {fmt_in(_r(length))} in long on {f.id}, over half its "
-                                 "shorter dimension (it could act as a fold)", bx)
+                                 f"{fmt_in(_r(dim))} in {along} (it could act as a fold)", bx)
     out = []
     for kind, items in found.items():
         key = f"{a.id}:{kind}:{fp}"
@@ -441,6 +398,90 @@ def _flags(a: Art, fm: FaceMap, acks: set[str]) -> list[CheckResult]:
                                    f"suspicious artwork: {a.name}: {listed}. Export is blocked until the designer "
                                    "acknowledges it in the checks panel", "artwork", None, a.id, region, ack=key))
     return out
+
+
+def _straight_runs(loop: list[Segment], dr: Drawn) -> list[Line]:
+    """The loop's straights with consecutive collinear pieces joined (a straight drawn in pieces is still
+    one straight). Bridge sides stay apart: they're the board's corridors, not artwork."""
+    runs: list[list[Line]] = []
+    for s in loop:
+        if not isinstance(s, Line) or s.length <= TOL or dr.kinds.get(s) == "bridge":
+            runs.append([])
+            continue
+        last = runs[-1] if runs else []
+        if last and _collinear(last[0], s) and math.dist(last[-1].end, s.start) <= 1e-6:
+            last.append(s)
+        else:
+            runs.append([s])
+    if dr.closed and len(runs) > 1 and runs[0] and runs[-1] and _collinear(runs[0][0], runs[-1][0]) and \
+            math.dist(runs[-1][-1].end, runs[0][0].start) <= 1e-6:
+        runs[0] = runs.pop() + runs[0]
+    return [Line(r[0].start, r[-1].end, r[0].type, r[0].op) for r in runs if r]
+
+
+def _collinear(a: Line, b: Line) -> bool:
+    ua = ((a.end[0] - a.start[0]) / a.length, (a.end[1] - a.start[1]) / a.length)
+    ub = ((b.end[0] - b.start[0]) / b.length, (b.end[1] - b.start[1]) / b.length)
+    if ua[0] * ub[0] + ua[1] * ub[1] <= 0:
+        return False
+    if abs(ua[0] * ub[1] - ua[1] * ub[0]) > math.sin(math.radians(0.5)):
+        return False
+    # b's far end stays on a's line (no slow drift round a gentle polygon).
+    n = (-ua[1], ua[0])
+    off = abs((b.end[0] - a.start[0]) * n[0] + (b.end[1] - a.start[1]) * n[1])
+    return off <= 1e-3
+
+
+def _seg_points(s: Segment) -> list[Point]:
+    if isinstance(s, Line):
+        return [s.start, s.end]
+    from .curves import prim_points  # noqa: PLC0415
+    from .shapes import Prim  # noqa: PLC0415
+
+    return prim_points(Prim(s.start, s.end, s.center, s.clockwise, s.full_circle), 16)
+
+
+def _oriented_size(pts: list[Point]) -> tuple[float, float]:
+    """(width, length) of the narrowest rectangle round the points, at any angle (rotating calipers on
+    the hull: the narrowest one has a side along a hull edge)."""
+    hull = _hull(pts)
+    if len(hull) < 3:
+        if len(hull) == 2:
+            return 0.0, math.dist(*hull)
+        return 0.0, 0.0
+    best = (math.inf, 0.0)
+    for a, b in zip(hull, hull[1:] + hull[:1]):
+        L = math.dist(a, b)
+        if L <= 1e-12:
+            continue
+        u = ((b[0] - a[0]) / L, (b[1] - a[1]) / L)
+        along = [(q[0] - a[0]) * u[0] + (q[1] - a[1]) * u[1] for q in hull]
+        across = [-(q[0] - a[0]) * u[1] + (q[1] - a[1]) * u[0] for q in hull]
+        w, l = max(across) - min(across), max(along) - min(along)
+        if w < best[0]:
+            best = (w, l)
+    return best
+
+
+def _hull(pts: list[Point]) -> list[Point]:
+    ps = sorted(set(pts))
+    if len(ps) < 3:
+        return ps
+
+    def cross(o: Point, a: Point, b: Point) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lo: list[Point] = []
+    for p in ps:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    hi: list[Point] = []
+    for p in reversed(ps):
+        while len(hi) >= 2 and cross(hi[-2], hi[-1], p) <= 0:
+            hi.pop()
+        hi.append(p)
+    return lo[:-1] + hi[:-1]
 
 
 def flag_keys(checks: list[dict[str, Any]]) -> set[str]:

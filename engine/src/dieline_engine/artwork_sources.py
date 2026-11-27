@@ -156,12 +156,11 @@ def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT
             kinds += ft.kinds
             fallback += ft.fallback
             radii += curve.radius_samples()
-        pairs = [(p, kind) for p, kind in zip(prims, kinds, strict=True)
-                 if p.full or math.dist(p.start, p.end) > 1e-9]
-        if not pairs:
+        # Zero-length pieces go, and their kinds with them: kinds[i] always describes prims[i].
+        keep = [k for k, q in enumerate(prims) if q.full or math.dist(q.start, q.end) > 1e-9]
+        prims, kinds = [prims[k] for k in keep], [kinds[k] for k in keep]
+        if not prims:
             continue
-        prims = [p for p, _ in pairs]
-        kinds = [kind for _, kind in pairs]
         closed = s.closed
         snapped = 0.0
         gap = math.dist(prims[0].start, prims[-1].end)

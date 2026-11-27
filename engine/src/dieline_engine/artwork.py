@@ -438,16 +438,25 @@ class Art:
     def segs(self) -> list[Segment]:
         return [s for c in self.live() for s in c.segs]
 
-    def fingerprint(self, panel_size: tuple[float, float]) -> str:
-        """The artwork as drawn: an acknowledgement is for exactly this geometry."""
+    def fingerprint(self, face: Face | None = None) -> str:
+        """Everything that decides what's cut: an acknowledgement is for exactly this. Each segment
+        (rule, ends, centre, direction, full circle), each outline's rule spec (pointage), and the face
+        it's on with that face's frame on the blank (a resize that keeps the flat coordinates still
+        moves the face round it), so any change asks again."""
         h = hashlib.sha1()
-        h.update(repr((self.face, panel_size)).encode())
-        geometry = [
-            (s.type.value, s.start, s.end, s.center, s.clockwise, s.full_circle)
-            if isinstance(s, Arc) else (s.type.value, s.start, s.end)
-            for s in self.segs()
-        ]
-        h.update(repr(sorted(geometry)).encode())
+
+        def r6(p: Any) -> Any:
+            return None if p is None else tuple(round(v, 6) for v in p)
+
+        h.update(repr(("face", self.face)).encode())
+        if face is not None:
+            h.update(repr((round(face.width, 6), round(face.height, 6), r6(face.origin), r6(face.x_axis),
+                           r6(face.y_axis), [r6(q) for q in face.polygon])).encode())
+        for op in sorted(self.ops, key=lambda o: o.id):
+            h.update(repr((op.id, op.kind, op.closed, op.rule)).encode())
+        for s in sorted(self.segs(), key=lambda s: (s.start, s.end)):
+            h.update(repr((s.type.value, s.start, s.end, getattr(s, "center", None), getattr(s, "clockwise", None),
+                           getattr(s, "full_circle", None))).encode())
         return h.hexdigest()[:16]
 
     def to_dict(self, units: str = "in") -> dict[str, Any]:

@@ -148,6 +148,29 @@ export interface SketchOverlay {
   frames: { featureId: string; box: MmBox }[];
 }
 
+/** The points that bound a segment: its ends and, for an arc, each of the circle's four extremes
+ *  (0, 90, 180, 270 deg) that the arc actually sweeps through, so a shallow arc of a large radius
+ *  isn't framed by its whole circle. */
+export function segmentExtent(s: SceneSegment): [number, number][] {
+  const pts: [number, number][] = [s.start, s.end];
+  if (!s.arc || !s.center) return pts;
+  const [cx, cy] = s.center;
+  const r = Math.hypot(s.start[0] - cx, s.start[1] - cy);
+  const tau = 2 * Math.PI;
+  const norm = (a: number) => ((a % tau) + tau) % tau;
+  const a0 = Math.atan2(s.start[1] - cy, s.start[0] - cx);
+  const a1 = Math.atan2(s.end[1] - cy, s.end[0] - cx);
+  // Counter-clockwise sweep from a0 (a clockwise arc is the same set swept the other way, from a1).
+  const full = s.full_circle || Math.hypot(s.end[0] - s.start[0], s.end[1] - s.start[1]) === 0;
+  const from = s.clockwise ? a1 : a0;
+  const sweep = full ? tau : norm(s.clockwise ? a0 - a1 : a1 - a0);
+  for (let k = 0; k < 4; k++) {
+    const ang = (k * Math.PI) / 2;
+    if (full || norm(ang - from) <= sweep + 1e-12) pts.push([cx + r * Math.cos(ang), cy + r * Math.sin(ang)]);
+  }
+  return pts;
+}
+
 export function agentSketches(scene: SceneSegment[] | undefined, units?: string): SketchOverlay {
   const out: SketchOverlay = { paths: [], frames: [] };
   const boxes = new Map<string, MmBox>();
@@ -156,20 +179,7 @@ export function agentSketches(scene: SceneSegment[] | undefined, units?: string)
     const prim = sceneToPrimitive(s, units);
     out.paths.push({ d: toSvgPath(prim), type: s.type });
     const k = scale(units);
-    const pts: [number, number][] = [s.start, s.end];
-    if (s.arc && s.center) {
-      const [cx, cy] = s.center;
-      const r = Math.hypot(s.start[0] - cx, s.start[1] - cy);
-      const a = Math.atan2(s.start[1] - cy, s.start[0] - cx);
-      const b = Math.atan2(s.end[1] - cy, s.end[0] - cx);
-      const turn = 2 * Math.PI;
-      const along = (angle: number) => (((s.clockwise ? a - angle : angle - a) % turn) + turn) % turn;
-      const sweep = s.full_circle ? turn : along(b);
-      const extrema: [number, number][] = [[cx + r, cy], [cx, cy + r], [cx - r, cy], [cx, cy - r]];
-      extrema.forEach((point, i) => {
-        if (along(i * Math.PI / 2) <= sweep) pts.push(point);
-      });
-    }
+    const pts = segmentExtent(s);
     const b = boxes.get(s.feature_id) ?? { xmin: Infinity, ymin: Infinity, xmax: -Infinity, ymax: -Infinity };
     for (const [x, y] of pts) {
       b.xmin = Math.min(b.xmin, x * k);

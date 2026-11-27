@@ -335,6 +335,10 @@ def arc_prim(e: EllipseArc) -> Prim | None:
 # ------------------------------------------------------------------ fitting
 
 
+ARC_RADIUS_MAX = 1e4  # a fitted arc flatter than this is drawn as a line
+ARC_SAGITTA_MIN = 1e-7
+
+
 @dataclass(slots=True)
 class Fit:
     prims: list[Prim] = field(default_factory=list)
@@ -349,9 +353,14 @@ def arc_through(p: Point, t: Point, q: Point) -> Prim:
     n = (-t[1], t[0])
     nw = _dot(n, w)
     L2 = _dot(w, w)
-    if abs(nw) <= 1e-9 * math.sqrt(L2) or abs(L2 / (2 * nw)) > 1e5 * math.sqrt(L2):
+    if abs(nw) <= 1e-9 * math.sqrt(L2):
         return Prim(p, q)
     r = L2 / (2 * nw)
+    # Nearly straight: a line (the fit's deviation check still decides), never an arc whose centre is
+    # far outside any drawing (the topology refuses coordinates over 1e5).
+    sag = abs(r) - math.sqrt(max(r * r - L2 / 4, 0.0))
+    if abs(r) > ARC_RADIUS_MAX or sag < ARC_SAGITTA_MIN:
+        return Prim(p, q)
     c = (p[0] + n[0] * r, p[1] + n[1] * r)
     # Leave headroom for placement on the blank. The fitter still checks chord error.
     if max(abs(c[0]), abs(c[1])) > MAX_COORD_IN / 2:
@@ -453,6 +462,11 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
     out = Fit()
     start = curve.point(0.0)
 
+    def excursion(ta: float, tb: float) -> float:
+        """How far the curve goes from where this piece starts (a loop can start and end at one point)."""
+        a = curve.point(ta)
+        return max(math.dist(a, curve.point(ta + (tb - ta) * i / 16)) for i in range(1, 17))
+
     def chords(ta: float, tb: float, depth: int = 0) -> None:
         a, b = curve.point(ta), curve.point(tb)
         seg = Prim(a, b)
@@ -466,6 +480,8 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
             out.fallback += 1
             out.max_dev = max(out.max_dev, dev)
             return
+        if excursion(ta, tb) <= 1e-12:
+            return
         if depth >= 20:
             raise CurveError("could not fit the artwork curve within tolerance")
         chords(ta, (ta + tb) / 2, depth + 1)
@@ -474,16 +490,15 @@ def fit(curve: Curve, tol: float = FIT_TOL_IN) -> Fit:
     def go(ta: float, tb: float, depth: int) -> None:
         p0, p1 = curve.point(ta), curve.point(tb)
         if math.dist(p0, p1) <= 1e-9:
-            mid = (ta + tb) / 2
-            # Coincident endpoints can enclose a complete loop, even when the midpoint
-            # coincides with them as well. Look inside the interval before discarding it.
-            if all(math.dist(p0, curve.point(ta + (tb - ta) * i / 8)) <= 1e-12 for i in range(1, 8)):
+            # A closed curve, or a loop of one that comes back to where it started: split it. Only a
+            # piece that never leaves its point is nothing.
+            if excursion(ta, tb) <= 1e-9:
                 return
             if depth >= MAX_DEPTH:
                 chords(ta, tb)
-            else:
-                go(ta, mid, depth + 1)
-                go(mid, tb, depth + 1)
+                return
+            go(ta, (ta + tb) / 2, depth + 1)
+            go((ta + tb) / 2, tb, depth + 1)
             return
         t0, t1 = curve.tangent(ta, True), curve.tangent(tb, False)
         arcs = biarc(p0, t0, p1, t1) if t0 is not None and t1 is not None else None

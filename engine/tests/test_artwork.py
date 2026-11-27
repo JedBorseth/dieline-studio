@@ -101,12 +101,8 @@ def test_every_library_shape_draws_valid_geometry(shape):
     f = out["features"][0]
     assert f["status"] == "ok", f.get("reason")
     assert f["provenance"] == "library artwork" and validate(d).ok
-    failures = {c["id"] for c in out["checks"] if c["status"] == "fail"}
-    if shape.get("outline") == "crease":
-        # The circumference can act as a fold on the panel's shorter dimension.
-        assert failures == {"artwork_a1_flag_rule"}
-    else:
-        assert not failures
+    # A 2 in creased circle is measured against the face's width, the way it runs: no flag.
+    assert not any(c["status"] == "fail" for c in out["checks"])
 
 
 def test_smiley_eyes_and_mouth_drop_out_and_its_outline_is_a_crease():
@@ -665,6 +661,20 @@ def test_svg_use_references_count_toward_the_element_limit(monkeypatch):
         ai.parse_svg(svg)
 
 
+def _use_dag(layers, fan):
+    """An empty group used `fan` times per layer, `layers` deep: fan ** layers walks, no shapes."""
+    defs = '<g id="g0"></g>' + "".join(
+        f'<g id="g{k}">' + f'<use href="#g{k - 1}"/>' * fan + "</g>" for k in range(1, layers + 1))
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="1in" viewBox="0 0 10 10"><defs>{defs}'
+            f'</defs><rect width="5" height="5"/><use href="#g{layers}"/></svg>').encode()
+
+
+def test_svg_use_references_that_draw_nothing_still_count_toward_the_limit():
+    assert len(ai.parse_svg(_use_dag(3, 5)).subs) == 1  # 125 walks: fine
+    with pytest.raises(ai.ImportRefused, match="elements once its <use> references are expanded"):
+        ai.parse_svg(_use_dag(7, 5))  # 78,125 walks of nothing
+
+
 def test_svg_path_with_very_many_outlines_skips_the_pairwise_fill_rule_compare():
     d = " ".join(f"M{x} 0 h1 v1 h-1 Z" for x in range(0, 2 * (ai.MAX_NESTED_COMPARE + 1), 2))
     p = ai.parse_svg(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 10"><path d="{d}"/></svg>'
@@ -780,3 +790,119 @@ def test_resize_renews_acknowledgement_even_when_anchored_geometry_stays_put():
 def test_missing_artwork_id_skips_explicit_ids_on_either_side():
     first, second, third = {**SLOT, "id": "a2"}, SLOT, {**SLOT, "id": "a1"}
     assert [a["id"] for a in params(first, second, third).artwork] == ["a2", "a3", "a1"]
+
+
+# ------------------------------------------------------------------ review fixes: biarcs and sources (6, 8)
+
+
+def test_a_nearly_straight_curve_fits_without_far_away_arc_centres():
+    from dieline_engine.topology import MAX_COORD_IN
+    f = curves.fit(curves.Bezier(((0, 0), (2.64, -8e-5), (5.36, -8e-5), (8, 0))), 0.002)
+    assert f.prims and all(p.center is None or max(map(abs, p.center)) < 1e4 for p in f.prims)
+    flat = {"kind": "sketch", "sketch": {"paths": ["M 0 50 C 33 49.999 67 49.999 100 50 L 100 70 L 0 70 Z"]},
+            "width": 8, "placement": MID}
+    out, d = made(flat)
+    assert out["features"][0]["status"] == "ok", out["features"][0].get("reason")
+    assert all(abs(v) < MAX_COORD_IN for s in d.segments for v in (*s.start, *s.end, *(getattr(s, "center", None)
+                                                                                       or ())))
+
+
+def test_a_curve_that_returns_to_its_start_midway_is_fitted_not_dropped():
+    eight = curves.Nurbs(3, (0, 0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1, 1),
+                         ((0, 0), (2, 1.5), (2, -1.5), (0, 0), (-2, 1.5), (-2, -1.5), (0, 0)))
+    assert eight.point(0.5) == pytest.approx((0, 0)) and eight.point(0) == eight.point(1)
+    f = curves.fit(eight, 0.002)
+    assert f.prims and _dev(eight, f.prims) <= 0.002 + 1e-9
+    xs = [q[0] for p in f.prims for q in (p.start, p.end)]
+    assert max(xs) > 1.4 and min(xs) < -1.4  # both loops are there
+
+
+def test_dropping_a_zero_length_piece_keeps_each_segments_kind():
+    sub = asrc.Sub([asrc.Prim((0, 0), (0, 0)), curves.Bezier(((0, 0), (1, 2), (3, -2), (4, 0))),
+                    asrc.Prim((4, 0), (0, 0))], True)
+    (c,), _ = asrc.finish([sub], 1.0, declared_closed=False)
+    assert len(c.kinds) == len(c.prims)
+    assert c.kinds[-1] == "line" and c.prims[-1].center is None
+    assert all(k == "fit" for k in c.kinds[:-1])
+
+
+# ------------------------------------------------------------------ review fixes: suspicious flags (7)
+
+NEAR_TOP = {"on": "P2", "x": "centred", "y": {"from": "top_score", "to": "near_edge", "distance": 0.25}}
+
+
+def _flags(*arts, **kw):
+    out, _ = made(*arts, **kw)
+    return {c["id"].split("_flag_")[1] for c in out["checks"] if "_flag_" in c["id"]}
+
+
+def test_a_straight_drawn_in_pieces_is_still_a_long_straight():
+    pieces = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 25 0 L 50 0 L 75 0 L 100 0 L 100 50 L 0 50 Z"]},
+              "width": 3, "placement": NEAR_TOP}
+    assert "parallel" in _flags(pieces)
+    # A curve drawn as many short chords, or a zigzag, isn't one straight.
+    ngon = {"kind": "shape", "shape": "polygon", "sides": 40, "diameter": 3, "placement": NEAR_TOP}
+    zig = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 20 6 L 40 0 L 60 6 L 80 0 L 100 6 L 100 50 L 0 50 Z"]},
+           "width": 3, "placement": NEAR_TOP}
+    assert "parallel" not in _flags(ngon) and "parallel" not in _flags(zig)
+
+
+def test_a_slot_is_slot_like_at_any_angle():
+    bar = {"kind": "sketch", "sketch": {"shapes": [{"type": "rect", "x": 0, "y": 0, "width": 100, "height": 8}]},
+           "width": 3, "placement": {**NEAR_TOP, "rotation_deg": 45}}
+    assert "slot" in _flags(bar)
+    # A rotated square, a circle and a thin ellipse (curved, not a slot) near the edge aren't.
+    sq = {"kind": "shape", "shape": "rounded_rect", "width": 1, "height": 1, "corner_radius": 0.0625,
+          "placement": {**NEAR_TOP, "rotation_deg": 45}}
+    dot = {"kind": "shape", "shape": "circle", "diameter": 0.4, "placement": NEAR_TOP}
+    oval = {"kind": "shape", "shape": "ellipse", "width": 2, "height": 0.4, "placement": {**NEAR_TOP,
+                                                                                         "rotation_deg": 30}}
+    for a in (sq, dot, oval):
+        assert "slot" not in _flags(a)
+
+
+def test_a_crease_running_up_a_shallow_face_is_measured_against_its_height():
+    up = {"kind": "sketch", "sketch": {"paths": ["M 50 0 L 50 100"]}, "height": 3, "rule": "crease",
+          "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    assert "rule" in _flags(up, depth=4)  # 3 in on a 14 x 4 in face: 75% of its height
+    across = {**up, "sketch": {"paths": ["M 0 50 L 100 50"]}, "height": None, "width": 3}
+    across.pop("height")
+    assert "rule" not in _flags(across, depth=4)  # 3 in of its 14 in width
+    short = {**up, "height": 1.5}
+    assert "rule" not in _flags(short, depth=4)
+
+
+def test_the_acknowledgement_fingerprint_covers_arc_direction_and_the_face_frame():
+    # The same ends and centre, one arc a quarter turn, the other three quarters the other way: the frame
+    # keeps the size the same, and spans the face so there's a flag to acknowledge.
+    frame = "M 0 0 L 100 0 L 100 40 L 0 40 Z"
+    one = {"kind": "sketch", "sketch": {"paths": [frame, "M 30 28 A 8 8 0 0 1 38 20 L 38 28 Z"]}, "width": 12,
+           "placement": MID, "islands": "drop_out"}
+    other = {**one, "sketch": {"paths": [frame, "M 30 28 A 8 8 0 1 0 38 20 L 38 28 Z"]}}
+    keys = []
+    for a in (one, other):
+        out, _ = made(a)
+        keys.append([c["ack"] for c in out["checks"] if c.get("ack")])
+    assert keys[0] and keys[1] and keys[0] != keys[1]
+    # A box resize that keeps the bar's flat coordinates still asks again.
+    bar = {"kind": "sketch", "sketch": {"shapes": [{"type": "rect", "x": 0, "y": 0, "width": 100, "height": 10}]},
+           "width": 3, "placement": {"on": "P4", "x": {"from": "right", "to": "near_edge", "distance": 0.5},
+                                     "y": {"from": "bottom_score", "to": "near_edge", "distance": 0.5}}}
+    out, d12 = made(bar, depth=12)
+    keys = [c["ack"] for c in out["checks"] if c.get("ack")]
+    assert keys
+    out, _ = made(bar, depth=12, acknowledged=keys)
+    assert all(c["status"] == "info" for c in out["checks"] if "_flag_" in c["id"])
+    out, d3 = made(bar, depth=3, acknowledged=keys)
+    a12, a3 = d12.extras["artwork"][0], d3.extras["artwork"][0]
+    assert sorted(s.start for s in a12.segs()) == sorted(s.start for s in a3.segs())  # same flat geometry
+    flags = [c for c in out["checks"] if "_flag_" in c["id"]]
+    assert flags and all(c["status"] == "fail" and not c.get("acknowledged") for c in flags)
+
+
+def test_artwork_given_without_ids_never_takes_an_id_already_listed():
+    dot = {"kind": "shape", "shape": "circle", "diameter": 1, "placement": MID}
+    p = BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": "a2"}, dot, dot]})
+    assert [a["id"] for a in p.artwork] == ["a2", "a1", "a3"]
+    with pytest.raises(ValueError, match="listed twice"):
+        BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": "a1"}, {**dot, "id": "a1"}]})
