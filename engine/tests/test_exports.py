@@ -1122,3 +1122,42 @@ def test_a_save_onto_the_emptied_path_is_never_overwritten(tmp_path, monkeypatch
     notes = exports.recover_all(cad, None)
     assert notes and "couldn't be undone" in notes[0]
     assert list((cad / "superseded").rglob("job.cf2"))
+
+
+def test_rpc_revisions_must_be_whole_numbers_and_partition_pieces_export_with_their_set(tmp_path):
+    """Review finding 19."""
+    from dataclasses import replace
+
+    from dieline_engine import partitions, partsets
+    from dieline_engine.designstore import FitLink, new_design
+    from dieline_engine.rpc import RpcError, Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    shown = server.methods["design.replace"]({"session_id": "s1", "params": BOX.model_dump()})
+    assert shown["revision"] == 1
+    # (a) True == 1 in Python: a bool isn't a revision
+    with pytest.raises(RpcError, match="expected"):
+        server.methods["design.replace"]({"session_id": "s1", "params": BOX.model_dump(),
+                                          "expected": {"design_id": shown["design_id"], "revision": True}})
+    with pytest.raises(RpcError, match="revision"):
+        server.methods["export.plan"]({"session_id": "s1", "design_id": shown["design_id"], "revision": True})
+    assert server.store.current("s1").revision == 1
+    # (b) one piece's parameters alone would skip its set's checks: refused with the reason
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    piece = partitions.PartitionParams(board="32 B KR", role="long", set=sp).model_dump()
+    with pytest.raises(RpcError, match="exported with its set"):
+        server.methods["export.plan"]({"params": piece})
+    with pytest.raises(RpcError, match="exported with its set"):
+        server.methods["box.export"]({"params": piece})
+    # (c) a design check that blocks the export still lists each format's readiness
+    d = new_design(BOX, "carton")
+    d, gid = partsets.add_set(d, sp, contained_in="carton")
+    d = replace(d, links=(*d.links, FitLink("fit_gone", "p9", gid)))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"], "formats": ["cf2", "dxf"]})
+    assert not plan["ready"] and set(plan["formats"]) == {"cf2", "dxf"}
+    assert all(not f["ready"] and f["blocking"] for f in plan["formats"].values())

@@ -155,7 +155,7 @@ class Server:
         if "expected" in p:  # what the form showed when the designer pressed Generate (null: nothing)
             e = p["expected"]
             if e is not None and not (isinstance(e, dict) and isinstance(e.get("design_id"), str)
-                                      and type(e.get("revision")) is int):
+                                      and _is_int(e.get("revision"))):
                 raise RpcError(INVALID_PARAMS, "expected must be {design_id, revision} or null")
             expected = None if e is None else (e["design_id"], e["revision"])
         if p.get("parts") is not None:
@@ -175,16 +175,21 @@ class Server:
     def _export_target(self, p: dict[str, Any]) -> tuple[list[exports.ExportPart], dict[str, Any]]:
         """The parts an export (or its plan) is for, and what the manifest records about the design."""
         if "design_id" in p:  # the export bar: exactly the snapshot it showed
-            revision = p.get("revision")
-            if type(revision) is not int:
-                raise RpcError(INVALID_PARAMS, "revision must be an integer")
-            snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), revision)
+            if not _is_int(p.get("revision")):
+                raise RpcError(INVALID_PARAMS, "revision must be the revision shown (a whole number)")
+            snap = self.store.snapshot(_str(p, "session_id"), _str(p, "design_id"), p.get("revision"))
             checks = self.store.check_exportable(snap)  # the design's own checks block it too
             payload = self.store.payload(snap)
             return self.store.export_parts(snap), {
                 "design_id": snap.id, "revision": snap.revision, "design_checks": checks,
                 "structure": {"groups": payload["groups"], "links": payload["links"]}}
-        params = designs.parse_params(p.get("params") or {})
+        raw = p.get("params") or {}
+        if isinstance(raw, dict) and raw.get("style") == "partition-slotted":
+            # One piece's parameters alone would skip its set's crossing, interlock and fit checks.
+            raise RpcError(INVALID_PARAMS, "a partition piece is exported with its set: export the design the "
+                                           "engine holds (session_id, design_id and revision), not one piece's "
+                                           "parameters")
+        params = designs.parse_params(raw)
         return [exports.ExportPart("p1", params.style, params)], {}
 
     def _export_args(self, p: dict[str, Any]) -> tuple[str | None, list[str]]:
@@ -212,12 +217,12 @@ class Server:
                                      dxf_expand_perfs=_flag(p, "dxf_expand_perfs"))
 
     def _export_plan(self, p: dict[str, Any]) -> dict[str, Any]:
+        filename, formats = self._export_args(p)
         try:
             parts, _ = self._export_target(p)
         except designs.DesignCheckFailed as exc:
             return {"ready": False, "blocking": [str(exc)], "files": [], "job_path": None, "replaces": [],
-                    "pickup": False, "formats": {}}
-        filename, formats = self._export_args(p)
+                    "pickup": False, "formats": {f: {"ready": False, "blocking": [str(exc)]} for f in formats}}
         cfg = self.settings.settings
         return exports.plan(parts, cfg.resolved_output_dir(), filename, formats, cfg.resolved_dxf_dir(),
                             _flag(p, "dxf_expand_perfs"))
@@ -269,13 +274,18 @@ class Server:
         if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
             raise RpcError(INVALID_PARAMS, "keys must be a list of acknowledgement keys")
         rev = p.get("revision")
-        if type(rev) is not int:
+        if not _is_int(rev):
             raise RpcError(INVALID_PARAMS, "revision must be the revision shown")
         return self.agent.acknowledge(_str(p, "session_id"), (_str(p, "design_id"), rev), _str(p, "part_id"), keys)
 
     def _chat_send(self, p: dict[str, Any]) -> dict[str, Any]:
         self.agent.start_turn(_str(p, "session_id"), _str(p, "text"))
         return {"accepted": True}
+
+
+def _is_int(v: Any) -> bool:
+    """A whole number, and not a bool (True == 1 in Python)."""
+    return type(v) is int
 
 
 def _flag(p: dict[str, Any], key: str) -> bool:

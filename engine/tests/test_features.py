@@ -69,7 +69,7 @@ def test_expressions_types_fractions_units_and_names():
     assert evaluate("W/2 - 1/4", env) == 4.75
     assert evaluate("1 1/2", env) == 1.5
     assert evaluate("2:12", env) == 2.75
-    with pytest.raises(ExpressionError, match="already specify inches"):
+    with pytest.raises(ExpressionError, match="take no unit"):
         evaluate("2:12mm", env)
     assert evaluate("2 * CAL", env) == pytest.approx(2 * get_board("32 B KR").cal)
     assert evaluate("50mm", env) == pytest.approx(50 / 25.4)
@@ -803,3 +803,98 @@ def test_tear_strip_thumb_hole_checks_its_actual_centre():
     copy = d.extras["features"][0].copies[0]
     hole = next(s for s in copy.segs if isinstance(s, Arc))
     assert copy.extra["tab_at"] == hole.center
+
+
+TS = {"kind": "tear_strip", "route": {"faces": "body_panels", "direction": "horizontal",
+                                      "at": {"from": "bottom_score", "distance": 3}}}
+
+
+def test_a_tear_strip_stopping_at_the_joint_warns_from_either_end():
+    """Review finding 12.1: start: end reverses the faces; the joint warning used to vanish."""
+    for start in ("start", "end"):
+        p = payload([{**TS, "tab": "angled_tab", "glue_joint": "stop", "start": start}])
+        assert feature(p)["status"] == "ok" and "feature_f1_joint" in checks(p), start
+
+
+def test_glue_joint_cross_carries_a_reversed_wrap_over_the_lug():
+    """Review finding 12.2: a P4-to-P1 route used to drop the lug."""
+    d = build([{**TS, "tab": "angled_tab", "route": {**TS["route"], "faces": ["P4", "P3", "P2", "P1"]}}])
+    f = d.extras["features"][0]
+    assert f.status == "ok", f.reason
+    assert f.copies[0].faces == ["glue_lug", "P4", "P3", "P2", "P1"]
+    assert validate(d).ok and not validate(d).islands
+    # the reference line is still the route's own first face's
+    fwd = build([{**TS, "tab": "angled_tab"}]).extras["features"][0]
+    ys = lambda b: sorted({round(s.start[1], 6) for s in b.copies[0].segs if s.op.endswith("rail_a")})  # noqa: E731
+    assert ys(f) == ys(fwd)
+
+
+def test_a_thumb_hole_tab_is_checked_where_the_hole_is():
+    """Review finding 12.3: the tab position was taken half a tab length in, not at the hole's centre."""
+    d = build([{**TS, "tab": "thumb_hole", "width": 1, "tab_length": "1/4"}])
+    c = d.extras["features"][0].copies[0]
+    hole = next(s for s in c.segs if isinstance(s, Arc))
+    assert c.extra["tab_at"] == pytest.approx(hole.center)
+
+
+@pytest.mark.parametrize("tab", ["edge_tab", "angled_tab", "thumb_hole"])
+def test_a_tear_strips_pointage_reaches_its_tab_cuts(tab):
+    """Review finding 12.4: pointage 3 left the tab cuts at 2 pt (mixed pointage)."""
+    d = build([{**TS, "tab": tab, "pointage": 3}])
+    ops = [op for k, op in d.ops.items() if k.startswith("f1.")]
+    assert ops and all(op.rule is not None and op.rule.pointage == 3 for op in ops)
+    assert {rules.rule_of(d, s).pointage for s in d.segments if (s.op or "").startswith("f1.")} == {3}
+
+
+def test_an_edge_tab_starts_on_each_rails_own_edge_over_the_lugs_taper():
+    """Review finding 12.5: start: end near the lug's taper built both tab cuts from the centre line's start."""
+    for dist in ("1/2", "5/8", 1):
+        p = params([{**TS, "tab": "edge_tab", "start": "end",
+                     "route": {**TS["route"], "at": {"from": "bottom_score", "distance": dist}}}])
+        d = designs.build(p)
+        f = d.extras["features"][0]
+        assert f.status == "ok", (dist, f.reason)
+        r = validate(d)
+        assert r.ok and not r.islands, (dist, r.invalid)
+        # each tab cut runs from the blank's edge to the start of its own rail
+        for k in ("a", "b"):
+            tab = next(s for s in d.segments if s.op == f"f1.tab_{k}")
+            rail = [s for s in d.segments if s.op == f"f1.rail_{k}"]
+            assert any(math.dist(tab.end, s.start) < 1e-6 or math.dist(tab.end, s.end) < 1e-6 for s in rail)
+
+
+def test_the_tab_glue_check_needs_the_tab_inside_the_landing_both_ways():
+    """Review finding 12.6: only x was compared, so a tab beside a flap's short glue landing warned."""
+    box = {**BOX, "style": "reg-gli-ext"}
+    for flap, dist in (("bottom_flap_P1", 9.2), ("top_flap_P1", 0.6)):
+        ts = {"kind": "tear_strip", "tab": "angled_tab",
+              "route": {"faces": [flap, "P1"], "direction": "vertical", "at": {"from": "left", "distance": dist}}}
+        p = designs.create_box(BoxParams.model_validate({**box, "features": [ts]}))
+        assert feature(p)["status"] == "ok" and "feature_f1_tab_glue" not in checks(p), flap
+    assert "feature_f1_tab_glue" in checks(payload([TS]))  # still flagged in P1's full-height landing
+
+
+def test_a_notch_beside_a_hole_is_a_near_miss_and_its_pitch_must_be_positive():
+    """Review finding 18."""
+    notch = {"kind": "notch", "on": "P1", "edge": "free_edge", "width": 1, "mirror": "none"}
+    vent = {"kind": "vent", "diameter": "1/2", "placement": {
+        "on": "P1", "mirror": "none", "y": "centred", "x": {"from": "free_edge", "to": "near_edge", "distance": "9/16"}}}
+    p = payload([notch, vent])
+    assert feature(p, "f1")["status"] == "ok" and feature(p, "f2")["status"] == "ok"
+    near = [v for k, v in checks(p).items() if k.endswith("_near")]
+    assert near and near[0]["status"] == "warn" and "1/16 in" in near[0]["message"]
+    # far enough apart: no warning
+    far = payload([notch, {**vent, "placement": {**vent["placement"], "x": {**vent["placement"]["x"], "distance": 2}}}])
+    assert not any(k.endswith("_near") for k in checks(far))
+    bad = payload([{**notch, "pattern": {"kind": "row", "count": 2, "pitch": -2}}])
+    assert feature(bad)["status"] == "stale" and "pitch must be positive" in feature(bad)["reason"]
+
+
+def test_sixteenths_take_no_unit():
+    """Review finding 20: "2:12mm" read 2:12 as 2.75 mm on an inch part."""
+    env = env_for("in", get_board("32 B KR"), {"L": 14, "W": 10, "D": 12})
+    assert evaluate("2:12", env) == 2.75
+    for text in ("2:12mm", "2:12in", "2:12 mm", "W - 2:12mm"):
+        with pytest.raises(ExpressionError, match="take no unit"):
+            evaluate(text, env)
+    assert evaluate("2:12 + 1mm", env) == pytest.approx(2.75 + 1 / 25.4)

@@ -347,13 +347,16 @@ def expand_perforations(d: Dieline) -> Dieline:
         else:
             out.segments.append(s)
     renamed = {op_id: f"{op_id or 'perf'}.cuts" for op_id in by_op}
+    # Ops a dashed cut may end on: named cuts only (a tear strip's tab cuts or thumb hole), never a crease.
+    cut_ops = {s.op for s in d.segments if s.type == LineType.CUT and s.op}
     for op_id, segs in by_op.items():
         rule = rule_of(d, segs[0])
         old = d.ops.get(op_id) if op_id else None
-        # Preserve contacts with pull-tab cuts. The perforation's generic permission to
-        # end on a hinge does not carry over to individual cuts in the sample-table DXF.
-        carried = tuple(x for x in (old.ends_on if old is not None else ())
-                        if x in d.ops and d.ops[x].kind in ("tab_cut", "hole"))
+        # Each piece may stop in the board or on the blank's edge or a crease it ends at, and on what
+        # the perforation itself may end on; crossing a crease is undeclared, so a cut landing on one
+        # is invalid here.
+        carried = tuple(renamed.get(x, x) for x in (old.ends_on if old is not None else ())
+                        if x in renamed or (x in cut_ops and x != "outline"))
         cut_op = Operation(renamed[op_id], "perf_cut", open_ends="free", ends_on=("outline", *carried),
                            rule=RuleSpec("cut", rule.pointage))
         out.ops[cut_op.id] = cut_op

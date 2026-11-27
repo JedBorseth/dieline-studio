@@ -767,20 +767,3 @@ def test_malformed_and_cyclic_stacks_are_unavailable_or_refused_and_depth_warns_
               {"id": "g2", "kind": "stack", "members": [{"ref": "g1", "role": "tier"}]}]
     with pytest.raises(ValueError, match="contains itself"):
         design_from_parts(parts, groups, [])
-
-
-def test_stateless_rpc_can_plan_and_export_a_partition_piece(tmp_path):
-    import io
-
-    from dieline_engine.rpc import Server
-    from dieline_engine.settings import SettingsStore
-
-    store = SettingsStore(tmp_path / "settings.json")
-    store.update({"output_dir": str(tmp_path / "out")})
-    server = Server(io.StringIO(), store)
-    sp = spec()
-    part = piece_params(sp, P.plan_set(sp).pieces[0].role)
-    request = {"params": part.model_dump(mode="json"), "filename": "divider"}
-    assert server.methods["export.plan"](request)["ready"]
-    assert server.methods["box.export"](request)["paths"][0].endswith("divider.cf2")
-    server._pool.shutdown()
