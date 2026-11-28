@@ -926,10 +926,10 @@ def to_json(subs: list[Sub]) -> list[dict[str, Any]]:
                 pieces.append({"e": [r(p.c[0]), r(p.c[1]), r(p.u[0]), r(p.u[1]), r(p.v[0]), r(p.v[1]), r(p.th0),
                                      r(p.dth)]})
             elif isinstance(p, Nurbs):
-                # Knots and weights at full precision: rounding can merge close knots (a smooth join
+                # Knots, control points and weights at full precision: rounding can merge close knots (a smooth join
                 # read back as a corner) or zero a tiny weight.
                 pieces.append({"n": {"d": p.degree, "k": [float(k) for k in p.knots],
-                                     "c": [[r(x), r(y)] for x, y in p.ctrl], "w": [float(w) for w in p.weights]}})
+                                     "c": [[float(x), float(y)] for x, y in p.ctrl], "w": [float(w) for w in p.weights]}})
             else:
                 raise SourceError(f"can't store a {type(p).__name__}")
         item: dict[str, Any] = {"closed": s.closed, "pieces": pieces}

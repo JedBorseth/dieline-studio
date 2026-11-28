@@ -28,6 +28,8 @@ FIT_TOL_IN = 0.002
 MAX_DEPTH = 14
 MAX_SPLINE_POINTS = 5000  # control points in one spline, as stored geometry allows
 MAX_IMPORT_SPLINE_POINTS = 10000  # in all of one import's splines: keeps a cold build well inside a minute
+REFINE_BELOW_IN = 1.0  # spline spans whose samples already bend tighter than this get a closer look
+REFINE_SPANS = 512  # the tightest-looking ones; realistic artwork has far fewer spans
 ARC_CORRECTION_MAX = 0.01  # an SVG arc's radius may be enlarged by at most 1%
 
 
@@ -147,9 +149,10 @@ def sample_points(curve: Curve, n: int = 48) -> list[Point]:
     out: list[Point] = []
     for q in curve.pieces():
         ts = sample_ts(q, n)
-        got = [(t, q.point(t)) for t in ts]
+        base = [(t, q.point(t)) for t in ts]
+        got = list(base)
         for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
-            best = sorted(got, key=lambda x: -sign * x[1][axis])[:3]
+            best = sorted(base, key=lambda x: -sign * x[1][axis])[:3]  # from the even samples, each way
             for t, _ in best:
                 i = bisect.bisect_left(ts, t)
                 lo, hi = ts[max(i - 1, 0)], ts[min(i + 1, len(ts) - 1)]
@@ -423,9 +426,10 @@ class Nurbs(Curve):
         if not (sp > 1e-300 and cr > 1e-300 and math.isfinite(sp) and math.isfinite(cr)):
             return None
         try:
-            return sp * (sp / cr) * sp
+            r = sp * (sp / cr) * sp
         except OverflowError:
             return None
+        return r if math.isfinite(r) else None
 
     def radius_samples(self, n: int = 32) -> list[tuple[float, Point]]:
         """Exact curvature: four samples through each span and evenly along the curve, refined round
@@ -453,13 +457,36 @@ class Nurbs(Curve):
             return out
 
         got = radii(sorted(us))
-        for _ in range(6):
-            if not got:
+        # Then closer in on each span's own tightest sample (one span can't crowd out another's
+        # hairpin): spans by how tight they already look, those under REFINE_BELOW_IN, at most
+        # REFINE_SPANS of them, each bracketed by its neighbouring samples and narrowed four times.
+        per: dict[int, list[tuple[float, float]]] = {}
+        for r, u, s in got:
+            per.setdefault(s, []).append((u, r))
+        order = sorted((min(r for _u, r in v), s) for s, v in per.items())
+        for low, s in order[:REFINE_SPANS]:
+            if low >= REFINE_BELOW_IN:
                 break
+            pts = sorted(per[s])
+            i = min(range(len(pts)), key=lambda j: pts[j][1])
+            lo = pts[i - 1][0] if i > 0 else k[s]
+            hi = pts[i + 1][0] if i + 1 < len(pts) else k[s + 1]
+            best_u, best_r = pts[i]
+            for _ in range(4):
+                found = radii([(lo + (hi - lo) * j / 6, s) for j in range(1, 6)])
+                got += found
+                for r, u, _s in found:
+                    if r < best_r:
+                        best_u, best_r = u, r
+                w = (hi - lo) / 6
+                lo, hi = max(best_u - w, k[s]), min(best_u + w, k[s + 1])
+        # And round the four tightest anywhere, however gentle they look (a needle-thin peak).
+        us |= {(u, s) for _r, u, s in got}
+        for rnd in range(6):
             more: set[tuple[float, int]] = set()
             for _r, u, s in sorted(got)[:4]:
                 a, b = k[s], k[s + 1]
-                width = (b - a) / 4 ** (_ + 1)
+                width = (b - a) / 4 ** (rnd + 1)
                 for j in range(-3, 4):
                     more.add((min(max(u + width * j / 4, a), b), s))
             more -= us

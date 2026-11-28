@@ -154,7 +154,14 @@ def check_artwork(d: Dieline) -> list[CheckResult]:
             out.append(CheckResult(f"artwork_{a.id}_note{k + 1}", status, msg, "artwork", None, a.id))
         out += _islands(a)
     # ---- tooling limits, one result each
-    bend_lim = BEND_MIN_HEAVY if (pointage >= 3 and double_wall) else BEND_MIN
+    from .rules import rule_of  # noqa: PLC0415
+
+    def bend_limit(dr: Drawn) -> float:
+        """The drawn outline's own rule decides: artwork can carry heavier pointage than the box."""
+        pts = [rule_of(d, s).pointage for s in dr.segs] or [pointage]
+        return BEND_MIN_HEAVY if (max(pts) >= 3 and double_wall) else BEND_MIN
+
+    limits: set[float] = set()
     bends: list[tuple[float, str, Art, Point]] = []
     acute: list[tuple[float, str, Art, Point]] = []
     short: list[tuple[float, str, Art, Point]] = []
@@ -162,6 +169,7 @@ def check_artwork(d: Dieline) -> list[CheckResult]:
         for dr in a.live():
             if dr.rule == "annotation":
                 continue
+            bend_lim = bend_limit(dr)
             tight = [(r, p) for r, p in dr.radii if r < bend_lim - TOL]
             for s in dr.segs:
                 if isinstance(s, Arc) and dr.kinds.get(s, "arc") == "arc":
@@ -171,6 +179,7 @@ def check_artwork(d: Dieline) -> list[CheckResult]:
             if tight:
                 r, p = min(tight)
                 bends.append((r, _where(fm, a, p), a, p))
+                limits.add(bend_lim)
             for loop in dr.loops:
                 cs = _corners(loop, dr.closed)
                 for i, ang in cs:
@@ -188,7 +197,8 @@ def check_artwork(d: Dieline) -> list[CheckResult]:
                         short.append((s.length, _where(fm, a, s.start), a, s.start))
     for res in (
         _agg("artwork_bend_radius", f"curve{'s' if len(bends) != 1 else ''} tighter than the rule bends", bends,
-             "in", f"{fmt_in(bend_lim)} in on the rule's centre line"),
+             "in", " / ".join(f"{fmt_in(x)} in" for x in sorted(limits or {BEND_MIN})) +
+             " on the rule's centre line" + (" (3/16 in for 3 pt rule on double wall)" if len(limits) > 1 else "")),
         _agg("artwork_acute", f"corner{'s' if len(acute) != 1 else ''} under {ACUTE_DEG:g} deg (they pinch the "
              "dieboard)", acute, "deg", f"{ACUTE_DEG:g} deg"),
         _agg("artwork_short", f"straight{'s' if len(short) != 1 else ''} under {fmt_in(SHORT_MIN)} in between "

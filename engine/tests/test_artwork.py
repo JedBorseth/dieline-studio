@@ -1161,3 +1161,48 @@ def test_artwork_given_without_ids_never_takes_an_id_already_listed():
     for bad in (["a1"], "", 0):
         with pytest.raises(ValidationError, match="isn't an artwork id"):
             BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": bad}]})
+
+
+def _import_of(subs, **kw):
+    return {"id": "a1", "kind": "import", "path": "x.dxf", "placement": MID, "units": "in",
+            "source": {"geometry": ai.to_json(subs), "units_in": 1.0, "name": "x.dxf", "format": "dxf"}, **kw}
+
+
+def test_a_tight_bend_inside_one_span_warns_even_beside_gentler_ones():
+    """Final v0.4.0 review: refinement followed the four tightest samples anywhere, so gentler spans
+    crowded out a hairpin sitting between another span's samples."""
+    sol = curves.Nurbs(2, (0, 0, 0, .98, .98, 1, 1, 1),
+                       ((-.2, .2625), (-.2, .0625), (0, .0625), (.2, -.4375), (.4, 3.0625)), (1, math.sqrt(.5), 1, 1, 1))
+    ctrl, x = [(0.0, 0.0)], 0.0
+    for s in range(10):  # nine 0.15 in arches and one hairpin, on span 3
+        if s == 3:
+            ctrl += [(x + 3.0, 0.0), (x + 1.2, 0.15)]
+            x += 1.2
+        else:
+            y0 = ctrl[-1][1]
+            ctrl += [(x + 0.15, y0 + 0.15), (x + 0.30, y0)]
+            x += 0.30
+    gem = curves.Nurbs(2, (0.0, 0.0, 0.0) + tuple(i / 10 for i in range(1, 10) for _ in range(2)) + (1.0, 1.0, 1.0),
+                       tuple(ctrl))
+    for q, box in ((sol, {}), (gem, {"length": 16, "width": 12, "depth": 12})):
+        assert min(r for r, _ in q.radius_samples()) < 0.125
+        out, _ = made(_import_of([asrc.Sub([q], False, "crease")]), **box)
+        assert out["features"][0]["status"] == "ok" and checks(out)["artwork_bend_radius"]["status"] == "warn"
+
+
+def test_the_bend_limit_follows_the_artworks_own_rule():
+    """Final v0.4.0 review: a 3 pt artwork rule on double wall was held to the box's 2 pt limit."""
+    circle = asrc.Sub([asrc.Prim((0.15, 0), (0.15, 0), (0, 0), False, True)], True)
+    out, _ = made(_import_of([circle]), board="48 BC KR")
+    assert "artwork_bend_radius" not in checks(out)  # 0.150 in is fine for 2 pt rule
+    out, _ = made(_import_of([circle], pointage=3), board="48 BC KR")
+    bend = checks(out)["artwork_bend_radius"]
+    assert bend["status"] == "warn" and "3/16 in" in bend["message"]
+
+
+def test_spline_control_points_keep_full_precision_in_storage():
+    """Final v0.4.0 review: rounding control points to 9 places opened a gap at a small spline's join."""
+    c = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1),
+                     ((0.0, 0.0), (0.03, 0.05), (0.06000000049, 0.0), (0.06000000051, 0.0), (0.09, 0.05), (0.127, 0.0)))
+    back = ai.from_json(ai.to_json([asrc.Sub([c], False)]))[0].pieces[0]
+    assert back.ctrl == c.ctrl
