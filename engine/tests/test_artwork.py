@@ -4,6 +4,7 @@ islands and bridges, the aggregated checks and the suspicious-artwork flags."""
 import math
 
 import pytest
+from pydantic import ValidationError
 
 from dieline_engine import artwork_import as ai
 from dieline_engine import artwork_sources as asrc
@@ -103,7 +104,7 @@ def test_every_library_shape_draws_valid_geometry(shape):
     assert f["provenance"] == "library artwork" and validate(d).ok
     failures = {c["id"] for c in out["checks"] if c["status"] == "fail"}
     if shape.get("outline") == "crease":
-        # The circumference can act as a fold on the panel's shorter dimension.
+        # A creased outline that isn't one straight is measured against the face's shorter side.
         assert failures == {"artwork_a1_flag_rule"}
     else:
         assert not failures
@@ -665,6 +666,20 @@ def test_svg_use_references_count_toward_the_element_limit(monkeypatch):
         ai.parse_svg(svg)
 
 
+def _use_dag(layers, fan):
+    """An empty group used `fan` times per layer, `layers` deep: fan ** layers walks, no shapes."""
+    defs = '<g id="g0"></g>' + "".join(
+        f'<g id="g{k}">' + f'<use href="#g{k - 1}"/>' * fan + "</g>" for k in range(1, layers + 1))
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="1in" viewBox="0 0 10 10"><defs>{defs}'
+            f'</defs><rect width="5" height="5"/><use href="#g{layers}"/></svg>').encode()
+
+
+def test_svg_use_references_that_draw_nothing_still_count_toward_the_limit():
+    assert len(ai.parse_svg(_use_dag(3, 5)).subs) == 1  # 125 walks: fine
+    with pytest.raises(ai.ImportRefused, match="elements once its <use> references are expanded"):
+        ai.parse_svg(_use_dag(7, 5))  # 78,125 walks of nothing
+
+
 def test_svg_path_with_very_many_outlines_skips_the_pairwise_fill_rule_compare():
     d = " ".join(f"M{x} 0 h1 v1 h-1 Z" for x in range(0, 2 * (ai.MAX_NESTED_COMPARE + 1), 2))
     p = ai.parse_svg(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 10"><path d="{d}"/></svg>'
@@ -780,3 +795,414 @@ def test_resize_renews_acknowledgement_even_when_anchored_geometry_stays_put():
 def test_missing_artwork_id_skips_explicit_ids_on_either_side():
     first, second, third = {**SLOT, "id": "a2"}, SLOT, {**SLOT, "id": "a1"}
     assert [a["id"] for a in params(first, second, third).artwork] == ["a2", "a3", "a1"]
+
+
+# ------------------------------------------------------------------ review fixes: biarcs and sources (6, 8)
+
+
+def test_a_nearly_straight_curve_fits_without_far_away_arc_centres():
+    from dieline_engine.topology import MAX_COORD_IN
+    f = curves.fit(curves.Bezier(((0, 0), (2.64, -8e-5), (5.36, -8e-5), (8, 0))), 0.002)
+    assert f.prims and all(p.center is None or max(map(abs, p.center)) < 1e4 for p in f.prims)
+    flat = {"kind": "sketch", "sketch": {"paths": ["M 0 50 C 33 49.999 67 49.999 100 50 L 100 70 L 0 70 Z"]},
+            "width": 8, "placement": MID}
+    out, d = made(flat)
+    assert out["features"][0]["status"] == "ok", out["features"][0].get("reason")
+    assert all(abs(v) < MAX_COORD_IN for s in d.segments for v in (*s.start, *s.end, *(getattr(s, "center", None)
+                                                                                       or ())))
+
+
+def test_a_curve_that_returns_to_its_start_midway_is_fitted_not_dropped():
+    eight = curves.Nurbs(3, (0, 0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1, 1),
+                         ((0, 0), (2, 1.5), (2, -1.5), (0, 0), (-2, 1.5), (-2, -1.5), (0, 0)))
+    assert eight.point(0.5) == pytest.approx((0, 0)) and eight.point(0) == eight.point(1)
+    f = curves.fit(eight, 0.002)
+    assert f.prims and _dev(eight, f.prims) <= 0.002 + 1e-9
+    xs = [q[0] for p in f.prims for q in (p.start, p.end)]
+    assert max(xs) > 1.4 and min(xs) < -1.4  # both loops are there
+
+
+def test_dropping_a_zero_length_piece_keeps_each_segments_kind():
+    sub = asrc.Sub([asrc.Prim((0, 0), (0, 0)), curves.Bezier(((0, 0), (1, 2), (3, -2), (4, 0))),
+                    asrc.Prim((4, 0), (0, 0))], True)
+    (c,), _ = asrc.finish([sub], 1.0, declared_closed=False)
+    assert len(c.kinds) == len(c.prims)
+    assert c.kinds[-1] == "line" and c.prims[-1].center is None
+    assert all(k == "fit" for k in c.kinds[:-1])
+
+
+# ------------------------------------------------------------------ review fixes: suspicious flags (7)
+
+NEAR_TOP = {"on": "P2", "x": "centred", "y": {"from": "top_score", "to": "near_edge", "distance": 0.25}}
+
+
+def _flags(*arts, **kw):
+    out, _ = made(*arts, **kw)
+    return {c["id"].split("_flag_")[1] for c in out["checks"] if "_flag_" in c["id"]}
+
+
+def test_a_straight_drawn_in_pieces_is_still_a_long_straight():
+    pieces = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 25 0 L 50 0 L 75 0 L 100 0 L 100 50 L 0 50 Z"]},
+              "width": 3, "placement": NEAR_TOP}
+    assert "parallel" in _flags(pieces)
+    # A curve drawn as many short chords, or a zigzag, isn't one straight.
+    ngon = {"kind": "shape", "shape": "polygon", "sides": 40, "diameter": 3, "placement": NEAR_TOP}
+    zig = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 20 6 L 40 0 L 60 6 L 80 0 L 100 6 L 100 50 L 0 50 Z"]},
+           "width": 3, "placement": NEAR_TOP}
+    assert "parallel" not in _flags(ngon) and "parallel" not in _flags(zig)
+
+
+def test_a_slot_is_slot_like_at_any_angle():
+    bar = {"kind": "sketch", "sketch": {"shapes": [{"type": "rect", "x": 0, "y": 0, "width": 100, "height": 8}]},
+           "width": 3, "placement": {**NEAR_TOP, "rotation_deg": 45}}
+    assert "slot" in _flags(bar)
+    # A rotated square, a circle and a thin ellipse (curved, not a slot) near the edge aren't.
+    sq = {"kind": "shape", "shape": "rounded_rect", "width": 1, "height": 1, "corner_radius": 0.0625,
+          "placement": {**NEAR_TOP, "rotation_deg": 45}}
+    dot = {"kind": "shape", "shape": "circle", "diameter": 0.4, "placement": NEAR_TOP}
+    oval = {"kind": "shape", "shape": "ellipse", "width": 2, "height": 0.4, "placement": {**NEAR_TOP,
+                                                                                         "rotation_deg": 30}}
+    for a in (sq, dot, oval):
+        assert "slot" not in _flags(a)
+
+
+def test_a_crease_running_up_a_shallow_face_is_measured_against_its_height():
+    up = {"kind": "sketch", "sketch": {"paths": ["M 50 0 L 50 100"]}, "height": 3, "rule": "crease",
+          "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    assert "rule" in _flags(up, depth=4)  # 3 in on a 14 x 4 in face: 75% of its height
+    across = {**up, "sketch": {"paths": ["M 0 50 L 100 50"]}, "height": None, "width": 3}
+    across.pop("height")
+    assert "rule" not in _flags(across, depth=4)  # 3 in of its 14 in width
+    short = {**up, "height": 1.5}
+    assert "rule" not in _flags(short, depth=4)
+
+
+def test_a_straight_crease_is_measured_across_the_face_in_its_direction():
+    """Review of the v0.4.0 merge: the limit jumped from half the height to half the width at 45 deg."""
+    bar = {"kind": "sketch", "sketch": {"paths": ["M 0 50 L 100 50"]}, "width": 4, "rule": "crease",
+           "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    for deg in (44, 45, 46):  # 4 in on a 14 x 4 in face: about 5.7 in across it that way
+        assert "rule" in _flags({**bar, "placement": {**bar["placement"], "rotation_deg": deg}}, depth=4), deg
+    assert "rule" not in _flags({**bar, "placement": {**bar["placement"], "rotation_deg": 10}}, depth=4)
+    diagonal = {"kind": "sketch", "sketch": {"paths": ["M 0 0 L 100 100"]}, "width": 3.1, "rule": "crease",
+                "placement": {"on": "P2", "x": "centred", "y": "centred"}}
+    assert "rule" in _flags(diagonal, depth=4)
+    # On a tapered glue lug, against the lug's own outline (its bounding rectangle is longer).
+    lug = {**bar, "width": 2.17, "placement": {"on": "glue_lug", "x": "centred", "y": "centred", "rotation_deg": 76}}
+    assert "rule" in _flags(lug, depth=4)
+
+
+def test_a_spline_that_loops_inside_one_short_knot_span_is_kept():
+    """Review of the v0.4.0 merge: samples of the whole curve all landed on its start and dropped it."""
+    tri = curves.Nurbs(1, (0, 0, 0.01, 0.02, 0.04, 1, 1), ((0, 0), (1, 0), (0, 1), (0, 0), (0, 0)))
+    f = curves.fit(tri)
+    xs = [q[0] for p in f.prims for q in (p.start, p.end)]
+    ys = [q[1] for p in f.prims for q in (p.start, p.end)]
+    assert f.prims and max(xs) == pytest.approx(1) and max(ys) == pytest.approx(1)
+    square = asrc.Sub([asrc.Prim((3, 0), (4, 0)), asrc.Prim((4, 0), (4, 1)), asrc.Prim((4, 1), (3, 1)),
+                       asrc.Prim((3, 1), (3, 0))], True)
+    contours, _ = asrc.finish([asrc.Sub([tri], True), square], 1.0, declared_closed=True)
+    assert len(contours) == 2
+    assert asrc.subs_bbox([asrc.Sub([tri], True)]) == pytest.approx((0, 0, 1, 1))  # sized by its loop
+    cubic = curves.Nurbs(3, (0, 0, 0, 0, 0.001, 0.0013, 0.0017, 0.002, 1, 1, 1, 1),
+                         ((0, 0), (0, 0), (0, 0), (1, 1), (1, -1), (0, 0), (0, 0), (0, 0)))
+    x0, _, x1, _ = asrc.subs_bbox([asrc.Sub([cubic], True)])
+    assert x1 - x0 > 0.9 and max(q[0] for p in curves.fit(cubic).prims for q in (p.start, p.end)) > 0.9
+
+
+def test_a_polyline_spline_keeps_its_corners_and_joins_its_straights():
+    """Review of the v0.4.0 fixes: fitting across a knot rounded corners into tiny arcs, and a straight
+    of many points became one line per point."""
+    for tri in (curves.Nurbs(1, (0, 0, 0.01, 0.02, 0.04, 1, 1), ((0, 0), (2, 0), (0, 0.7), (0, 0), (0, 0))),
+                curves.Nurbs(1, (0, 0, 1e-7, 2e-7, 4e-7, 1, 1), ((0, 0), (1, 0), (0, 1), (0, 0), (0, 0)))):
+        f = curves.fit(tri)
+        assert len(f.prims) == 3 and all(p.center is None for p in f.prims)
+    n = 2502
+    line = curves.Nurbs(1, (0, 0, *(i / (n - 1) for i in range(1, n - 1)), 1, 1),
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    f = curves.fit(line)
+    assert len(f.prims) == 1 and f.prims[0].end == pytest.approx((5.002, 0))
+
+
+def test_a_tight_bend_in_a_short_knot_span_is_seen_by_the_radius_check():
+    q = curves.Nurbs(2, (0, 0, 0, 0.005, 0.01, 1, 1, 1), ((0, 0), (0.05, 0.05), (0.1, 0), (0.05, 0), (0, 0)))
+    assert min(r for r, _ in q.radius_samples()) < 0.01
+    # A hairpin away from any knot (two spans, knot at 0.5) is still found, below the 1/8 in warning.
+    hairpin = curves.Nurbs(2, (0, 0, 0, 0.5, 1, 1, 1), ((0, 0), (1, 0.01), (0, 0.02), (0, 1)))
+    assert min(r for r, _ in hairpin.radius_samples()) < 0.125
+    # A span one float wide neither crashes the radius check nor the fit.
+    ulp = curves.Nurbs(2, (0, 0, 0, 0.5, math.nextafter(0.5, 1), 1, 1, 1), ((0, 0), (1, 1), (2, 0), (3, 1), (4, 0)))
+    assert ulp.radius_samples() and curves.fit(ulp).prims
+
+
+def test_a_wiggle_inside_one_short_span_is_fitted_not_flattened():
+    """Review of the v0.4.0 fixes: a span whose ends and middle sit on a line, with its quarter points
+    off it, was fitted as one straight line."""
+    class Wiggle(curves.Curve):
+        def point(self, t):
+            u = (t - 0.5) / 0.01
+            return (10 * t, 0.2 * math.sin(math.tau * u) if 0 <= u <= 1 else 0.0)
+
+        def breaks(self):
+            return [0.0, 0.5, 0.51, 1.0]
+
+    c = Wiggle()
+    f = curves.fit(c)
+    ts = [0.5 + 0.01 * j / 200 for j in range(201)]
+    worst = max(min(curves.prim_point_dist(p, c.point(t)) for p in f.prims) for t in ts)
+    assert worst <= curves.FIT_TOL_IN + 1e-6
+
+
+def test_large_splines_are_quick_capped_and_refused_early():
+    import time
+
+    n = 5000
+    line = curves.Nurbs(1, (0, 0, *(i / (n - 1) for i in range(1, n - 1)), 1, 1),
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    t = time.perf_counter()
+    assert len(curves.fit(line).prims) == 1 and line.radius_samples() == []
+    assert len(curves.sample_points(line)) == n
+    assert time.perf_counter() - t < 5
+    with pytest.raises(curves.CurveError, match="more than 5000 control points"):
+        curves.check_nurbs(1, [0, *(i / n for i in range(n + 1)), 1], [(i, 0) for i in range(n + 1)], [])
+    # Degree 10, 5,000 collinear points: still one straight, and quick.
+    t = time.perf_counter()
+    high = curves.Nurbs(10, (0,) * 11 + tuple(i / (n - 10) for i in range(1, n - 10)) + (1,) * 11,
+                        tuple((i * 0.002, 0.0) for i in range(n)))
+    assert len(curves.fit(high).prims) == 1 and high.radius_samples() == []
+    assert time.perf_counter() - t < 30
+    # Fitting stops once past its segment budget, rather than fitting the whole spline first.
+    arches, ctrl, kn = 200, [(0, 0)], [0, 0, 0, 0]
+    for i in range(arches):
+        ctrl += [(i + 0.3, 1), (i + 0.7, 1), (i + 1, 0)]
+        kn += [(i + 1) / arches] * 3
+    many = curves.Nurbs(3, tuple(kn[:-3] + [1, 1, 1, 1]), tuple(ctrl))
+    with pytest.raises(curves.TooManySegments):
+        curves.fit(many, limit=50)
+
+
+def test_narrow_and_repeated_knots_round_trip_through_storage():
+    """Review of the v0.4.0 fixes: spans a few floats wide crashed the radius check, and rounding stored
+    knots turned a smooth join into a refused break."""
+    for ulps in (2, 4, 6):
+        k = 5000000.0
+        k2 = k
+        for _ in range(ulps):
+            k2 = math.nextafter(k2, math.inf)
+        c = curves.Nurbs(2, (0, 0, 0, k, k2, 1e7, 1e7, 1e7), ((0, 0), (1, 1), (2, 0), (3, 1), (4, 0)))
+        sub = asrc.Sub([c], False)
+        back = ai.from_json(ai.to_json([sub]))[0].pieces[0]
+        assert back.knots == c.knots
+        assert back.radius_samples() and curves.fit(back).prims
+    # Close knots on a quadratic (a double and a near one) stay apart through storage.
+    close = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5000000001, 1, 1, 1),
+                         ((0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)))
+    back = ai.from_json(ai.to_json([asrc.Sub([close], False)]))[0].pieces[0]
+    assert back.knots == close.knots and curves.fit(back).prims
+
+
+def test_a_knot_repeated_past_the_degree_is_kept_where_it_joins_and_refused_where_it_gaps():
+    """Review of the v0.4.0 fixes: a gap there was bridged by a straight, or a piece dropped."""
+    # A real triple knot on a quadratic, both sides meeting at (2, 0): continuous, so kept.
+    kn, ctrl = [0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1], [(0, 0), (1, 1), (2, 0), (2, 0), (3, 1), (4, 0)]
+    curves.check_nurbs(2, kn, ctrl, [])
+    f = curves.fit(curves.Nurbs(2, tuple(kn), tuple(ctrl)))
+    assert f.prims and any(math.dist(q, (2, 0)) < 1e-9 for p in f.prims for q in (p.start, p.end))
+    for degree, kn, ctrl in ((1, [0, 0, .5, .5, 1, 1], [(0, 0), (1, 0), (2, 1), (3, 1)]),
+                             (1, [0, 0, .5, .5, 1, 1], [(0, 0), (2, 5), (5, 0), (7, 0)]),
+                             (2, [0, 0, 0, .5, .5, .5, 1, 1, 1], [(0, 0), (1, 1), (2, 0), (3, 0), (3, 1), (4, 0)])):
+        with pytest.raises(curves.CurveError, match="gap"):
+            curves.check_nurbs(degree, kn, ctrl, [])
+
+
+def test_a_spline_bend_radius_is_exact_even_in_a_tiny_span():
+    """Review of the v0.4.0 fixes: a quarter-span circle read a 0.120 in bend as 0.25 in."""
+    a = .25 / .24
+    q = curves.Nurbs(2, (0, 0, 0, .00001, .00002, 1, 1, 1), ((-.5, a), (0, -a), (1, 3 * a), (1, 3 * a), (1, 3 * a)))
+    assert min(r for r, _ in q.radius_samples()) == pytest.approx(0.120, abs=1e-4)
+    peak = curves.Nurbs(2, (0, 0, 0, 1, 1, 1), ((0, 0), (1, 0), (0.1, 5e-8)))
+    assert min(r for r, _ in peak.radius_samples()) < 0.125
+
+
+def test_a_curvy_high_degree_spline_fits_quickly_and_chords_keep_to_the_budget():
+    """Review of the v0.4.0 fixes: every subdivision re-evaluated every probe, and chords ignored it."""
+    import time
+
+    deg, n = 10, 2000
+    knots = (0.0,) * (deg + 1) + tuple(i / (n - deg) for i in range(1, n - deg)) + (1.0,) * (deg + 1)
+    wave = curves.Nurbs(deg, knots, tuple((10 * i / (n - 1), 0.5 * math.sin(4 * math.tau * i / (n - 1)))
+                                          for i in range(n)))
+    t = time.perf_counter()
+    f = curves.fit(wave, limit=5000)
+    assert f.prims and time.perf_counter() - t < 15
+    m = 2000
+    knots = (0.0,) * 4 + tuple(i / (m - 3) for i in range(1, m - 3)) + (1.0,) * 4
+    coil = [(0.0, 0.0)] + [(3 * math.cos(200 * math.tau * i / (m - 1)), 3 * math.sin(200 * math.tau * i / (m - 1)))
+                           for i in range(1, m - 1)] + [(0.001, 0.0)]
+    with pytest.raises(curves.TooManySegments):
+        curves.fit(curves.Nurbs(3, knots, tuple(coil)), limit=50)
+    with pytest.raises(curves.TooManySegments):  # the exact straights too
+        curves.fit(curves.Nurbs(1, (0, 0, 1 / 3, 2 / 3, 1, 1), ((0, 0), (1, 0), (1, 1), (2, 1))), limit=2)
+
+
+def test_a_large_straight_import_builds_well_inside_the_desktop_deadline(tmp_path):
+    """Review of the v0.4.0 fixes: three 5,000-point degree-10 straight creases took 92 s cold."""
+    import io
+    import time
+
+    from dieline_engine.rpc import Server
+    from dieline_engine.settings import SettingsStore
+
+    n = 5000
+    knots = (0.0,) * 11 + tuple(j / 4990 for j in range(1, 4990)) + (1.0,) * 11
+    subs = [asrc.Sub([curves.Nurbs(10, knots, tuple((i * .002, float(row)) for i in range(n)))], False, "crease")
+            for row in range(2)]
+    item = {"id": "a1", "kind": "import", "path": "x.dxf", "width": 3, "placement": MID,
+            "source": {"geometry": ai.to_json(subs), "units_in": 1.0, "name": "x.dxf", "format": "dxf"}}
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    t = time.perf_counter()
+    shown = server.methods["design.replace"]({"session_id": "s1", "params": {**BOX, "artwork": [item]}})
+    assert shown["parts"][0]["features"][0]["status"] == "ok"
+    assert time.perf_counter() - t < 20
+    server._pool.shutdown()
+    # More spline points than an import can take are refused, whether read from a file or stored.
+    third = asrc.Sub([curves.Nurbs(10, knots, tuple((i * .002, 2.0) for i in range(n)))], False, "crease")
+    with pytest.raises(asrc.SourceError, match="control points in all"):
+        ai.from_json(ai.to_json([*subs, third]))
+
+
+def test_round_five_spline_cases():
+    """Review of the v0.4.0 fixes, round 5."""
+    # Both sides of a shared knot are measured: 0.140 in on the left, 0.025 in on the right.
+    c = curves.Nurbs(2, (0, 0, 0, .5, .5, 1, 1, 1), ((-.14, .14), (-.14, 0), (0, 0), (.05, 0), (2, .2)),
+                     (1, math.sqrt(.5), 1, 1, 1))
+    assert min(r for r, _ in c.radius_samples()) == pytest.approx(0.025, abs=1e-4)
+    # A peak between samples still sizes the artwork: 3 in tall means 3 in.
+    peak = curves.Nurbs(2, (0, 0, 0, .493, .493, .512, .531, 1, 1, 1),
+                        ((-1, 0), (-.5, 0), (0, 0), (.1, 1), (.2, -17 / 7), (.5, 0), (1, 0)))
+    subs = [asrc.Sub([peak], False, "crease"), asrc.Sub([asrc.Prim((-1, -3), (1, -3))], False, "crease")]
+    box = asrc.subs_bbox(subs)
+    cs, _ = asrc.finish(subs, 3 / (box[3] - box[1]), declared_closed=False, box=box)
+    ys = [q[1] for c_ in cs for p in c_.prims for q in curves.prim_points(p, 16)]
+    assert max(ys) - min(ys) == pytest.approx(3, abs=1e-3)
+    # A gap far from the origin is still a gap; a join there isn't.
+    with pytest.raises(curves.CurveError, match="gap"):
+        curves.check_nurbs(1, [0, 0, .5, .5, 1, 1], [(1e8, 0), (1e8 + 1, 0), (1e8 + 1, .05), (1e8 + 2, .05)], [])
+    curves.check_nurbs(1, [0, 0, .5, .5, 1, 1], [(1e8, 0), (1e8 + 1, 0), (1e8 + 1, 0), (1e8 + 2, .05)], [])
+    # Rescaling the knots doesn't change the curve or its radius.
+    tiny = curves.Nurbs(2, (0, 0, 0, 1e-105, 1e-105, 1e-105), ((0, 0), (.5, 1), (1, 0)))
+    unit = curves.Nurbs(2, (0, 0, 0, 1, 1, 1), ((0, 0), (.5, 1), (1, 0)))
+    assert min(r for r, _ in tiny.radius_samples()) == pytest.approx(min(r for r, _ in unit.radius_samples()))
+    # Artwork that ends at exactly the segment limit is kept (a sub-nanoinch piece is dropped, not counted).
+    poly = asrc.Sub([asrc.Prim((i % 2, .01 * i), ((i + 1) % 2, .01 * (i + 1))) for i in range(4999)], False, "crease")
+    spline = asrc.Sub([curves.Nurbs(1, (0, 0, .5, 1, 1), ((0, 60), (1, 60), (1, 60 + 1e-8)))], False, "crease")
+    cs, _ = asrc.finish([poly, spline], 1 / 25.4, declared_closed=False)
+    assert [len(c_.prims) for c_ in cs] == [4999, 1]
+
+
+def test_joined_fallback_chords_are_counted_once():
+    out = curves.Fit([curves.Prim((0, 0), (1, 0)), curves.Prim((1, 0), (2, 0)), curves.Prim((2, 0), (3, 0))],
+                     ["fallback"] * 3, 3)
+    curves._join_lines(out)
+    assert len(out.prims) == 1 and out.fallback == 1
+
+
+def test_the_longest_chord_is_one_stretch_across_the_outline():
+    from types import SimpleNamespace
+
+    from dieline_engine.artwork_checks import _longest_chord
+    from dieline_engine.geometry import Line, LineType
+
+    # A V: across its two arms a horizontal line meets the outline twice over, 1 in each.
+    v = SimpleNamespace(polygon=[(0, 0), (1, 0), (2, 3), (3, 0), (4, 0), (2, 4)], width=4, height=4)
+    assert _longest_chord(v, Line((0, 0.5), (1, 0.5), LineType.CREASE)) == pytest.approx(1, abs=1e-3)
+    rect = SimpleNamespace(polygon=[(0, 0), (14, 0), (14, 4), (0, 4)], width=14, height=4)
+    assert _longest_chord(rect, Line((0, 1), (1, 1), LineType.CREASE)) == pytest.approx(14)
+    assert _longest_chord(rect, Line((0, 0), (1, 1), LineType.CREASE)) == pytest.approx(4 * 2 ** 0.5)
+
+
+def test_the_acknowledgement_fingerprint_covers_arc_direction_and_the_face_frame():
+    # The same ends and centre, one arc a quarter turn, the other three quarters the other way: the frame
+    # keeps the size the same, and spans the face so there's a flag to acknowledge.
+    frame = "M 0 0 L 100 0 L 100 40 L 0 40 Z"
+    one = {"kind": "sketch", "sketch": {"paths": [frame, "M 30 28 A 8 8 0 0 1 38 20 L 38 28 Z"]}, "width": 12,
+           "placement": MID, "islands": "drop_out"}
+    other = {**one, "sketch": {"paths": [frame, "M 30 28 A 8 8 0 1 0 38 20 L 38 28 Z"]}}
+    keys = []
+    for a in (one, other):
+        out, _ = made(a)
+        keys.append([c["ack"] for c in out["checks"] if c.get("ack")])
+    assert keys[0] and keys[1] and keys[0] != keys[1]
+    # A box resize that keeps the bar's flat coordinates still asks again.
+    bar = {"kind": "sketch", "sketch": {"shapes": [{"type": "rect", "x": 0, "y": 0, "width": 100, "height": 10}]},
+           "width": 3, "placement": {"on": "P4", "x": {"from": "right", "to": "near_edge", "distance": 0.5},
+                                     "y": {"from": "bottom_score", "to": "near_edge", "distance": 0.5}}}
+    out, d12 = made(bar, depth=12)
+    keys = [c["ack"] for c in out["checks"] if c.get("ack")]
+    assert keys
+    out, _ = made(bar, depth=12, acknowledged=keys)
+    assert all(c["status"] == "info" for c in out["checks"] if "_flag_" in c["id"])
+    out, d3 = made(bar, depth=3, acknowledged=keys)
+    a12, a3 = d12.extras["artwork"][0], d3.extras["artwork"][0]
+    assert sorted(s.start for s in a12.segs()) == sorted(s.start for s in a3.segs())  # same flat geometry
+    flags = [c for c in out["checks"] if "_flag_" in c["id"]]
+    assert flags and all(c["status"] == "fail" and not c.get("acknowledged") for c in flags)
+
+
+def test_artwork_given_without_ids_never_takes_an_id_already_listed():
+    dot = {"kind": "shape", "shape": "circle", "diameter": 1, "placement": MID}
+    p = BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": "a2"}, dot, dot]})
+    assert [a["id"] for a in p.artwork] == ["a2", "a1", "a3"]
+    with pytest.raises(ValueError, match="listed twice"):
+        BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": "a1"}, {**dot, "id": "a1"}]})
+    # An id that isn't a string is refused as invalid parameters, never renumbered or a crash.
+    for bad in (["a1"], "", 0):
+        with pytest.raises(ValidationError, match="isn't an artwork id"):
+            BoxParams.model_validate({**BOX, "artwork": [{**dot, "id": bad}]})
+
+
+def _import_of(subs, **kw):
+    return {"id": "a1", "kind": "import", "path": "x.dxf", "placement": MID, "units": "in",
+            "source": {"geometry": ai.to_json(subs), "units_in": 1.0, "name": "x.dxf", "format": "dxf"}, **kw}
+
+
+def test_a_tight_bend_inside_one_span_warns_even_beside_gentler_ones():
+    """Final v0.4.0 review: refinement followed the four tightest samples anywhere, so gentler spans
+    crowded out a hairpin sitting between another span's samples."""
+    sol = curves.Nurbs(2, (0, 0, 0, .98, .98, 1, 1, 1),
+                       ((-.2, .2625), (-.2, .0625), (0, .0625), (.2, -.4375), (.4, 3.0625)), (1, math.sqrt(.5), 1, 1, 1))
+    ctrl, x = [(0.0, 0.0)], 0.0
+    for s in range(10):  # nine 0.15 in arches and one hairpin, on span 3
+        if s == 3:
+            ctrl += [(x + 3.0, 0.0), (x + 1.2, 0.15)]
+            x += 1.2
+        else:
+            y0 = ctrl[-1][1]
+            ctrl += [(x + 0.15, y0 + 0.15), (x + 0.30, y0)]
+            x += 0.30
+    gem = curves.Nurbs(2, (0.0, 0.0, 0.0) + tuple(i / 10 for i in range(1, 10) for _ in range(2)) + (1.0, 1.0, 1.0),
+                       tuple(ctrl))
+    for q, box in ((sol, {}), (gem, {"length": 16, "width": 12, "depth": 12})):
+        assert min(r for r, _ in q.radius_samples()) < 0.125
+        out, _ = made(_import_of([asrc.Sub([q], False, "crease")]), **box)
+        assert out["features"][0]["status"] == "ok" and checks(out)["artwork_bend_radius"]["status"] == "warn"
+
+
+def test_the_bend_limit_follows_the_artworks_own_rule():
+    """Final v0.4.0 review: a 3 pt artwork rule on double wall was held to the box's 2 pt limit."""
+    circle = asrc.Sub([asrc.Prim((0.15, 0), (0.15, 0), (0, 0), False, True)], True)
+    out, _ = made(_import_of([circle]), board="48 BC KR")
+    assert "artwork_bend_radius" not in checks(out)  # 0.150 in is fine for 2 pt rule
+    out, _ = made(_import_of([circle], pointage=3), board="48 BC KR")
+    bend = checks(out)["artwork_bend_radius"]
+    assert bend["status"] == "warn" and "3/16 in" in bend["message"]
+
+
+def test_spline_control_points_keep_full_precision_in_storage():
+    """Final v0.4.0 review: rounding control points to 9 places opened a gap at a small spline's join."""
+    c = curves.Nurbs(2, (0, 0, 0, 0.5, 0.5, 0.5, 1, 1, 1),
+                     ((0.0, 0.0), (0.03, 0.05), (0.06000000049, 0.0), (0.06000000051, 0.0), (0.09, 0.05), (0.127, 0.0)))
+    back = ai.from_json(ai.to_json([asrc.Sub([c], False)]))[0].pieces[0]
+    assert back.ctrl == c.ctrl

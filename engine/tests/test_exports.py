@@ -1122,3 +1122,103 @@ def test_a_save_onto_the_emptied_path_is_never_overwritten(tmp_path, monkeypatch
     notes = exports.recover_all(cad, None)
     assert notes and "couldn't be undone" in notes[0]
     assert list((cad / "superseded").rglob("job.cf2"))
+
+
+def test_rpc_revisions_must_be_whole_numbers_and_partition_pieces_export_with_their_set(tmp_path):
+    """Review finding 19."""
+    from dataclasses import replace
+
+    from dieline_engine import partitions, partsets
+    from dieline_engine.designstore import FitLink, new_design
+    from dieline_engine.rpc import RpcError, Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    shown = server.methods["design.replace"]({"session_id": "s1", "params": BOX.model_dump()})
+    assert shown["revision"] == 1
+    # (a) True == 1 in Python: a bool isn't a revision
+    with pytest.raises(RpcError, match="expected"):
+        server.methods["design.replace"]({"session_id": "s1", "params": BOX.model_dump(),
+                                          "expected": {"design_id": shown["design_id"], "revision": True}})
+    with pytest.raises(RpcError, match="revision"):
+        server.methods["export.plan"]({"session_id": "s1", "design_id": shown["design_id"], "revision": True})
+    assert server.store.current("s1").revision == 1
+    # (b) one piece's parameters alone would skip its set's checks: refused with the reason
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    piece = partitions.PartitionParams(board="32 B KR", role="long", set=sp).model_dump()
+    with pytest.raises(RpcError, match="exported with its set"):
+        server.methods["export.plan"]({"params": piece})
+    with pytest.raises(RpcError, match="exported with its set"):
+        server.methods["box.export"]({"params": piece})
+    # (c) a design check that blocks the export still lists each format's readiness
+    d = new_design(BOX, "carton")
+    d, gid = partsets.add_set(d, sp, contained_in="carton")
+    d = replace(d, links=(*d.links, FitLink("fit_gone", "p9", gid)))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"], "formats": ["cf2", "dxf"]})
+    assert not plan["ready"] and set(plan["formats"]) == {"cf2", "dxf"}
+    assert all(not f["ready"] and f["blocking"] for f in plan["formats"].values())
+
+
+def test_a_held_partition_piece_without_its_set_is_not_exported(tmp_path):
+    """Review of the v0.4.0 merge: a snapshot holding one piece and no group used to export it."""
+    from dieline_engine import designs, partitions, partsets
+    from dieline_engine.designstore import new_design
+    from dieline_engine.rpc import Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    piece = partitions.PartitionParams(board="32 B KR", role="long", set=sp).model_dump()
+    lone = server.methods["design.replace"]({"session_id": "s1", "parts": [{"part_id": "p1", "params": piece}]})
+    target = {"session_id": "s1", "design_id": lone["design_id"], "revision": lone["revision"], "formats": ["cf2"]}
+    plan = server.methods["export.plan"](target)
+    assert not plan["ready"] and "isn't in a partition set" in plan["blocking"][0]
+    assert set(plan["formats"]) == {"cf2", "dxf"}  # both listed, even when only one was asked for
+    with pytest.raises(designs.DesignCheckFailed, match="isn't in a partition set"):
+        server.methods["box.export"]({**target, "filename": "lone"})
+    # The whole set, held with its box, exports.
+    d, _ = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    full = {"session_id": "s1", "design_id": held["design_id"], "revision": held["revision"]}
+    assert server.methods["export.plan"](full)["ready"], server.methods["export.plan"](full)["blocking"]
+
+
+def test_a_set_whose_parts_make_fewer_than_it_holds_is_not_exported(tmp_path):
+    """Review of the v0.4.0 fixes: the set's counts were checked, the parts' quantities exported."""
+    from dataclasses import replace
+
+    from dieline_engine import partitions, partsets
+    from dieline_engine.designstore import new_design
+    from dieline_engine.rpc import Server
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update({"output_dir": str(tmp_path / "out")})
+    server = Server(io.StringIO(), store)
+    sp = partitions.spec_from_inputs("box_cells", {"length": 12, "width": 9, "depth": 6, "cells_long": 3,
+                                                   "cells_short": 2})
+    d, gid = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    group = next(g for g in d.groups if g.id == gid)
+    short = next(m for m in group.members if m.quantity > 1)
+    d = replace(d, parts=tuple(replace(p, quantity=1) if p.id == short.ref else p for p in d.parts))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"]})
+    assert not plan["ready"] and "but the part makes 1" in plan["blocking"][0]
+    # One part listed twice in its set, each at 1: the set counts 2, the job makes 1.
+    d, gid = partsets.add_set(new_design(BOX, "carton"), sp, contained_in="carton")
+    group = next(g for g in d.groups if g.id == gid)
+    short = next(m for m in group.members if m.quantity > 1)
+    twice = replace(group, members=tuple(m for m in group.members if m is not short) +
+                    (replace(short, quantity=1), replace(short, quantity=1)))
+    d = replace(d, groups=tuple(twice if g.id == gid else g for g in d.groups),
+                parts=tuple(replace(p, quantity=1) if p.id == short.ref else p for p in d.parts))
+    held = server.store.mutate("s1", lambda cur: d, expected="any")
+    plan = server.methods["export.plan"]({"session_id": "s1", "design_id": held["design_id"],
+                                          "revision": held["revision"]})
+    assert not plan["ready"] and "listed 2 times" in " ".join(plan["blocking"])

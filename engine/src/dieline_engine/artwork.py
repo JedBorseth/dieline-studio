@@ -36,6 +36,8 @@ import copy
 import hashlib
 import json
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +47,7 @@ from .expressions import ExpressionError
 from .faces import Face, FaceMap
 from .features import Ctx, FeatureError, _env, _flat_prims, _inside_face, _retype, friendly
 from .geometry import PRECISION, Arc, Dieline, Line, LineType, Operation, Point, Segment, _round_pt
+from .curves import FIT_TOL_IN
 from .rules import PERF_CUT, PERF_TIE, RuleSpec
 from .shapes import Prim, bbox as prim_bbox, transform
 
@@ -438,16 +441,25 @@ class Art:
     def segs(self) -> list[Segment]:
         return [s for c in self.live() for s in c.segs]
 
-    def fingerprint(self, panel_size: tuple[float, float]) -> str:
-        """The artwork as drawn: an acknowledgement is for exactly this geometry."""
+    def fingerprint(self, face: Face | None = None) -> str:
+        """Everything that decides what's cut: an acknowledgement is for exactly this. Each segment
+        (rule, ends, centre, direction, full circle), each outline's rule spec (pointage), and the face
+        it's on with that face's frame on the blank (a resize that keeps the flat coordinates still
+        moves the face round it), so any change asks again."""
         h = hashlib.sha1()
-        h.update(repr((self.face, panel_size)).encode())
-        geometry = [
-            (s.type.value, s.start, s.end, s.center, s.clockwise, s.full_circle)
-            if isinstance(s, Arc) else (s.type.value, s.start, s.end)
-            for s in self.segs()
-        ]
-        h.update(repr(sorted(geometry)).encode())
+
+        def r6(p: Any) -> Any:
+            return None if p is None else tuple(round(v, 6) for v in p)
+
+        h.update(repr(("face", self.face)).encode())
+        if face is not None:
+            h.update(repr((round(face.width, 6), round(face.height, 6), r6(face.origin), r6(face.x_axis),
+                           r6(face.y_axis), [r6(q) for q in face.polygon])).encode())
+        for op in sorted(self.ops, key=lambda o: o.id):
+            h.update(repr((op.id, op.kind, op.closed, op.rule)).encode())
+        for s in sorted(self.segs(), key=lambda s: (s.start, s.end)):
+            h.update(repr((s.type.value, s.start, s.end, getattr(s, "center", None), getattr(s, "clockwise", None),
+                           getattr(s, "full_circle", None))).encode())
         return h.hexdigest()[:16]
 
     def to_dict(self, units: str = "in") -> dict[str, Any]:
@@ -515,14 +527,41 @@ def local(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
         raise ArtworkError(str(exc)) from None
 
 
-def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
+# Fitted imports, by what decides them (geometry, size, closed): a design is built several times a
+# request (store, checks, scene), and a large spline is seconds of fitting each time.
+_FITTED: "OrderedDict[str, tuple]" = OrderedDict()
+_FITTED_MAX = 16
+_FITTED_LOCK = threading.Lock()
+
+
+def _fitted(geometry: Any, sz: dict[str, Any], natural: float | None, closed: bool, what: str) -> tuple:
     from .artwork_import import from_json  # noqa: PLC0415
+
+    key = hashlib.sha256(json.dumps([geometry, sz, natural, closed, FIT_TOL_IN], sort_keys=True,
+                                    default=str).encode()).hexdigest()  # `what` only words errors
+    with _FITTED_LOCK:
+        hit = _FITTED.get(key)
+        if hit is not None:
+            _FITTED.move_to_end(key)
+            return copy.deepcopy(hit)
+    subs = from_json(geometry)
+    box = src.subs_bbox(subs)
+    k = src.scale_for(box, sz, natural, what)
+    cs, fallback = src.finish(subs, k, declared_closed=closed, what=what, box=box, tol=FIT_TOL_IN)
+    got = (box, k, cs, fallback)
+    with _FITTED_LOCK:
+        _FITTED[key] = copy.deepcopy(got)
+        while len(_FITTED) > _FITTED_MAX:
+            _FITTED.popitem(last=False)
+    return got
+
+
+def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
     from .checks import fmt_in  # noqa: PLC0415
 
     source = spec.get("source")
     if not isinstance(source, dict):
         raise ArtworkError(f"{what}: this import hasn't been approved yet, so it has no geometry")
-    subs = from_json(source["geometry"])
     natural = source.get("units_in")
     if natural is None and spec.get("units"):
         natural = UNITS_IN[spec["units"]]
@@ -532,9 +571,7 @@ def _imported(spec: dict[str, Any], ctx: Ctx, what: str) -> src.Local:
     for k in ("width", "height"):
         if spec.get(k) is not None:
             sz[k] = ctx.size(spec[k], f"{what} {k}")
-    box = src.subs_bbox(subs)
-    k = src.scale_for(box, sz, natural, what)
-    cs, fallback = src.finish(subs, k, declared_closed=bool(spec.get("closed")), what=what)
+    box, k, cs, fallback = _fitted(source["geometry"], sz, natural, bool(spec.get("closed")), what)
     w, h = (box[2] - box[0]) * k, (box[3] - box[1]) * k
     fmt = str(source.get("format", "file")).upper()
     words = (f"imported {fmt} {source.get('name', '')} (sha256 {str(source.get('sha256', ''))[:12]}), "

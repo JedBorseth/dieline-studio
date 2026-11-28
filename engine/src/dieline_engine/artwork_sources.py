@@ -17,7 +17,8 @@ from typing import Any
 
 from . import glyphs
 from .curves import (ARC_CORRECTION_MAX, FIT_TOL_IN, Bezier, Curve, CurveError, EllipseArc, Nurbs, arc_prim,
-                     axis_ellipse, check_nurbs, fit, svg_arc)
+                     axis_ellipse, check_nurbs, fit, svg_arc,
+                     TooManySegments)
 from .shapes import Prim, bbox as prim_bbox, circle as sh_circle, rounded_rect, transform
 
 Point = tuple[float, float]
@@ -88,7 +89,9 @@ def _piece_points(p: Any) -> list[Point]:
         from .curves import prim_points  # noqa: PLC0415
 
         return prim_points(p, 16)
-    return [p.point(i / 48) for i in range(49)]
+    from .curves import sample_points  # noqa: PLC0415
+
+    return sample_points(p)
 
 
 def subs_bbox(subs: list[Sub]) -> tuple[float, float, float, float]:
@@ -129,10 +132,10 @@ def scale_for(box: tuple[float, float, float, float], size: dict[str, float], na
 
 
 def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT_TOL_IN,
-           what: str = "the artwork") -> tuple[list[Contour], int]:
+           what: str = "the artwork", box: tuple[float, float, float, float] | None = None) -> tuple[list[Contour], int]:
     """Scale by k about the outline's centre, fit the curves at final size, close what may be closed.
-    Returns the contours and how many chords stand in for arcs."""
-    x0, y0, x1, y1 = subs_bbox(subs)
+    Returns the contours and how many chords stand in for arcs. `box` is subs_bbox(subs), if known."""
+    x0, y0, x1, y1 = box if box is not None else subs_bbox(subs)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
 
     def f(p: Point) -> Point:
@@ -151,17 +154,20 @@ def finish(subs: list[Sub], k: float, *, declared_closed: bool, tol: float = FIT
                 kinds.append("arc" if p.center is not None else "line")
                 continue
             curve = p.map(f)
-            ft = fit(curve, tol)
+            try:
+                ft = fit(curve, tol, MAX_SEGMENTS - total)  # the exact count is checked below, after clean-up
+            except TooManySegments:
+                raise SourceError(f"{what} has more than {MAX_SEGMENTS} segments after fitting; simplify it") \
+                    from None
             prims += ft.prims
             kinds += ft.kinds
             fallback += ft.fallback
             radii += curve.radius_samples()
-        pairs = [(p, kind) for p, kind in zip(prims, kinds, strict=True)
-                 if p.full or math.dist(p.start, p.end) > 1e-9]
-        if not pairs:
+        # Zero-length pieces go, and their kinds with them: kinds[i] always describes prims[i].
+        keep = [k for k, q in enumerate(prims) if q.full or math.dist(q.start, q.end) > 1e-9]
+        prims, kinds = [prims[k] for k in keep], [kinds[k] for k in keep]
+        if not prims:
             continue
-        prims = [p for p, _ in pairs]
-        kinds = [kind for _, kind in pairs]
         closed = s.closed
         snapped = 0.0
         gap = math.dist(prims[0].start, prims[-1].end)

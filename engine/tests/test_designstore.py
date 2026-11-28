@@ -286,7 +286,7 @@ def test_rpc_replace_get_and_export_by_snapshot(tmp_path):
     with pytest.raises(RpcError, match="expected must be"):
         server.methods["design.replace"]({"session_id": "s1", "params": BOX,
                                           "expected": {"design_id": shown["design_id"], "revision": True}})
-    with pytest.raises(RpcError, match="revision must be an integer"):
+    with pytest.raises(RpcError, match="revision must be the revision shown"):
         server.methods["export.plan"]({"session_id": "s1", "design_id": shown["design_id"], "revision": True})
     # The chat changed the design after the export bar showed it: that bar's export is refused.
     server.store.mutate("s1", lambda cur: update_part(cur, None, params(length=16)))
@@ -400,7 +400,7 @@ def test_a_stale_link_blocks_export_everywhere(tmp_path):
                                       "revision": out["revision"], "filename": "x"})
     plan = server.methods["export.plan"]({"session_id": "s1", "design_id": out["design_id"],
                                           "revision": out["revision"], "filename": "x"})
-    assert plan["ready"] is False and plan["formats"] == {}
+    assert plan["ready"] is False and plan["formats"]["cf2"]["ready"] is False
     t = agent_mod.Turn("s1", 1, [], (out["design_id"], out["revision"]), out["seq"])
     server.agent.sessions["s1"] = agent_mod.Session("s1", active=t)
     with pytest.raises(designs.DesignCheckFailed):

@@ -193,6 +193,8 @@ def check_features(d: Dieline) -> list[CheckResult]:
                                 f"{_name(b, c)} is in the band {opp} covers when the box is closed, and {opp} has no "
                                 "matching cut-out", b, _bounds(segs))
     # ---- features too close to each other (near misses)
+    # Edge notches count against holes and each other: applying them only keeps 1/8 in on one edge,
+    # and notches on two edges of a face (or a hole beside one) leave the same thin web.
     cutouts = holes + [(b, c) for b in live if b.kind == "notch" for c in b.copies]
     for i, (b, c) in enumerate(cutouts):
         for b2, c2 in cutouts[i + 1:]:
